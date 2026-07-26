@@ -1,2 +1,27 @@
 # CNCVerse Bridge
-An application addon to run cloudstream extensions on nuvio, stremio and every other stremio supported platforms
+
+An application addon to run cloudstream extensions on Nuvio, Stremio, and every other Stremio-supported platform.
+
+## Getting Started
+
+Follow these steps to download and set up CNCVerse Bridge on your Android device.
+
+### 1. Download
+- Go to the **[Releases](../../releases)** page of this repository on your Android device.
+- Download the latest `.apk` file for CNCVerse Bridge.
+
+### 2. Install and Run the App
+- Open your file manager or downloads folder and tap on the downloaded `.apk` file to install it. 
+  *(Note: You may need to allow "Install unknown apps" in your Android settings if prompted).*
+- Once installed, open the CNCVerse Bridge app.
+- The app will run a local server in the background and display an addon URL on the screen.
+
+### 3. Final Setup in Stremio / Nuvio
+To use CNCVerse Bridge with your media center on the same device:
+1. Copy the addon URL provided within the CNCVerse Bridge app (e.g., `http://127.0.0.1:8080/manifest.json`).
+2. Open the **Stremio** or **Nuvio** app on your Android device.
+3. Navigate to the **Addons** section.
+4. Paste the copied URL into the search bar or addon URL field.
+5. Tap **Install** to add the CNCVerse Bridge addon to your platform.
+
+You are now ready to stream using Cloudstream extensions!
