@@ -2,6 +2,14 @@
 
 An application addon to run cloudstream extensions on Nuvio, Stremio, and every other Stremio-supported platform.
 
+## Note: This app is completely in alpha stage, you may experience bugs, crashes etc. Join community to report and fix bugs.
+
+### 💬 Community
+
+Join our Telegram group to discuss extensions, request features, or report issues:  
+
+[![Join us on Telegram](https://img.shields.io/badge/Telegram-Join%20Group-2CA5E0?style=for-the-badge&logo=telegram&logoColor=white)](https://t.me/cncverse)
+
 ## Getting Started
 
 Follow these steps to download and set up CNCVerse Bridge on your Android device.
