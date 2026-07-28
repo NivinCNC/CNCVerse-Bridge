@@ -26,7 +26,7 @@ Follow these steps to download and set up CNCVerse Bridge on your Android device
 
 ### 3. Final Setup in Stremio / Nuvio
 To use CNCVerse Bridge with your media center on the same device:
-1. Copy the addon URL provided within the CNCVerse Bridge app (e.g., `http://127.0.0.1:8080/manifest.json`).
+1. Copy the addon URL provided within the CNCVerse Bridge app (e.g., `http://127.0.0.1:8080/manifest.json`) (Make sure to enable stremio mode if on stremio).
 2. Open the **Stremio** or **Nuvio** app on your Android device.
 3. Navigate to the **Addons** section.
 4. Paste the copied URL into the search bar or addon URL field.
