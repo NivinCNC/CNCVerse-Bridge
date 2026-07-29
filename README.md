@@ -33,3 +33,9 @@ To use CNCVerse Bridge with your media center on the same device:
 5. Tap **Install** to add the CNCVerse Bridge addon to your platform.
 
 You are now ready to stream using Cloudstream extensions!
+
+## License
+
+All rights reserved. No part of this codebase may be copied, modified, distributed, or otherwise used without explicit permission from the copyright owner.
+
+**Note:** Files originating from the Cloudstream project are from the Cloudstream repository. Those files retain their original licenses and copyright notices as applicable under the Cloudstream project and are not covered by this proprietary license. See the [LICENSE](LICENSE) file for more details.

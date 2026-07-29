@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- AMOLED Black theme — pure #000000 background for true AMOLED savings -->
+    <style name="AppTheme" parent="Theme.MaterialComponents.NoActionBar">
+        <item name="colorPrimary">#8B5CF6</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="colorSecondary">#7C3AED</item>
+
+        <!-- True AMOLED black -->
+        <item name="android:windowBackground">#000000</item>
+        <item name="android:colorBackground">#000000</item>
+
+        <!-- Edge-to-edge — navigation bar / status bar transparent -->
+        <item name="android:windowTranslucentStatus">false</item>
+        <item name="android:windowTranslucentNavigation">false</item>
+        <item name="android:statusBarColor">#00000000</item>
+        <item name="android:navigationBarColor">#00000000</item>
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+
+        <!-- White text on black -->
+        <item name="android:textColorPrimary">#FFFFFF</item>
+        <item name="colorOnSurface">#FFFFFF</item>
+        <item name="android:textColor">#FFFFFF</item>
+
+        <!-- Bottom sheet styling -->
+        <item name="bottomSheetDialogTheme">@style/AmoledBottomSheetDialogTheme</item>
+    </style>
+
+    <style name="AmoledBottomSheetDialogTheme" parent="Theme.MaterialComponents.BottomSheetDialog">
+        <item name="bottomSheetStyle">@style/AmoledBottomSheetStyle</item>
+    </style>
+
+    <style name="AmoledBottomSheetStyle" parent="Widget.MaterialComponents.BottomSheet.Modal">
+        <item name="backgroundTint">#0A0A0A</item>
+        <item name="behavior_peekHeight">400dp</item>
+        <item name="behavior_skipCollapsed">false</item>
+    </style>
+</resources>
+
