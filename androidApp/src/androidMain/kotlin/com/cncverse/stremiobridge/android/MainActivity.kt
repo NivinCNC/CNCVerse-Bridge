@@ -209,6 +209,25 @@ class MainActivity : com.lagradost.cloudstream3.MainActivity() {
         }
     }
 
+    override fun startActivity(intent: Intent?, options: Bundle?) {
+        if (intent != null && intent.action == Intent.ACTION_VIEW) {
+            val uri = intent.dataString
+            if (uri != null && (
+                uri.contains("aliexpress", ignoreCase = true) ||
+                uri.contains("cutt.ly", ignoreCase = true) ||
+                uri.contains("doubleclick", ignoreCase = true) ||
+                uri.contains("shopee", ignoreCase = true) ||
+                uri.contains("lazada", ignoreCase = true) ||
+                uri.contains("ad_", ignoreCase = true) ||
+                uri.contains("affiliate", ignoreCase = true)
+            )) {
+                ServerState.warn("Blocked ad redirect attempt from loaded plugin: $uri")
+                return // Block external ad browser popups!
+            }
+        }
+        super.startActivity(intent, options)
+    }
+
     private var lastBrowserOpenMs = 0L
     private val BROWSER_DEBOUNCE_MS = 1000L
 }

@@ -46,13 +46,61 @@ actual class PluginLoader(private val context: Context) {
         plugins: List<SitePlugin>,
         cs3Files: Map<String, File>,
     ): List<LoadedPluginInfo> = withContext(Dispatchers.IO) {
+        configureAppClientNetwork()
         val pluginContext = awaitForegroundActivity()
-        plugins.mapNotNull { plugin ->
+        val loadedList = plugins.mapNotNull { plugin ->
             val file = cs3Files[plugin.internalName] ?: run {
                 ServerState.warn("No .cs3 file for '${plugin.name}', skipping")
                 return@mapNotNull plugin.toLoadedPluginInfo(apiRegistered = false)
             }
             loadSinglePlugin(file, plugin, pluginContext)
+        }
+        preWarmPluginHosts()
+        loadedList
+    }
+
+    private fun configureAppClientNetwork() {
+        try {
+            val appClass = runCatching { Class.forName("com.lagradost.cloudstream3.app") }.getOrNull() ?: return
+            val clientField = appClass.fields.firstOrNull { it.name == "client" } ?: return
+            val currentNiceClient = clientField.get(null) ?: return
+
+            val okClientField = currentNiceClient.javaClass.declaredFields.firstOrNull {
+                it.type.name.contains("OkHttpClient")
+            } ?: return
+            okClientField.isAccessible = true
+            val existingOk = okClientField.get(currentNiceClient) as? okhttp3.OkHttpClient ?: return
+
+            val newOk = existingOk.newBuilder()
+                .dns(com.cncverse.stremiobridge.network.AdaptiveHostDns)
+                .fastFallback(true)
+                .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
+                .readTimeout(35, java.util.concurrent.TimeUnit.SECONDS)
+                .retryOnConnectionFailure(true)
+                .build()
+            okClientField.set(currentNiceClient, newOk)
+            ServerState.info("Configured AdaptiveHostDns Engine with DoH Fallback Chain on app.client")
+        } catch (t: Throwable) {
+            Log.w(TAG, "Failed to configure AdaptiveHostDns network on app.client: ${t.message}")
+        }
+    }
+
+    private suspend fun preWarmPluginHosts() {
+        withContext(Dispatchers.IO) {
+            try {
+                registeredApis.forEach { api ->
+                    val mainUrlField = api.javaClass.methods.firstOrNull { it.name == "getMainUrl" }
+                    val mainUrl = mainUrlField?.invoke(api) as? String
+                    if (!mainUrl.isNullOrBlank()) {
+                        val host = runCatching { java.net.URI(mainUrl).host }.getOrNull()
+                        if (!host.isNullOrBlank()) {
+                            com.cncverse.stremiobridge.network.AdaptiveHostDns.preWarmHost(host)
+                        }
+                    }
+                }
+            } catch (t: Throwable) {
+                Log.w(TAG, "Pre-warming plugin hosts encountered an error: ${t.message}")
+            }
         }
     }
 
@@ -639,11 +687,27 @@ private fun Any.reflectToStreams(pluginName: String, api: Any? = null): List<Str
         if (url.contains(".mpd") && !clearkeyHex.isNullOrBlank()) {
             val encodedMpdUrl = java.net.URLEncoder.encode(url, "UTF-8")
             val hostIp = try {
-                java.net.NetworkInterface.getNetworkInterfaces().asSequence()
+                val interfaces = java.net.NetworkInterface.getNetworkInterfaces().asSequence().toList()
+                val preferred = interfaces.filter { iface ->
+                    iface.isUp && !iface.isLoopback && !iface.isPointToPoint &&
+                    (iface.name.contains("wlan", ignoreCase = true) ||
+                     iface.name.contains("eth", ignoreCase = true) ||
+                     iface.name.contains("en", ignoreCase = true))
+                }
+                val candidates = if (preferred.isNotEmpty()) preferred else interfaces.filter { iface ->
+                    iface.isUp && !iface.isLoopback && !iface.isPointToPoint &&
+                    !iface.name.contains("p2p", ignoreCase = true) &&
+                    !iface.name.contains("dummy", ignoreCase = true) &&
+                    !iface.name.contains("tun", ignoreCase = true) &&
+                    !iface.name.contains("rmnet", ignoreCase = true)
+                }
+                candidates
                     .flatMap { it.inetAddresses.asSequence() }
                     .filterIsInstance<java.net.Inet4Address>()
-                    .filter { !it.isLoopbackAddress }
-                    .firstOrNull()?.hostAddress ?: "127.0.0.1"
+                    .filter { !it.isLoopbackAddress && it.isSiteLocalAddress }
+                    .map { it.hostAddress }
+                    .sorted()
+                    .firstOrNull() ?: "127.0.0.1"
             } catch (e: Exception) { "127.0.0.1" }
             
             var proxyBase = "http://$hostIp:" + com.cncverse.stremiobridge.state.ServerState.serverPort
