@@ -29,13 +29,15 @@ object HttpClientManager {
         maxRequestsPerHost = 64   // CDN usa stesso host - serve alto parallelismo
     }
 
-    // Client di base ottimizzato per streaming veloce - parametri da EasyProxy
+    // Client di base ottimizzato per streaming veloce con AdaptiveHostDns e FastFallback
     private val baseClient: OkHttpClient = OkHttpClient.Builder()
+        .dns(com.cncverse.stremiobridge.network.AdaptiveHostDns)
+        .fastFallback(true)
         .connectionPool(connectionPool)
         .dispatcher(dispatcher)
-        .connectTimeout(10, TimeUnit.SECONDS)  // Connect timeout più lungo per stabilità
-        .readTimeout(30, TimeUnit.SECONDS)     // Read timeout più lungo per segmenti grandi
-        .writeTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(20, TimeUnit.SECONDS)  // Connect timeout generoso per stabilità di handshake
+        .readTimeout(45, TimeUnit.SECONDS)     // Read timeout generoso per segmenti video ad alto bitrate
+        .writeTimeout(20, TimeUnit.SECONDS)
         .callTimeout(60, TimeUnit.SECONDS)     // Call timeout globale
         .followRedirects(true)
         .followSslRedirects(true)

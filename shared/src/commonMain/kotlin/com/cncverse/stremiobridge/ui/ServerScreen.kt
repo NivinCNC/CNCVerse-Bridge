@@ -166,9 +166,17 @@ fun ServerScreen(
                         )
                         Spacer(Modifier.height(10.dp))
                         
+                        val isEmulator = status.ipAddress.startsWith("10.0.2.") || status.ipAddress.startsWith("10.0.3.")
+                        
                         if (selectedTab == 0) {
                             // Nuvio Tab (HTTP)
                             UrlChip(label = "LAN HTTP", url = status.stremioUrl) { onCopyUrl(status.stremioUrl) }
+                            
+                            if (isEmulator) {
+                                val adbUrl = "http://127.0.0.1:8080/manifest.json"
+                                Spacer(Modifier.height(8.dp))
+                                UrlChip(label = "PC HOST (ADB)", url = adbUrl) { onCopyUrl(adbUrl) }
+                            }
                             
                             if (status.ipAddress != "127.0.0.1" && status.ipAddress != "localhost") {
                                 Spacer(Modifier.height(8.dp))
@@ -209,6 +217,30 @@ fun ServerScreen(
                                         uncheckedTrackColor = AmoledCard,
                                     )
                                 )
+                            }
+                        }
+                        
+                        if (isEmulator) {
+                            Spacer(Modifier.height(16.dp))
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(Violet500.copy(alpha = 0.12f))
+                                    .border(1.dp, Violet500.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
+                                    .padding(12.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("💻", fontSize = 18.sp, modifier = Modifier.padding(end = 10.dp))
+                                Column {
+                                    Text("Emulator Detected", color = Violet500, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                    Text(
+                                        "Run 'adb forward tcp:8080 tcp:8080' on PC to connect Nuvio/Stremio from PC browser to http://127.0.0.1:8080/manifest.json",
+                                        color = TextSecondary,
+                                        fontSize = 11.sp,
+                                        lineHeight = 14.sp
+                                    )
+                                }
                             }
                         }
                         

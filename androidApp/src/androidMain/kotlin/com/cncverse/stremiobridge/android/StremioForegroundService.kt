@@ -173,12 +173,27 @@ class StremioForegroundService : Service() {
 
     private fun getLocalIpAddress(): String? {
         return try {
-            NetworkInterface.getNetworkInterfaces().asSequence()
+            val interfaces = NetworkInterface.getNetworkInterfaces().asSequence().toList()
+            val preferred = interfaces.filter { iface ->
+                iface.isUp && !iface.isLoopback && !iface.isPointToPoint &&
+                (iface.name.contains("wlan", ignoreCase = true) ||
+                 iface.name.contains("eth", ignoreCase = true) ||
+                 iface.name.contains("en", ignoreCase = true))
+            }
+            val candidates = if (preferred.isNotEmpty()) preferred else interfaces.filter { iface ->
+                iface.isUp && !iface.isLoopback && !iface.isPointToPoint &&
+                !iface.name.contains("p2p", ignoreCase = true) &&
+                !iface.name.contains("dummy", ignoreCase = true) &&
+                !iface.name.contains("tun", ignoreCase = true) &&
+                !iface.name.contains("rmnet", ignoreCase = true)
+            }
+            candidates
                 .flatMap { it.inetAddresses.asSequence() }
                 .filterIsInstance<Inet4Address>()
-                .filter { !it.isLoopbackAddress }
+                .filter { !it.isLoopbackAddress && it.isSiteLocalAddress }
+                .map { it.hostAddress }
+                .sorted()
                 .firstOrNull()
-                ?.hostAddress
         } catch (e: Exception) {
             null
         }
