@@ -4,6 +4,8 @@ An application addon to run cloudstream extensions on Nuvio, Stremio, and every 
 
 ## Note: This app is completely in alpha stage, you may experience bugs, crashes etc. Join community to report and fix bugs. If you are a developer a PR for fixes are welcomed
 
+## ⚠️ Currently stremio web and stremio desktop have some issues because of the lack of https support (Work on progress to fix this)
+
 ### 💬 Community
 
 Join our Telegram group to discuss extensions, request features, or report issues:  
