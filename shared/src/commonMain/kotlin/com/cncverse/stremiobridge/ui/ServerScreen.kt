@@ -18,6 +18,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
@@ -28,7 +29,33 @@ import com.cncverse.stremiobridge.state.*
 
 import com.cncverse.stremiobridge.tunnel.CloudflaredManager
 import com.cncverse.stremiobridge.tunnel.DeviceIdManager
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import java.net.URL
+
+// ── Donation stats data ────────────────────────────────────────────────────────
+private data class DonationStats(
+    val currentAmount: Double,
+    val targetAmount: Double,
+    val percent: Int,
+    val supportersCount: Int,
+    val month: String,
+)
+
+// in-memory cooldown: epoch-day string of last shown date
+private var donationLastShownDay: String = ""
+private val STATS_URL = "https://cncverse.pages.dev/api/stats"
+private val PRIMARY_DONATE_URL = "https://cncverse.pages.dev"
+
+private fun donationToday(): String {
+    // Simple epoch-day string (UTC) — same approach as DonationManager
+    val dayMs = System.currentTimeMillis() / 86_400_000L
+    return dayMs.toString()
+}
 
 @Composable
 fun ServerScreen(
@@ -43,6 +70,56 @@ fun ServerScreen(
     var isDownloadingCloudflared by remember { mutableStateOf(false) }
     val activeTunnelUrl by ServerState.activeTunnelUrl.collectAsState()
     val coroutineScope = rememberCoroutineScope()
+    val uriHandler = LocalUriHandler.current
+
+    // ── Donation dialog state ──────────────────────────────────────────────────
+    var showDonationDialog by remember { mutableStateOf(false) }
+    var donationStats by remember { mutableStateOf<DonationStats?>(null) }
+    var donationLoading by remember { mutableStateOf(false) }
+
+    fun tryShowDonation() {
+        val today = donationToday()
+        if (donationLastShownDay == today) return  // already shown today
+        donationLastShownDay = today
+        donationLoading = true
+        coroutineScope.launch {
+            val stats = withContext(Dispatchers.IO) {
+                try {
+                    val json = Json { ignoreUnknownKeys = true }
+                    val text = URL(STATS_URL).readText()
+                    val obj = json.parseToJsonElement(text).jsonObject
+                    DonationStats(
+                        currentAmount  = obj["totalUsd"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 0.0,
+                        targetAmount   = obj["targetGoalUsd"]?.jsonPrimitive?.content?.toDoubleOrNull() ?: 100.0,
+                        percent        = obj["percent"]?.jsonPrimitive?.content?.toIntOrNull() ?: -1,
+                        supportersCount= obj["supporterCount"]?.jsonPrimitive?.content?.toIntOrNull() ?: 0,
+                        month          = obj["month"]?.jsonPrimitive?.content ?: "Monthly Goal",
+                    )
+                } catch (_: Exception) {
+                    // Fallback with zeros — still show dialog
+                    DonationStats(0.0, 100.0, -1, 0, "Monthly Goal")
+                }
+            }
+            donationStats = stats
+            donationLoading = false
+            showDonationDialog = true
+        }
+    }
+
+    // Show donation dialog when data is ready
+    if (showDonationDialog && !donationLoading) {
+        val stats = donationStats
+        if (stats != null) {
+            DonationDialog(
+                stats = stats,
+                onDismiss = { showDonationDialog = false },
+                onPrimary = {
+                    showDonationDialog = false
+                    uriHandler.openUri(PRIMARY_DONATE_URL)
+                },
+            )
+        }
+    }
 
     if (showCloudflaredDialog) {
         AlertDialog(
@@ -172,7 +249,13 @@ fun ServerScreen(
             val btnColor = if (isRunning) Color(0xFF7F1D1D) else Violet600
 
             Button(
-                onClick = if (isRunning) onStop else onStart,
+                onClick = {
+                    if (isRunning) onStop()
+                    else {
+                        onStart()
+                        tryShowDonation()
+                    }
+                },
                 enabled = !isStarting,
                 modifier = Modifier
                     .fillMaxWidth()
@@ -525,4 +608,158 @@ private fun TypeBadge(type: String) {
             .background(Color(0xFF1E1043), RoundedCornerShape(3.dp))
             .padding(horizontal = 5.dp, vertical = 2.dp),
     )
+}
+
+// ── Donation Dialog ────────────────────────────────────────────────────────────
+
+@Composable
+private fun DonationDialog(
+    stats: DonationStats,
+    onDismiss: () -> Unit,
+    onPrimary: () -> Unit,
+) {
+    val pct = if (stats.percent in 0..100) stats.percent
+              else if (stats.targetAmount <= 0) 0
+              else (stats.currentAmount / stats.targetAmount * 100).toInt().coerceIn(0, 100)
+    val isAchieved = pct >= 100
+
+    androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(
+                    brush = androidx.compose.ui.graphics.Brush.verticalGradient(
+                        listOf(Color(0xFF251442), Color(0xFF180D2D), Color(0xFF0F071B))
+                    ),
+                    shape = RoundedCornerShape(20.dp),
+                )
+                .border(1.5.dp, Violet500, RoundedCornerShape(20.dp))
+                .padding(20.dp)
+        ) {
+            Column {
+                // ── Badge ──────────────────────────────────────────────────
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(Color(0xFF3B1D6B))
+                        .border(1.dp, Color(0xFF8B5CF6), CircleShape)
+                        .padding(horizontal = 12.dp, vertical = 5.dp)
+                ) {
+                    Text(
+                        "⚡ CNCVerse Repo • by NivinCNC ↗",
+                        color = Color(0xFFC4B5FD),
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
+
+                Spacer(Modifier.height(12.dp))
+
+                // ── Title ──────────────────────────────────────────────────
+                Text(
+                    if (isAchieved) "🎉  CNCVerse Goal Achieved!" else "⚠️  Help Keep CNCVerse Alive",
+                    color = Color.White,
+                    fontSize = 18.sp,
+                    fontWeight = FontWeight.Bold,
+                )
+
+                Spacer(Modifier.height(10.dp))
+
+                // ── Bullet points ──────────────────────────────────────────
+                val bullets = if (isAchieved) listOf(
+                    "🎉 Goal achieved! Thank you for the incredible support",
+                    "🛠️ Keeps the bridge alive and active",
+                    "🐞 Faster bug fixes",
+                    "🚫 No Ads, No Subscription: Bridge stays 100% free for everyone.",
+                ) else listOf(
+                    "🚫 No Ads, No Subscription: Keeps bridge 100% free.",
+                    "🛠️ Active Repo Maintenance: Frequent updates to support latest available extensions",
+                    "⚠️ Goal Missed = Delayed Fixes: If monthly target isn't met, latest extensions support will slow down.",
+                    "💀 Zero Support = Bridge Die: Without support, providers break and links die over time.",
+                )
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    bullets.forEach { b ->
+                        Text(b, color = Color(0xFFE9D5FF), fontSize = 13.sp, lineHeight = 18.sp)
+                    }
+                }
+
+                Spacer(Modifier.height(14.dp))
+
+                // ── Progress card ──────────────────────────────────────────
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(
+                            brush = androidx.compose.ui.graphics.Brush.verticalGradient(
+                                listOf(Color(0xFF1E1035), Color(0xFF120924))
+                            )
+                        )
+                        .border(1.dp, Color(0xFF4C1D95), RoundedCornerShape(12.dp))
+                        .padding(14.dp)
+                ) {
+                    // Label row
+                    Row(modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            "${stats.month} Goal",
+                            color = Color(0xFFC4B5FD),
+                            fontSize = 13.sp,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Text(
+                            "\$${stats.currentAmount.toInt()} / \$${stats.targetAmount.toInt()}  ($pct%)",
+                            color = Color(0xFF4ADE80),
+                            fontSize = 13.sp,
+                            fontWeight = FontWeight.Bold,
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    // Progress bar
+                    LinearProgressIndicator(
+                        progress = { pct.coerceIn(0, 100) / 100f },
+                        modifier = Modifier.fillMaxWidth().height(6.dp).clip(CircleShape),
+                        color = Color(0xFF4ADE80),
+                        trackColor = Color(0xFF2A124E),
+                        strokeCap = StrokeCap.Round,
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        "👥 ${stats.supportersCount} supporters this month",
+                        color = Color(0xFFA78BFA),
+                        fontSize = 12.sp,
+                    )
+                }
+
+                Spacer(Modifier.height(14.dp))
+
+                // ── Action row ─────────────────────────────────────────────
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = onDismiss) {
+                        Text(
+                            if (isAchieved) "Awesome!" else "Maybe Later",
+                            color = Color(0xFFA78BFA),
+                            fontSize = 14.sp,
+                        )
+                    }
+                    Spacer(Modifier.width(8.dp))
+                    Button(
+                        onClick = onPrimary,
+                        colors = ButtonDefaults.buttonColors(containerColor = Violet600, contentColor = Color.White),
+                        shape = RoundedCornerShape(10.dp),
+                    ) {
+                        Text(
+                            if (isAchieved) "💖 Send Extra Love" else "☕ Keep It Alive",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp,
+                        )
+                    }
+                }
+
+            }
+        }
+    }
 }

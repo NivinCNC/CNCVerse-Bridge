@@ -3,6 +3,9 @@ package android.webkit
 import android.content.Context
 import android.view.ViewGroup
 import java.io.InputStream
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
  * android.webkit stubs. Desktop has no WebView engine, so these are inert —
@@ -14,7 +17,26 @@ class WebView(context: Context? = null) : ViewGroup() {
 
     fun setWebViewClient(client: WebViewClient?) {}
     fun setWebChromeClient(client: WebChromeClient?) {}
-    fun loadUrl(url: String?) {}
+
+    /**
+     * On desktop, loadUrl triggers the CDP browser solver so that plugins
+     * calling WebView-based CF bypass can get cf_clearance via CookieManager.getCookie().
+     */
+    fun loadUrl(url: String?) {
+        if (url.isNullOrBlank()) return
+        com.cncverse.stremiobridge.state.ServerState.info("[WebView-DBG] loadUrl($url) — triggering CDP solver")
+        GlobalScope.launch(Dispatchers.IO) {
+            try {
+                com.cncverse.stremiobridge.network.SystemBrowserCdpBypass.launchManualClearance(
+                    targetUrl = url,
+                    hostName = runCatching { java.net.URI(url).host }.getOrNull(),
+                )
+            } catch (e: Exception) {
+                com.cncverse.stremiobridge.state.ServerState.error("[WebView-DBG] CDP launch failed: ${e.message}")
+            }
+        }
+    }
+
     fun evaluateJavascript(script: String?, resultCallback: ValueCallback<String>?) {}
     fun destroy() {}
     fun setJavaScriptEnabled(enabled: Boolean) {}
@@ -83,14 +105,65 @@ interface ValueCallback<T> {
 @Target(AnnotationTarget.FUNCTION)
 annotation class JavascriptInterface
 
-object CookieManager {
-    @JvmStatic
-    fun getInstance(): CookieManager = this
+class CookieManager {
+    companion object {
+        @JvmStatic
+        private val INSTANCE = CookieManager()
 
-    fun setCookie(url: String?, value: String?) {}
-    fun getCookie(url: String?): String? = null
-    fun removeAllWindows() {}
-    fun flush() {}
+        @JvmStatic
+        fun getInstance(): CookieManager = INSTANCE
+    }
+
     fun setAcceptCookie(accept: Boolean) {}
-    fun setAcceptThirdPartyCookies(webview: WebView?, accept: Boolean) {}
+
+    fun setAcceptThirdPartyCookies(webView: WebView?, accept: Boolean) {}
+
+    fun setCookie(url: String?, value: String?) {
+        if (url == null || value == null) return
+        // Sync cookies set by plugins directly into the CloudflareKiller store so
+        // clearance cookies are available to OkHttp interceptors on desktop.
+        runCatching {
+            val host = java.net.URI(url).host ?: return@runCatching
+            val pair = value.split("=", limit = 2)
+            val key = pair.getOrNull(0)?.trim() ?: return@runCatching
+            val cookieValue = pair.getOrNull(1)?.trim() ?: return@runCatching
+            val existing = com.lagradost.cloudstream3.network.CloudflareKiller.savedCookies[host]?.toMutableMap() ?: mutableMapOf()
+            existing[key] = cookieValue
+            com.lagradost.cloudstream3.network.CloudflareKiller.savedCookies[host] = existing
+        }
+    }
+
+    fun getCookie(url: String?): String? {
+        if (url == null) return null
+        return runCatching {
+            val host = java.net.URI(url).host ?: return null
+            val cookies = com.lagradost.cloudstream3.network.CloudflareKiller.getSavedCookies(host)
+            if (cookies.isEmpty()) return null
+            // Return all saved cookies in "name=value; name=value" format so the
+            // plugin's cf_clearance regex (Regex("cf_clearance=([^;]+)")) can match.
+            cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+        }.getOrNull()
+    }
+
+    fun removeAllCookies(callback: ValueCallback<Boolean>?) {
+        com.lagradost.cloudstream3.network.CloudflareKiller.clearAllClearance()
+        callback?.onReceiveValue(true)
+    }
+
+    fun removeSessionCookies(callback: ValueCallback<Boolean>?) {
+        callback?.onReceiveValue(true)
+    }
+
+    fun removeAllCookie() {
+        com.lagradost.cloudstream3.network.CloudflareKiller.clearAllClearance()
+    }
+
+    fun removeSessionCookie() {}
+
+    fun hasCookies(): Boolean {
+        return com.lagradost.cloudstream3.network.CloudflareKiller.savedCookies.isNotEmpty()
+    }
+
+    fun flush() {}
 }
+

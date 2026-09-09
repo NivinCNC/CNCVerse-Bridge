@@ -8,7 +8,6 @@ import com.cncverse.stremiobridge.plugin.GlobalPluginManager
 import com.cncverse.stremiobridge.plugin.PluginLoader
 import com.cncverse.stremiobridge.repo.PluginInstaller
 import com.cncverse.stremiobridge.repo.RepoManager
-import com.cncverse.stremiobridge.repo.loadExtensionSettings
 import com.cncverse.stremiobridge.server.StremioServer
 import com.cncverse.stremiobridge.state.*
 import com.cncverse.stremiobridge.tunnel.CloudflaredManager
@@ -27,18 +26,13 @@ import androidx.compose.ui.Modifier
 import com.cncverse.stremiobridge.ui.MainScreen
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
-import java.awt.Desktop
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
-import java.net.URI
-import kotlin.io.encoding.Base64
-import kotlin.io.encoding.ExperimentalEncodingApi
 
 private const val DEFAULT_PORT = 8080
-private const val OMG10 = "aHR0cHM6Ly9vbWcxMC5jb20vNC8xMTEwNDQ4OQ=="
 private val CACHE_DIR = File(System.getProperty("user.home"), ".cncverse_bridge").absolutePath
 
 fun main() = application {
@@ -52,7 +46,6 @@ fun main() = application {
     val pluginLoader = remember { PluginLoader() }
     var serverJob by remember { mutableStateOf<Job?>(null) }
     val windowState = rememberWindowState(width = 1000.dp, height = 780.dp)
-    var lastBrowserOpenMs by remember { mutableStateOf(0L) }
     var settingsPluginId by remember { mutableStateOf<String?>(null) }
     
     var updateRelease by remember { mutableStateOf<GithubRelease?>(null) }
@@ -61,14 +54,6 @@ fun main() = application {
     // Register the loader globally before anything else runs
     GlobalPluginManager.loader = pluginLoader
 
-    fun openInExternalBrowser(url: String) {
-        val now = System.currentTimeMillis()
-        if (now - lastBrowserOpenMs < 1000L) return
-        lastBrowserOpenMs = now
-        runCatching {
-            if (Desktop.isDesktopSupported()) Desktop.getDesktop().browse(URI(url))
-        }
-    }
 
     fun startServer() {
         if (ServerState.status.value is ServerStatus.Running) return
@@ -148,11 +133,9 @@ fun main() = application {
             logsFlow   = ServerState.logs,
             onStart    = {
                 startServer()
-                maybeShowAdSupport(::openInExternalBrowser)
             },
             onStop     = {
                 stopServer()
-                maybeShowAdSupport(::openInExternalBrowser)
             },
             onCopyUrl  = { url -> copyToClipboard(url) },
             onCopyLogs = { logText -> copyToClipboard(logText) },
@@ -280,18 +263,6 @@ private fun copyToClipboard(text: String) {
     }
 }
 
-@OptIn(ExperimentalEncodingApi::class)
-private fun maybeShowAdSupport(openInExternalBrowser: (String) -> Unit) {
-    val settings = loadExtensionSettings()
-    val mode = settings["KEY_MODE"]
-    val token = settings["KEY_LICENSE_TOKEN"]
-    val expiresAt = settings["KEY_EXPIRES_AT"]?.toLongOrNull() ?: 0L
-    val nowSeconds = System.currentTimeMillis() / 1000
-    val subscribed = mode == "subscription" && token != null && (expiresAt == 0L || nowSeconds < expiresAt)
-    if (!subscribed) {
-        openInExternalBrowser(Base64.Default.decode(OMG10).decodeToString())
-    }
-}
 
 /**
  * Mirrors the Android StremioForegroundService.startBridge flow:

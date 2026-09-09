@@ -66,14 +66,20 @@ actual class PluginLoader {
                 ServerState.warn("No .cs3 for '${plugin.name}', skipping")
                 return@mapNotNull plugin.toLoadedPluginInfo(apiRegistered = false)
             }
-            loadSinglePlugin(cs3File, plugin)
+            val info = loadSinglePlugin(cs3File, plugin)
+            // Patch plugin-specific classes AFTER the plugin's classloader is active
+            configurePluginNetworkPostLoad()
+            info
         }
         preWarmPluginHosts()
         loadedList
     }
 
-    /** Reconfigures the global NiceHttp `app` client used by plugins with AdaptiveHostDns. */
+    /** Reconfigures the global NiceHttp `app` client used by plugins with AdaptiveHostDns + CloudflareKiller. */
     private fun configureAppClientNetwork() {
+        val cfKiller = com.lagradost.cloudstream3.network.CloudflareKiller()
+
+        // ── 1. Patch the global `app` (MainActivityKt.getApp()) ──────────────
         try {
             val mainActivityKt = Class.forName("com.lagradost.cloudstream3.MainActivityKt")
             val currentNiceClient = mainActivityKt.getMethod("getApp").invoke(null) ?: return
@@ -85,6 +91,7 @@ actual class PluginLoader {
             val existingOk = okClientField.get(currentNiceClient) as? okhttp3.OkHttpClient ?: return
 
             val newOk = existingOk.newBuilder()
+                .addInterceptor(cfKiller)
                 .dns(AdaptiveHostDns)
                 .fastFallback(true)
                 .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
@@ -92,9 +99,103 @@ actual class PluginLoader {
                 .retryOnConnectionFailure(true)
                 .build()
             okClientField.set(currentNiceClient, newOk)
-            ServerState.info("Configured AdaptiveHostDns Engine with DoH Fallback Chain on app.client")
+            ServerState.info("Configured AdaptiveHostDns + CloudflareKiller on app.client (global)")
         } catch (t: Throwable) {
-            ServerState.warn("Failed to configure AdaptiveHostDns network on app.client: ${t.message}")
+            ServerState.warn("Failed to configure global app.client: ${t.message}")
+        }
+
+        // ── 2. Patch NiceHttp Requests.baseClient (companion/static) ─────────
+        // Plugin-local `val app = Requests(...)` uses Requests.baseClient as the
+        // underlying OkHttpClient. Patching the companion object field means ALL
+        // Requests instances created after this point inherit the interceptor.
+        try {
+            val requestsClass = Class.forName("com.lagradost.nicehttp.Requests")
+            // Try companion object first (Kotlin companion)
+            val companionField = runCatching {
+                requestsClass.getDeclaredField("Companion").also { it.isAccessible = true }
+            }.getOrNull()
+            val target = companionField?.get(null) ?: requestsClass
+
+            val baseClientField = (target.javaClass.declaredFields + requestsClass.declaredFields)
+                .firstOrNull { it.type.name.contains("OkHttpClient") }
+                ?.also { it.isAccessible = true }
+
+            if (baseClientField != null) {
+                val existing = baseClientField.get(target) as? okhttp3.OkHttpClient
+                    ?: baseClientField.get(null) as? okhttp3.OkHttpClient
+                if (existing != null) {
+                    // Only add if not already present
+                    val alreadyHas = existing.interceptors.any { it is com.lagradost.cloudstream3.network.CloudflareKiller }
+                    if (!alreadyHas) {
+                        val patched = existing.newBuilder()
+                            .addInterceptor(cfKiller)
+                            .dns(AdaptiveHostDns)
+                            .build()
+                        runCatching { baseClientField.set(target, patched) }
+                        runCatching { baseClientField.set(null, patched) }
+                        ServerState.info("Configured CloudflareKiller on NiceHttp Requests.baseClient")
+                    }
+                }
+            } else {
+                ServerState.warn("[CF-DBG] Could not find OkHttpClient field in NiceHttp Requests")
+            }
+        } catch (t: Throwable) {
+            ServerState.warn("Failed to patch NiceHttp Requests.baseClient: ${t.message}")
+        }
+
+        // Steps 3 & 4 (plugin-specific patching) are deferred to
+        // configurePluginNetworkPostLoad() which runs after each plugin's
+        // classloader is set up.
+    }
+
+    /**
+     * Called after each plugin's classloader is active.
+     * Patches the plugin's own `app` (Requests) OkHttp client and injects
+     * DesktopContext into NetflixMirrorProvider so WebView-based CF bypass works.
+     */
+    private fun configurePluginNetworkPostLoad() {
+        val cfKiller = com.lagradost.cloudstream3.network.CloudflareKiller()
+
+        // Search all loaded plugin classloaders for the CNC Verse plugin classes
+        for (cl in loadedClassLoaders) {
+            // ── 3. Patch plugin `val app = Requests(...)` ─────────────────────
+            runCatching {
+                val clazz = cl.loadClass("com.horis.cncverse.UtilsKt")
+                val appField = clazz.declaredFields.firstOrNull { f ->
+                    f.name == "app" || f.type.name.contains("Requests")
+                }?.also { it.isAccessible = true } ?: return@runCatching
+                val requests = appField.get(null) ?: return@runCatching
+                val okField = requests.javaClass.declaredFields.firstOrNull {
+                    it.type.name.contains("OkHttpClient")
+                }?.also { it.isAccessible = true } ?: return@runCatching
+                val existing = okField.get(requests) as? okhttp3.OkHttpClient ?: return@runCatching
+                if (existing.interceptors.none { it is com.lagradost.cloudstream3.network.CloudflareKiller }) {
+                    val patched = existing.newBuilder().addInterceptor(cfKiller).build()
+                    okField.set(requests, patched)
+                    ServerState.info("[CF] Patched CloudflareKiller into com.horis.cncverse.UtilsKt.app")
+                }
+            }
+
+            // ── 4. Inject DesktopContext into NetflixMirrorProvider ───────────
+            // Without a non-null context, solveCloudflareInWebView() returns null
+            // immediately and the WebView stub's CDP bridge is never reached.
+            runCatching {
+                val providerClass = cl.loadClass("com.horis.cncverse.NetflixMirrorProvider")
+                val companionField = runCatching {
+                    providerClass.getDeclaredField("Companion").also { it.isAccessible = true }
+                }.getOrNull()
+                val companion = companionField?.get(null) ?: return@runCatching
+
+                val ctxField = (companion.javaClass.declaredFields + providerClass.declaredFields)
+                    .firstOrNull { it.name == "context" }
+                    ?.also { it.isAccessible = true } ?: return@runCatching
+
+                val current = runCatching { ctxField.get(companion) }.getOrNull()
+                if (current == null) {
+                    ctxField.set(companion, android.content.DesktopContext)
+                    ServerState.info("[CF] Set NetflixMirrorProvider.context = DesktopContext")
+                }
+            }
         }
     }
 

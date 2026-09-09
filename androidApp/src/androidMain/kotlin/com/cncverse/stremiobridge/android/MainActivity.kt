@@ -4,8 +4,6 @@ import android.Manifest
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
-import kotlin.io.encoding.Base64
-import kotlin.io.encoding.ExperimentalEncodingApi
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Build
@@ -37,7 +35,7 @@ class MainActivity : com.lagradost.cloudstream3.MainActivity() {
     private var serviceBound = false
     private var bridgeService: StremioForegroundService? = null
     private val activityScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
-    private val OMG10 = "aHR0cHM6Ly9vbWcxMC5jb20vNC8xMTEwNDQ4OQ=="
+
 
     private val serviceConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName, binder: IBinder) {
@@ -160,7 +158,6 @@ class MainActivity : com.lagradost.cloudstream3.MainActivity() {
         }
     }
 
-    @OptIn(ExperimentalEncodingApi::class)
     private fun onStartPressed() {
         if (ServerState.status.value is ServerStatus.Running) return
 
@@ -175,20 +172,13 @@ class MainActivity : com.lagradost.cloudstream3.MainActivity() {
             }
         }
         startBridgeService()
-        if (!isSubscribed()) {
-            openInExternalBrowser(Base64.Default.decode(OMG10).decodeToString())
-        }
     }
 
-    @OptIn(ExperimentalEncodingApi::class)
     private fun onStopPressed() {
         bridgeService?.stopServer()
         stopService(Intent(this, StremioForegroundService::class.java))
         ServerState.updateStatus(ServerStatus.Stopped)
         ServerState.info("Server stopped by user")
-        if (!isSubscribed()) {
-            openInExternalBrowser(Base64.Default.decode(OMG10).decodeToString())
-        }
     }
 
     private fun startBridgeService() {
@@ -216,24 +206,6 @@ class MainActivity : com.lagradost.cloudstream3.MainActivity() {
         }
     }
 
-    private var lastBrowserOpenMs = 0L
-    private val BROWSER_DEBOUNCE_MS = 1000L
-
-    private fun openInExternalBrowser(url: String) {
-        val now = System.currentTimeMillis()
-        if (now - lastBrowserOpenMs < BROWSER_DEBOUNCE_MS) return
-        lastBrowserOpenMs = now
-        android.os.Handler(android.os.Looper.getMainLooper()).post {
-            try {
-                this.startActivity(
-                    Intent(Intent.ACTION_VIEW, android.net.Uri.parse(url)).apply {
-                        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    }
-                )
-            } catch (e: Exception) { }
-        }
-    }
-
     private fun isSubscribed(): Boolean {
         val settings = com.cncverse.stremiobridge.repo.loadExtensionSettings()
         val mode = settings["KEY_MODE"]
@@ -243,7 +215,6 @@ class MainActivity : com.lagradost.cloudstream3.MainActivity() {
         return mode == "subscription" && token != null && (expiresAt == 0L || nowSeconds < expiresAt)
     }
 
-    @OptIn(ExperimentalEncodingApi::class)
     private fun shouldBlockIntent(intent: Intent?): Boolean {
         if (intent == null) return false
         if (intent.action == Intent.ACTION_VIEW && isSubscribed()) {
