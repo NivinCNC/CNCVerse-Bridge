@@ -7,6 +7,9 @@ package com.cncverse.stremiobridge.ui
  * On Android: no-op (Android uses the native WebView-based CloudflareKiller).
  */
 expect object CloudflareSolverState {
+    /** True on desktop (where the CDP solver is available); false on Android. */
+    val isSupported: Boolean
+
     /** Whether the desktop CF solver is enabled. */
     var enabled: Boolean
 

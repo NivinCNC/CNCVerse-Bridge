@@ -96,7 +96,8 @@ fun SettingsScreen() {
                 }
             }
 
-            // ── Cloudflare Solver ──────────────────────────────────────────
+            // ── Cloudflare Solver (desktop-only) ──────────────────────────
+            if (CloudflareSolverState.isSupported) {
             var cfEnabled by remember { mutableStateOf(CloudflareSolverState.enabled) }
 
             AmoledCard {
@@ -213,7 +214,8 @@ fun SettingsScreen() {
                         fontSize = 11.sp,
                     )
                 }
-            }
+            } // end AmoledCard
+            } // end if (CloudflareSolverState.isSupported)
 
     }
 }
