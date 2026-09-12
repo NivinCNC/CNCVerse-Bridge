@@ -22,6 +22,7 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.cncverse.stremiobridge.settings.PluginSettingSchema
 import com.cncverse.stremiobridge.settings.PluginSettingsSchemaRegistry
+import com.cncverse.stremiobridge.settings.SettingsPresentation
 import com.cncverse.stremiobridge.ui.AmoledCard
 import com.cncverse.stremiobridge.ui.AmoledCard2
 import com.cncverse.stremiobridge.ui.AmoledSurface
@@ -55,10 +56,7 @@ fun PluginSettingsDialog(
 
     val settings = remember(pluginInternalName, pluginDisplayName, schemaUpdates) {
         PluginSettingsSchemaRegistry.getSettingsForPlugin(pluginInternalName, pluginDisplayName)
-            .sortedWith(
-                compareBy<PluginSettingSchema> { getCategoryPriority(it.key) }
-                    .thenBy { getFriendlyName(it.key) },
-            )
+            .sortedWith(SettingsPresentation.settingsComparator)
     }
 
     // Current raw values from the shared settings store (everything is stringified)
@@ -169,9 +167,9 @@ fun PluginSettingsDialog(
                                 }
                             }
                         } else {
-                            val grouped = settings.groupBy { getCategory(it.key) }
+                            val grouped = settings.groupBy { SettingsPresentation.getCategory(it.key) }
                             val sortedCategories = grouped.keys.sortedBy { category ->
-                                categoryPriorities[category] ?: 4
+                                SettingsPresentation.categoryPriorities[category] ?: 4
                             }
 
                             sortedCategories.forEach { category ->
@@ -236,8 +234,8 @@ private fun SettingCard(
     rawValue: String?,
     onChanged: (String?) -> Unit,
 ) {
-    val friendly = getFriendlyName(schema.key)
-    val desc = getDescription(schema.key)
+    val friendly = SettingsPresentation.getFriendlyName(schema.key)
+    val desc = SettingsPresentation.getDescription(schema.key)
 
     Column(
         modifier = Modifier
@@ -250,7 +248,7 @@ private fun SettingCard(
         when {
             schema.options != null -> ListSetting(schema, friendly, desc, rawValue, onChanged)
             schema.type == "StringSet" -> StringSetSetting(schema, friendly, desc, rawValue, onChanged)
-            isBooleanLike(schema, rawValue) -> BooleanSetting(friendly, desc, schema, rawValue, onChanged)
+            SettingsPresentation.isBooleanLike(schema, rawValue) -> BooleanSetting(friendly, desc, schema, rawValue, onChanged)
             else -> TextSetting(schema, friendly, desc, rawValue, onChanged)
         }
     }
@@ -377,12 +375,10 @@ private fun StringSetSetting(
     rawValue: String?,
     onChanged: (String?) -> Unit,
 ) {
-    val isDisabledKey = schema.key.lowercase().contains("disabled")
+    val isDisabledKey = SettingsPresentation.isDisabledStyleKey(schema)
 
-    val currentSet = parseStoredSet(rawValue)
-    val options = ((schema.defaultValue as? Set<*>)?.map { it.toString() }?.toSet() ?: emptySet())
-        .plus(currentSet)
-        .sorted()
+    val currentSet = SettingsPresentation.parseStoredSet(rawValue)
+    val options = SettingsPresentation.stringSetOptions(schema, rawValue)
 
     Column(modifier = Modifier.fillMaxWidth()) {
         Text(friendly, color = TextPrimary, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
@@ -484,119 +480,5 @@ private fun StringSetSetting(
     }
 }
 
-/** Parses a stored set value: newline-joined (native) or legacy "[a, b]" toStrings. */
-private fun parseStoredSet(raw: String?): Set<String> {
-    if (raw.isNullOrBlank()) return emptySet()
-    val trimmed = raw.trim()
-    val items = if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
-        trimmed.removeSurrounding("[", "]").split(",")
-    } else {
-        trimmed.split("\n")
-    }
-    return items.map { it.trim() }.filter { it.isNotEmpty() }.toSet()
-}
-
-private fun isBooleanLike(schema: PluginSettingSchema, rawValue: String?): Boolean {
-    if (schema.type == "Boolean" || schema.defaultValue is Boolean) return true
-    if (rawValue == "true" || rawValue == "false") return true
-    // Plugins toggle individual providers through keys named ProviderXxx / xxxEnable
-    if (schema.key.startsWith("Provider") || schema.key.endsWith("Enable")) return true
-    return false
-}
-
-// ── Logical categorization and visual polish (mirrors cs3-desktop-client) ────
-
-private val categoryPriorities = mapOf(
-    "General Configurations" to 0,
-    "Accounts & API Integrations" to 1,
-    "Stremio & External Catalogs" to 2,
-    "Scrapers & Engines" to 3,
-)
-
-private fun getCategory(key: String): String {
-    val lower = key.lowercase()
-    return when {
-        lower.contains("stremio") || lower.contains("addon") || lower.contains("catalog") -> "Stremio & External Catalogs"
-        lower.contains("key") || lower.contains("token") || lower.contains("auth") || lower.contains("api") ||
-            lower.contains("password") || lower.contains("username") -> "Accounts & API Integrations"
-        lower.contains("provider") || lower.contains("source") || lower.contains("channel") ||
-            lower.contains("extractor") || lower.endsWith("enable") || lower.contains("concurrency") ||
-            lower.startsWith("scrape") -> "Scrapers & Engines"
-        else -> "General Configurations"
-    }
-}
-
-private fun getCategoryPriority(key: String): Int = categoryPriorities[getCategory(key)] ?: 4
-
-
-/** Explicit friendly name overrides for known plugin settings. */
-private val friendlyNameOverrides = mapOf(
-    "ProviderCineStream" to "CineStream Catalog",
-    "ProviderSimkl" to "Simkl Catalog",
-    "ProviderTmdb" to "TMDB Catalog",
-    "stremio_addons" to "Stremio Addon URLs",
-    "token" to "FebBox Token",
-    "provider_concurrency" to "Scrape Concurrency",
-    "enabled_plugins_saved" to "Enabled Providers",
-    "moviebox_host" to "MovieBox Server",
-    "ScrapeConcurrency" to "Scrape Concurrency",
-    "DownloadEnable" to "Download Only Links",
-    "showbox_ui_token" to "ShowBox Token",
-    "wyzie_subs_api_key" to "Wyzie Subtitles API Key",
-    "gramcinema_bearer_token" to "GramCinema Token",
-    "new_provider_default_on" to "Auto-Enable New Providers",
-    "cloudflare_webview_bypass_enabled" to "Cloudflare Bypass",
-)
-
-/** Explicit description overrides for known plugin settings. */
-private val descriptionOverrides = mapOf(
-    "ProviderCineStream" to "Enable the Cinemeta-backed catalog for browsing movies & shows.",
-    "ProviderSimkl" to "Enable the Simkl-backed catalog for anime & watchlist integration.",
-    "ProviderTmdb" to "Enable the TMDB-backed catalog for trending & popular content.",
-    "stremio_addons" to "Comma-separated Stremio addon manifest URLs for external catalogs.",
-    "token" to "Paste your FebBox authentication token for premium source access.",
-    "provider_concurrency" to "Max parallel scraping threads (-1 = unlimited).",
-    "enabled_plugins_saved" to "Select which scraping engines are active for this plugin.",
-    "moviebox_host" to "Select which MovieBox API server to use.",
-    "ScrapeConcurrency" to "Max parallel scraping threads (default: 10).",
-    "DownloadEnable" to "Only fetch direct download links (not for streaming).",
-    "showbox_ui_token" to "Paste your ShowBox/FebBox UI token.",
-    "wyzie_subs_api_key" to "API key for Wyzie subtitle service.",
-    "gramcinema_bearer_token" to "Bearer token for GramCinema source.",
-    "new_provider_default_on" to "Automatically enable newly added providers on update.",
-    "cloudflare_webview_bypass_enabled" to "Use WebView to bypass Cloudflare protection on supported sites.",
-)
-
-private fun getFriendlyName(key: String): String {
-    friendlyNameOverrides[key]?.let { return it }
-
-    var clean = key.substringAfterLast('/')
-    if (clean.startsWith("Provider")) {
-        clean = clean.removePrefix("Provider")
-    }
-
-    val friendly = clean.replace("_", " ")
-        .replace(Regex("([a-z])([A-Z])"), "$1 $2")
-        .trim()
-        .split(" ")
-        .joinToString(" ") { it.replaceFirstChar { c -> c.uppercaseChar() } }
-
-    return friendly
-        .replace(" Saved Links", " Links Cache")
-        .replace(" Concurrency", " Simultaneous Connections")
-}
-
-private fun getDescription(key: String): String {
-    descriptionOverrides[key]?.let { return it }
-    val friendly = getFriendlyName(key)
-    return when {
-        key.startsWith("Provider") -> "Enable or disable the $friendly search scraper channel."
-        key.lowercase().contains("concurrency") -> "Set maximum simultaneous connection threads to speed up retrieval."
-        key.lowercase().contains("token") || key.lowercase().contains("key") -> "Configure authentication credentials/API key for $friendly."
-        key.lowercase().contains("stremio") -> "Configure external streaming catalog source links."
-        key.lowercase().contains("disabled") -> "Toggle individual sub-scrapers and data sources for this plugin."
-        key.lowercase().contains("enabled") -> "Select which sub-engines are active."
-        else -> ""
-    }
-}
-
+// ── Value-rendering helpers (categorization/friendly names live in
+//    shared SettingsPresentation, shared with the web admin settings API) ──

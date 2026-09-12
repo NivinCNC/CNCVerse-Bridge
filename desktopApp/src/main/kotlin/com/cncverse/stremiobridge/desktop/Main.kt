@@ -6,11 +6,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.*
 import com.cncverse.stremiobridge.plugin.GlobalPluginManager
 import com.cncverse.stremiobridge.plugin.PluginLoader
-import com.cncverse.stremiobridge.repo.PluginInstaller
 import com.cncverse.stremiobridge.repo.RepoManager
-import com.cncverse.stremiobridge.server.StremioServer
+import com.cncverse.stremiobridge.server.BridgeRuntime
+import com.cncverse.stremiobridge.server.PlatformPaths
+import com.cncverse.stremiobridge.server.web.AdminServer
+import com.cncverse.stremiobridge.server.web.WebAdmin
 import com.cncverse.stremiobridge.state.*
-import com.cncverse.stremiobridge.tunnel.CloudflaredManager
 import com.cncverse.stremiobridge.update.GithubRelease
 import com.cncverse.stremiobridge.update.OtaUpdater
 import com.cncverse.stremiobridge.update.installOtaUpdate
@@ -25,15 +26,12 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.ui.Modifier
 import com.cncverse.stremiobridge.ui.MainScreen
 import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.first
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 import java.io.File
-import java.net.Inet4Address
-import java.net.NetworkInterface
 
 private const val DEFAULT_PORT = 8080
-private val CACHE_DIR = File(System.getProperty("user.home"), ".cncverse_bridge").absolutePath
+private val CACHE_DIR: String = PlatformPaths.cacheDir.absolutePath
 
 fun main() = application {
     // Surface fatal errors (e.g. Compose render-thread exceptions) into the
@@ -47,18 +45,23 @@ fun main() = application {
     var serverJob by remember { mutableStateOf<Job?>(null) }
     val windowState = rememberWindowState(width = 1000.dp, height = 780.dp)
     var settingsPluginId by remember { mutableStateOf<String?>(null) }
-    
+
     var updateRelease by remember { mutableStateOf<GithubRelease?>(null) }
     var otaDownloadProgress by remember { mutableStateOf<Float?>(null) }
 
     // Register the loader globally before anything else runs
     GlobalPluginManager.loader = pluginLoader
 
+    // Shared runtime wiring (also used by the web admin when CNC_WEB_ADMIN=1)
+    BridgeRuntime.cacheDir = CACHE_DIR
+    BridgeRuntime.appScope = appScope
+    WebAdmin.appScope = appScope
+    WebAdmin.preferredPort = DEFAULT_PORT
 
     fun startServer() {
         if (ServerState.status.value is ServerStatus.Running) return
         serverJob = appScope.launch {
-            runCatching { startBridge(appScope) }
+            runCatching { BridgeRuntime.startBridge(DEFAULT_PORT) }
                 .onFailure { e ->
                     ServerState.error("Fatal: ${e.message}")
                     ServerState.updateStatus(ServerStatus.Error(e.message ?: "Unknown"))
@@ -69,9 +72,12 @@ fun main() = application {
     fun stopServer() {
         serverJob?.cancel()
         serverJob = null
-        StremioServer.stop()
-        ServerState.updateStatus(ServerStatus.Stopped)
-        ServerState.info("Server stopped by user")
+        val port = ServerState.serverPort
+        BridgeRuntime.stopBridge()
+        // Keep the web admin panel reachable when it is enabled
+        if (WebAdmin.isEnabled) {
+            appScope.launch { AdminServer.ensureRunning(port) }
+        }
     }
 
     // ── App startup init (mirrors Android MainActivity.onCreate) ──────────
@@ -79,13 +85,9 @@ fun main() = application {
         // Pre-load repo list into state (before UI interactions)
         RepoManager.loadSavedRepos()
 
-        // Pre-load installed plugins and register them globally
-        val installed = withContext(Dispatchers.IO) { PluginInstaller.loadInstalledPlugins(CACHE_DIR) }
-        RepoState.setInstalledPlugins(installed)
-        installed.forEach { RepoState.setInstallState(it.internalName, PluginInstallState.Installed) }
-
-        val cs3Files = PluginInstaller.getInstalledFiles(CACHE_DIR)
-        GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
+        // Pre-load installed plugins and register them globally so the
+        // Extensions screen is browsable even before the server starts
+        BridgeRuntime.forceReloadPlugins()
 
         // Fetch metadata and available plugins so the UI is populated
         RepoManager.refreshAllRepos()
@@ -98,7 +100,12 @@ fun main() = application {
             settingsPluginId = it
             runCatching { pluginLoader.openPluginSettings(it, null) }
         }
-        
+
+        if (WebAdmin.isEnabled) {
+            ServerState.info("Web admin panel will be available at /admin once the server starts" +
+                (WebAdmin.adminToken?.let { " (protected by CNC_ADMIN_TOKEN)" } ?: ""))
+        }
+
         // OTA Update check
         appScope.launch {
             try {
@@ -148,27 +155,14 @@ fun main() = application {
                 }
             },
             onInstallPlugin = { ap ->
-                val success = PluginInstaller.installPlugin(ap, CACHE_DIR)
-                if (success) {
-                    ServerState.info("Loading installed plugin '${ap.plugin.name}'…")
-                    val installed = PluginInstaller.loadInstalledPlugins(CACHE_DIR)
-                    RepoState.setInstalledPlugins(installed)
-                    installed.forEach { RepoState.setInstallState(it.internalName, PluginInstallState.Installed) }
-
-                    val cs3Files = PluginInstaller.getInstalledFiles(CACHE_DIR)
-                    GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
-                    // No server restart needed: StremioServer reads StremioServer.loadedApis
-                    // which were repopulated by reloadAllPlugins.
+                appScope.launch {
+                    BridgeRuntime.installPlugin(ap)
                 }
             },
             onUninstallPlugin = { internalName ->
-                PluginInstaller.uninstallPlugin(internalName, CACHE_DIR)
-
-                val installed = PluginInstaller.loadInstalledPlugins(CACHE_DIR)
-                RepoState.setInstalledPlugins(installed)
-
-                val cs3Files = PluginInstaller.getInstalledFiles(CACHE_DIR)
-                GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
+                appScope.launch {
+                    BridgeRuntime.uninstallPlugin(internalName)
+                }
             },
             onAddRepo      = { url -> RepoManager.addRepo(url) },
             onRemoveRepo   = { url -> RepoManager.removeRepo(url) },
@@ -192,19 +186,17 @@ fun main() = application {
                     // re-read their prefs during load (mirrors the reference
                     // client's reload-on-close behavior)
                     appScope.launch(Dispatchers.IO) {
-                        val installed = PluginInstaller.loadInstalledPlugins(CACHE_DIR)
-                        val cs3Files = PluginInstaller.getInstalledFiles(CACHE_DIR)
-                        GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
+                        BridgeRuntime.forceReloadPlugins()
                     }
                 },
             )
         }
-        
+
         // OTA Update Dialog
         updateRelease?.let { release ->
             AlertDialog(
-                onDismissRequest = { 
-                    if (otaDownloadProgress == null) updateRelease = null 
+                onDismissRequest = {
+                    if (otaDownloadProgress == null) updateRelease = null
                 },
                 title = { Text("Update Available") },
                 text = {
@@ -262,87 +254,3 @@ private fun copyToClipboard(text: String) {
         ServerState.warn("Could not copy to clipboard: ${e.message}")
     }
 }
-
-
-/**
- * Mirrors the Android StremioForegroundService.startBridge flow:
- *  1. Load installed plugin registry from disk
- *  2. Refresh repos (background, non-blocking) + auto-update outdated plugins
- *  3. Wait for GlobalPluginManager to finish loading plugins
- *  4. Start the Ktor Stremio HTTP server
- */
-private suspend fun startBridge(appScope: CoroutineScope) {
-    ServerState.updateStatus(ServerStatus.Starting("Loading plugin registry…"))
-    val installed = withContext(Dispatchers.IO) { PluginInstaller.loadInstalledPlugins(CACHE_DIR) }
-    RepoState.setInstalledPlugins(installed)
-    installed.forEach { RepoState.setInstallState(it.internalName, PluginInstallState.Installed) }
-    ServerState.info("Found ${installed.size} installed plugin(s)")
-
-    RepoManager.loadSavedRepos()
-    ServerState.updateStatus(ServerStatus.Starting("Refreshing repos…"))
-
-    // Refresh repos in background (does NOT block server startup)
-    appScope.launch(Dispatchers.IO) {
-        runCatching {
-            RepoManager.refreshAllRepos()
-            val toUpdate = RepoState.installedPlugins.value.filter {
-                RepoState.getInstallState(it.internalName) is PluginInstallState.UpdateAvailable
-            }
-            if (toUpdate.isNotEmpty()) {
-                ServerState.info("Auto-updating ${toUpdate.size} plugin(s)…")
-                PluginInstaller.autoUpdateInstalled(CACHE_DIR)
-            }
-        }.onFailure { e ->
-            ServerState.warn("Repo refresh error: ${e.message}")
-        }
-    }
-
-    // Wait for the global plugin load kicked off at app start (bounded, so a
-    // failed load can't wedge the server in "Waiting for plugins" forever)
-    ServerState.updateStatus(ServerStatus.Starting("Waiting for plugins…"))
-    val pluginsReady = withTimeoutOrNull(30_000) {
-        GlobalPluginManager.isPluginsLoaded.first { it }
-    }
-    if (pluginsReady == null) {
-        ServerState.warn("Timed out waiting for plugin load — starting server with whatever is available")
-    }
-    val loadedInfos = ServerState.globalLoadedPlugins.value
-
-    val ipAddress = getLocalIpAddress() ?: "127.0.0.1"
-    CloudflaredManager.deviceIp = ipAddress
-    val boundPort = StremioServer.start(DEFAULT_PORT, CACHE_DIR)
-
-    ServerState.updateStatus(
-        ServerStatus.Running(
-            port          = boundPort,
-            loadedPlugins = loadedInfos,
-            ipAddress     = ipAddress,
-        )
-    )
-    ServerState.info("🎬 Bridge running at http://$ipAddress:$boundPort/manifest.json")
-
-}
-
-private fun getLocalIpAddress(): String? = try {
-    val interfaces = NetworkInterface.getNetworkInterfaces().asSequence().toList()
-    val preferred = interfaces.filter { iface ->
-        iface.isUp && !iface.isLoopback && !iface.isPointToPoint &&
-        (iface.name.contains("wlan", ignoreCase = true) ||
-         iface.name.contains("eth", ignoreCase = true) ||
-         iface.name.contains("en", ignoreCase = true))
-    }
-    val candidates = if (preferred.isNotEmpty()) preferred else interfaces.filter { iface ->
-        iface.isUp && !iface.isLoopback && !iface.isPointToPoint &&
-        !iface.name.contains("p2p", ignoreCase = true) &&
-        !iface.name.contains("dummy", ignoreCase = true) &&
-        !iface.name.contains("tun", ignoreCase = true) &&
-        !iface.name.contains("rmnet", ignoreCase = true)
-    }
-    candidates
-        .flatMap { it.inetAddresses.asSequence() }
-        .filterIsInstance<Inet4Address>()
-        .filter { !it.isLoopbackAddress && it.isSiteLocalAddress }
-        .map { it.hostAddress }
-        .sorted()
-        .firstOrNull()
-} catch (_: Exception) { null }

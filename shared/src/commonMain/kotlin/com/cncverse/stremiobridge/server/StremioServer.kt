@@ -178,6 +178,21 @@ object StremioServer {
         ServerState.info("Stremio server stopped")
     }
 
+    /**
+     * Toggles a plugin's enabled state and persists it. Returns the new enabled state.
+     */
+    fun togglePluginDisabled(internalName: String): Boolean {
+        val enabled = if (disabledPlugins.contains(internalName)) {
+            disabledPlugins.remove(internalName)
+            true
+        } else {
+            disabledPlugins.add(internalName)
+            false
+        }
+        saveDisabledPlugins()
+        return enabled
+    }
+
     private fun Application.setupPlugins() {
         install(ContentNegotiation) { json(serverJson) }
         
@@ -196,6 +211,7 @@ object StremioServer {
 
     private fun Application.setupRoutes() {
         setupMpdProxyRoutes()
+        setupWebAdminRoutes()
         routing {
             // 📺 Status Page 📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺
             get("/") {
@@ -639,4 +655,11 @@ fun MediaInfo.toStremiMeta(pluginInternalName: String, stremioType: String) = St
 )
 
 expect fun Application.setupMpdProxyRoutes()
+
+/**
+ * Platform hook for the web admin panel routes. Mounted inside the main addon
+ * server engine when enabled (desktop with CNC_WEB_ADMIN=1, always on in the
+ * headless server app); a no-op on Android.
+ */
+expect fun Application.setupWebAdminRoutes()
 

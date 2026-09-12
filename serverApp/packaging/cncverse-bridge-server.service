@@ -1,0 +1,32 @@
+[Unit]
+Description=CNCVerse Bridge Server (headless Stremio addon bridge)
+Documentation=https://github.com/NivinCNC/CNCVerse-Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=cncverse
+Group=cncverse
+# Adjust install prefix below to match where the package was installed
+ExecStart=/usr/lib/cncverse-bridge-server/bin/cncverse-bridge-server
+WorkingDirectory=/usr/lib/cncverse-bridge-server
+Environment=CNC_PORT=8080
+# Persistent data lives under the service user's home:
+#   ~/.cncverse        (repos, extension settings, cloudflared binary)
+#   ~/.cncverse_bridge (downloaded .cs3 plugins)
+# Override with CNC_CONFIG_DIR / CNC_CACHE_DIR if desired.
+# Optional: protect the web admin panel with a token
+#Environment=CNC_ADMIN_TOKEN=change-me
+Restart=on-failure
+RestartSec=5
+SuccessExitStatus=143
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

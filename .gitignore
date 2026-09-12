@@ -8,3 +8,6 @@ local.properties
 .idea/
 .DS_Store
 Thumbs.db
+
+# headless server packaging output
+serverApp/dist/

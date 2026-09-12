@@ -1,13 +1,10 @@
 package com.cncverse.stremiobridge.repo
 
+import com.cncverse.stremiobridge.server.PlatformPaths
 import java.io.File
 
 private val repoUrlsFile: File
-    get() {
-        val dir = File(System.getProperty("user.home"), ".cncverse")
-        dir.mkdirs()
-        return File(dir, "repos.txt")
-    }
+    get() = PlatformPaths.fileInConfigDir("repos.txt")
 
 actual fun loadRepoUrls(): List<String> {
     val f = repoUrlsFile
@@ -20,11 +17,7 @@ actual fun saveRepoUrls(urls: List<String>) {
 }
 
 private val extSettingsFile: File
-    get() {
-        val dir = File(System.getProperty("user.home"), ".cncverse")
-        dir.mkdirs()
-        return File(dir, "ext_settings.txt")
-    }
+    get() = PlatformPaths.fileInConfigDir("ext_settings.txt")
 
 actual fun loadExtensionSettings(): Map<String, String> {
     val f = extSettingsFile

@@ -151,8 +151,19 @@ object SystemBrowserCdpBypass {
         } else {
             edgePaths.add(File("/usr/bin/microsoft-edge-stable"))
             edgePaths.add(File("/usr/bin/microsoft-edge"))
+            edgePaths.add(File("/usr/bin/microsoft-edge-beta"))
+            edgePaths.add(File("/usr/bin/microsoft-edge-dev"))
             chromePaths.add(File("/usr/bin/google-chrome-stable"))
             chromePaths.add(File("/usr/bin/google-chrome"))
+            chromePaths.add(File("/usr/bin/google-chrome-beta"))
+            chromePaths.add(File("/usr/bin/google-chrome-unstable"))
+            // Chromium is the standard browser on many distros
+            chromePaths.add(File("/usr/bin/chromium"))
+            chromePaths.add(File("/usr/bin/chromium-browser"))
+            chromePaths.add(File("/usr/bin/brave-browser"))
+            chromePaths.add(File("/snap/bin/chromium"))
+            chromePaths.add(File("/opt/google/chrome/chrome"))
+            chromePaths.add(File("/opt/chromium/chromium"))
         }
 
         val browserFile = when {
@@ -506,9 +517,15 @@ object SystemBrowserCdpBypass {
 
     private fun destroyBrowserSession(process: Process, sessionDirName: String, userDataDir: File) {
         runCatching { process.destroy() }
+        val osName = System.getProperty("os.name", "").lowercase()
         runCatching {
-            val script = "Get-CimInstance Win32_Process -Filter \"Name = 'msedge.exe' OR Name = 'chrome.exe'\" | Where-Object { \$_.CommandLine -match '$sessionDirName' } | Invoke-CimMethod -MethodName Terminate"
-            ProcessBuilder("powershell", "-NoProfile", "-Command", script).start().waitFor()
+            if (osName.contains("win")) {
+                val script = "Get-CimInstance Win32_Process -Filter \"Name = 'msedge.exe' OR Name = 'chrome.exe'\" | Where-Object { \$_.CommandLine -match '$sessionDirName' } | Invoke-CimMethod -MethodName Terminate"
+                ProcessBuilder("powershell", "-NoProfile", "-Command", script).start().waitFor()
+            } else {
+                // Unix: kill any stragglers still referencing the temp profile dir
+                ProcessBuilder("pkill", "-f", sessionDirName).start().waitFor()
+            }
         }
         runCatching {
             Thread.sleep(1000)

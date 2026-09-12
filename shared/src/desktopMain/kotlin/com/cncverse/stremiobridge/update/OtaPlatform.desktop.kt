@@ -17,7 +17,7 @@ actual fun saveOtaFile(data: ByteArray, fileName: String): String {
 }
 
 /**
- * Desktop OTA: launch the downloaded installer (.msi or .exe) and exit
+ * Desktop OTA: launch the downloaded installer (.msi/.exe/.deb/.dmg) and exit
  * so the installer can replace the running application files.
  */
 actual fun installOtaUpdate(filePath: String) {
@@ -44,8 +44,16 @@ actual fun installOtaUpdate(filePath: String) {
                 ProcessBuilder("open", filePath).start()
             }
             else -> {
-                // Linux — try to open with default handler
-                ProcessBuilder("xdg-open", filePath).start()
+                // Linux: .deb — install through the package manager with a GUI
+                // privilege prompt (pkexec), falling back to the software store
+                // (xdg-open) and finally a plain dpkg hint.
+                val launched = runCatching {
+                    ProcessBuilder("pkexec", "dpkg", "-i", filePath).start()
+                    true
+                }.getOrElse { false }
+                if (!launched) {
+                    runCatching { ProcessBuilder("xdg-open", filePath).start() }
+                }
             }
         }
         ServerState.info("OTA installer launched: $filePath — exiting app for update…")

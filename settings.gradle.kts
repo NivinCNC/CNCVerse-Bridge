@@ -23,3 +23,4 @@ rootProject.name = "CNCVerseStremioBridge"
 include(":shared")
 include(":androidApp")
 include(":desktopApp")
+include(":serverApp")

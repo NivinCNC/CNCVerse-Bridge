@@ -57,7 +57,7 @@ compose.desktop {
         mainClass = "com.cncverse.stremiobridge.desktop.MainKt"
 
         nativeDistributions {
-            targetFormats(TargetFormat.Msi, TargetFormat.Exe)
+            targetFormats(TargetFormat.Msi, TargetFormat.Exe, TargetFormat.Deb)
             // jdk.zipfs — dex2jar writes converted jars via the zip filesystem provider
             // jdk.unsupported / java.scripting — commonly needed by plugin libraries
             // (sun.misc.Unsafe, Rhino JS eval)
@@ -72,6 +72,16 @@ compose.desktop {
                 upgradeUuid = "b3f5e2a1-4c8d-4f3e-b7c2-9d1e5f6a8b0c"
                 iconFile.set(project.file("src/main/resources/icon.ico"))
                 shortcut = true
+            }
+
+            linux {
+                // debMaintainer is required by the .deb target
+                debMaintainer = "NivinCNC <nivincnc@users.noreply.github.com>"
+                iconFile.set(project.file("src/main/resources/logo.png"))
+                shortcut = true
+                menuGroup = "CNCVerse"
+                // rpm also supported: uncomment to ship both
+                // packageName stays "CNCVerse Bridge"; the .deb installs to /opt
             }
         }
 

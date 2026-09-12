@@ -1,18 +1,13 @@
 package com.cncverse.stremiobridge.tunnel
 
+import com.cncverse.stremiobridge.server.PlatformPaths
 import java.io.File
 
 actual fun getCloudflaredBinaryPath(): String {
     val os = System.getProperty("os.name", "").lowercase()
-    val isWindows = os.contains("win")
-    val fileName = if (isWindows) "cloudflared.exe" else "cloudflared"
-    
-    val userHome = System.getProperty("user.home", ".")
-    val dir = File(userHome, ".cncverse")
-    if (!dir.exists()) {
-        dir.mkdirs()
-    }
-    return File(dir, fileName).absolutePath
+    val fileName = if (os.contains("win")) "cloudflared.exe" else "cloudflared"
+
+    return File(PlatformPaths.configDir, fileName).absolutePath
 }
 
 actual fun setFileExecutable(filePath: String) {
