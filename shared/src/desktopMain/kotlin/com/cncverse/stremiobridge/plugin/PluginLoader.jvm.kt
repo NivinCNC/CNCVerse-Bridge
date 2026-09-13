@@ -48,7 +48,7 @@ private val looseJson = Json { ignoreUnknownKeys = true }
  * are real [MainAPI] instances and can be called directly (no reflection).
  */
 /** Cache/transformer version — bump when PluginBytecodeTransformer behavior changes. */
-private const val TRANSFORMER_VERSION = 4
+private const val TRANSFORMER_VERSION = PluginBytecodeTransformer.VERSION
 
 actual class PluginLoader {
 
@@ -309,7 +309,22 @@ actual class PluginLoader {
             setFieldViaReflection(pluginInstance, "filename", cs3File.absolutePath)
 
             // Attach .cs3-backed resources so resource-based settings UIs work
-            PluginResources.attachIfPresent(cs3File, classLoader, pluginInstance)
+            if (PluginResources.attachIfPresent(cs3File, classLoader, pluginInstance)) {
+                // Expose them to the AXML inflater too (layout/settings fragments)
+                var resCls: Class<*>? = pluginInstance.javaClass
+                var pluginResources: PluginResources? = null
+                while (resCls != null && pluginResources == null) {
+                    runCatching {
+                        val f = resCls!!.getDeclaredField("resources")
+                        f.isAccessible = true
+                        (f.get(pluginInstance) as? PluginResources)?.let { pluginResources = it }
+                    }
+                    resCls = resCls?.superclass
+                }
+                pluginResources?.let {
+                    com.cncverse.stremiobridge.shadowui.ShadowResourceRegistry.register(data.internalName, it)
+                }
+            }
 
             // ── Step 5: Call load() — prefer load(Context), fall back to load() ─
             val loadMethodWithContext = runCatching {
@@ -539,25 +554,29 @@ actual class PluginLoader {
     fun getPluginInstance(internalName: String): Any? = loadedPlugins[internalName]
 
     actual fun openPluginSettings(internalName: String, activityContext: Any?) {
-        // Desktop settings discovery: execute the plugin's openSettings lambda.
-        // Its Android UI calls are neutered no-ops (PluginBytecodeTransformer),
-        // but the key reads inside (DataStore/SharedPreferences) hit our
-        // functional stubs and register every setting in the schema registry —
-        // which the settings dialog then renders.
+        // Full settings UI: run the plugin's openSettings lambda against the
+        // recording stubs. Every AlertDialog.show()/DialogFragment.show() it
+        // performs is captured by ShadowUi and rendered natively by Compose;
+        // DataStore key reads still register in the schema registry as a
+        // fallback for plugins without UI code.
         val pluginInstance = loadedPlugins[internalName] ?: run {
             ServerState.warn("Settings unavailable: '$internalName' is not loaded")
             return
         }
         val openSettings = getOpenSettings(pluginInstance) ?: run {
-            ServerState.warn("Settings unavailable for '$internalName' (no openSettings declared)")
+            ServerState.info("'$internalName' declares no settings UI — schema fallback only")
             return
         }
+        com.cncverse.stremiobridge.shadowui.ShadowUi.beginSession(internalName)
         val context = activityContext as? android.content.Context ?: android.content.DesktopContext
-        runCatching { openSettings(context) }
-            .onSuccess { ServerState.info("Executed settings discovery for '$internalName'") }
-            .onFailure { error ->
-                ServerState.warn("Settings discovery for '$internalName' failed: ${error.message}")
-            }
+        try {
+            openSettings(context)
+            ServerState.info("Executed settings UI code for '$internalName'")
+        } catch (t: Throwable) {
+            ServerState.warn("Settings UI execution for '$internalName' failed: ${t.message}")
+        } finally {
+            com.cncverse.stremiobridge.shadowui.ShadowUi.finishSessionDelayed()
+        }
     }
 
     actual fun unloadAll() {

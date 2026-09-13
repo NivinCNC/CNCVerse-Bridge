@@ -94,3 +94,18 @@ compose.desktop {
         jvmArgs("-Dfile.encoding=UTF-8")
     }
 }
+
+// Headless smoke test for the ShadowUi recording layer against real .cs3 plugins.
+tasks.register<JavaExec>("shadowSmokeTest") {
+    group = "verification"
+    description = "Loads real .cs3 plugins, runs their settings UI code, verifies ShadowUi capture"
+    dependsOn(":desktopApp:compileKotlinDesktop")
+    val mainOutput = kotlin.targets["desktop"].compilations.getByName("main").output
+    classpath = files(mainOutput.allOutputs) + configurations["desktopRuntimeClasspath"]
+    mainClass.set("com.cncverse.stremiobridge.desktop.ShadowSmokeTestKt")
+    maxHeapSize = "2200m"
+    if (project.hasProperty("cs3dir")) {
+        val extra = (project.properties["cs3dir"] as String).split(" ").filter { it.isNotBlank() }
+        args = extra
+    }
+}

@@ -22,25 +22,53 @@ open class Context {
     open fun getFilesDir(): File = File(System.getProperty("user.home"), ".cncverse_bridge")
     open fun getCacheDir(): File = File(getFilesDir(), "cache").apply { mkdirs() }
     open fun getPackageName(): String = "com.cncverse.stremiobridge.desktop"
-    open fun getSystemService(name: String): Any? = null
+
+    private val activityManagerInstance = lazy { android.app.ActivityManager() }
+
+    open fun getSystemService(name: String): Any? = when (name) {
+        CLIPBOARD_SERVICE -> clipboard
+        LAYOUT_INFLATER_SERVICE -> android.view.LayoutInflater.from(this)
+        INPUT_METHOD_SERVICE -> InputMethodManager
+        ACTIVITY_SERVICE -> activityManagerInstance.value
+        else -> null
+    }
+
+    private val clipboard = ClipboardManager()
+
     open fun getString(resId: Int, vararg formatArgs: Any): String = ""
     open fun getPackageManager(): android.content.pm.PackageManager = android.content.pm.PackageManager()
     open fun getResources(): android.content.res.Resources = android.content.res.Resources()
+    fun getMainLooper(): android.os.Looper = android.os.Looper.getMainLooper()
+    fun getSystemServiceName(serviceClass: Class<*>): String? = null
     open fun registerActivityLifecycleCallbacks(callbacks: Any) {}
     open fun unregisterActivityLifecycleCallbacks(callbacks: Any) {}
 
     companion object {
         const val MODE_PRIVATE = 0
         const val MODE_APPEND = 32768
+        const val CLIPBOARD_SERVICE = "clipboard"
+        const val LAYOUT_INFLATER_SERVICE = "layout_inflater"
+        const val INPUT_METHOD_SERVICE = "input_method"
+        const val ACTIVITY_SERVICE = "activity"
+        const val AUDIO_SERVICE = "audio"
+        const val NOTIFICATION_SERVICE = "notification"
+        const val CONNECTIVITY_SERVICE = "connectivity"
     }
+}
+
+/** Soft-keyboard stub — desktop dialogs show focus without an IME. */
+object InputMethodManager {
+    @JvmStatic fun showSoftInput(view: android.view.View?, flags: Int): Boolean = true
+    @JvmStatic fun hideSoftInputFromWindow(windowToken: Any?, flags: Int): Boolean = true
+    fun toggleSoftInput(showFlags: Int, hideFlags: Int) {}
 }
 
 /**
  * Singleton context handed to plugins that request one. Extends the
- * AppCompatActivity stub so plugins casting the context to an Activity
- * (settings/dialog code paths) don't crash on desktop.
+ * FragmentActivity stub so plugins casting the context to an Activity or
+ * using support fragments (settings dialogs) work on desktop.
  */
-object DesktopContext : androidx.appcompat.app.AppCompatActivity()
+object DesktopContext : androidx.fragment.app.FragmentActivity()
 
 interface SharedPreferences {
     interface Editor {

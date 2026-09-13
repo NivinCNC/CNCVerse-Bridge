@@ -98,11 +98,14 @@ class PluginResources(
 
     override fun getString(id: Int): String = arsc?.stringValues?.get(id) ?: super.getString(id)
 
+    /** String resolution used by the AXML inflater for @string references. */
+    fun resolveString(id: Int): String? = arsc?.stringValues?.get(id)
+
     override fun getDrawable(id: Int): android.graphics.drawable.Drawable? =
         arsc?.entryPaths?.get(id)?.let { entry ->
             runCatching {
                 ZipFile(cs3File).use { zip ->
-                    zip.getEntry(entry)?.let { android.graphics.drawable.Drawable() }
+                    zip.getEntry(entry)?.let { android.graphics.drawable.NamedDrawable(entry.substringAfterLast('/')) }
                 }
             }.getOrNull()
         } ?: super.getDrawable(id)

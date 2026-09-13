@@ -45,7 +45,9 @@ class ComponentName(val pkg: String, val cls: String) {
 }
 
 class ClipData(val label: CharSequence?) {
-    class Item(val text: CharSequence?)
+    class Item(@JvmField val text: CharSequence?, @JvmField val htmlText: String? = null) {
+        fun coerceToText(context: Context?): CharSequence? = text
+    }
 
     private val items = mutableListOf<Item>()
     val itemCount: Int get() = items.size
@@ -59,7 +61,21 @@ class ClipData(val label: CharSequence?) {
     }
 }
 
+/** Wired to the desktop AWT clipboard so plugins can copy tokens. */
 class ClipboardManager {
-    var primaryClip: ClipData? = null
+    @JvmField var primaryClip: ClipData? = null
+
+    fun setPrimaryClip(clip: ClipData?) {
+        primaryClip = clip
+        try {
+            val text = clip?.getItemAt(0)?.text?.toString() ?: return
+            java.awt.Toolkit.getDefaultToolkit().systemClipboard.setContents(
+                java.awt.datatransfer.StringSelection(text), null
+            )
+        } catch (_: Throwable) {
+        }
+    }
+
     fun hasPrimaryClip(): Boolean = primaryClip != null
+    fun clearPrimaryClip() { primaryClip = null }
 }

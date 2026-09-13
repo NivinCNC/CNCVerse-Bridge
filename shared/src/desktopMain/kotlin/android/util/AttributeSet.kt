@@ -8,6 +8,7 @@ interface AttributeSet {
     fun getAttributeName(index: Int): String
     fun getAttributeValue(index: Int): String
     fun getAttributeValue(name: String): String
+    fun getAttributeValue(namespace: String?, name: String?): String?
     fun getAttributeBooleanValue(index: Int, defaultValue: Boolean): Boolean
     fun getAttributeBooleanValue(namespace: String?, name: String, defaultValue: Boolean): Boolean
     fun getAttributeIntValue(index: Int, defaultValue: Int): Int

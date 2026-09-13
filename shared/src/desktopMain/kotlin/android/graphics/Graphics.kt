@@ -65,6 +65,12 @@ class Typeface private constructor() {
         @JvmField val SANS_SERIF: Typeface = Typeface()
         @JvmField val SERIF: Typeface = Typeface()
 
+        // Style constants (plugins reference these as static fields)
+        @JvmField val NORMAL: Int = 0
+        @JvmField val BOLD: Int = 1
+        @JvmField val ITALIC: Int = 2
+        @JvmField val BOLD_ITALIC: Int = 3
+
         @JvmStatic
         fun create(family: Typeface?, style: Int): Typeface =
             if (style == 1) DEFAULT_BOLD else DEFAULT

@@ -21,9 +21,13 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Text
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.width
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.ui.Modifier
+import com.cncverse.stremiobridge.shadowui.ShadowUi
 import com.cncverse.stremiobridge.ui.MainScreen
 import kotlinx.coroutines.*
 import java.awt.Toolkit
@@ -98,7 +102,53 @@ fun main() = application {
         // Testing hook: open a plugin's settings dialog on launch (gear button)
         System.getenv("CNC_TEST_GEAR")?.let {
             settingsPluginId = it
-            runCatching { pluginLoader.openPluginSettings(it, null) }
+            appScope.launch(Dispatchers.IO) {
+                runCatching { pluginLoader.openPluginSettings(it, null) }
+            }
+        }
+
+        // Testing hook: simulate a click on the Nth clickable in the shadow UI
+        // (exercises the same dispatch path as a real user click).
+        System.getenv("CNC_SIMULATE_CLICK")?.toIntOrNull()?.let { clickIndex ->
+            val clickDelay = System.getenv("CNC_SIMULATE_CLICK_DELAY")?.toLongOrNull() ?: 4000
+            appScope.launch {
+                kotlinx.coroutines.delay(clickDelay)
+                runCatching {
+                    var index = 0
+                    android.view.ShadowClickHelper.findNthClickable { view ->
+                        if (index == clickIndex) {
+                            view.performClick()
+                            true
+                        } else {
+                            index++
+                            false
+                        }
+                    }
+                }
+            }
+        }
+
+        // Testing hook: capture a screenshot after the UI settles (xvfb runs).
+        System.getenv("CNC_SCREENSHOT")?.let { shotPath ->
+            val delayMs = System.getenv("CNC_SCREENSHOT_DELAY")?.toLongOrNull() ?: 9000
+            appScope.launch {
+                kotlinx.coroutines.delay(delayMs)
+                runCatching {
+                    val robot = java.awt.Robot()
+                    val screen = Toolkit.getDefaultToolkit().screenSize
+                    val image = robot.createScreenCapture(
+                        java.awt.Rectangle(0, 0, screen.width.coerceAtMost(1400), screen.height.coerceAtMost(900)),
+                    )
+                    val out = File(shotPath)
+                    out.parentFile?.mkdirs()
+                    javax.imageio.ImageIO.write(image, "png", out)
+                    ServerState.info("Screenshot saved: ${out.absolutePath}")
+                }.onFailure { ServerState.warn("Screenshot failed: ${it.message}") }
+                if (System.getenv("CNC_SCREENSHOT_EXIT") == "1") {
+                    stopServer()
+                    exitApplication()
+                }
+            }
         }
 
         if (WebAdmin.isEnabled) {
@@ -170,26 +220,54 @@ fun main() = application {
             windowWidthClass = windowWidthClass,
         )
 
-        // Plugin settings dialog (gear button) — desktop-native rendering of the
-        // settings keys the plugin registered through CloudStreamApp/DataStore.
-        // Must compose inside the Window: dialogs need the scene context.
+        // Plugin settings (gear button). Plugins with their own settings UI
+        // (AlertDialog / DialogFragment code paths) render through ShadowUi —
+        // the plugin's real UI running against recording stubs. Plugins without
+        // UI code fall back to the schema-registry dialog.
         settingsPluginId?.let { pluginId ->
-            val displayName = RepoState.installedPlugins.value
-                .firstOrNull { it.internalName == pluginId }?.displayName
-                ?: pluginId
-            PluginSettingsDialog(
-                pluginInternalName = pluginId,
-                pluginDisplayName = displayName,
-                onDismiss = {
+            val shadowDialogs by ShadowUi.dialogs.collectAsState()
+            val sessionState by ShadowUi.sessionState.collectAsState()
+            val producedDialogs by ShadowUi.sessionProducedDialogs.collectAsState()
+
+            when {
+                // Live plugin-rendered settings UI
+                shadowDialogs.isNotEmpty() -> ShadowUiHost()
+
+                // openSettings is executing on a worker thread — show a spinner
+                sessionState == ShadowUi.SessionState.Running -> LoadingSettingsDialog(
+                    pluginName = RepoState.installedPlugins.value
+                        .firstOrNull { it.internalName == pluginId }?.displayName ?: pluginId,
+                )
+
+                // Session finished without any UI → schema fallback
+                !producedDialogs -> {
+                    val displayName = RepoState.installedPlugins.value
+                        .firstOrNull { it.internalName == pluginId }?.displayName
+                        ?: pluginId
+                    PluginSettingsDialog(
+                        pluginInternalName = pluginId,
+                        pluginDisplayName = displayName,
+                        onDismiss = {
+                            settingsPluginId = null
+                            appScope.launch(Dispatchers.IO) {
+                                val installed = PluginInstaller.loadInstalledPlugins(CACHE_DIR)
+                                val cs3Files = PluginInstaller.getInstalledFiles(CACHE_DIR)
+                                GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
+                            }
+                        },
+                    )
+                }
+
+                // Plugin UI produced dialogs and the stack is now empty → done.
+                else -> LaunchedEffect(pluginId) {
+                    ShadowUi.endSession()
                     settingsPluginId = null
-                    // Apply changed settings without an app restart: providers
-                    // re-read their prefs during load (mirrors the reference
-                    // client's reload-on-close behavior)
-                    appScope.launch(Dispatchers.IO) {
-                        BridgeRuntime.forceReloadPlugins()
-                    }
-                },
-            )
+                    // Apply changed settings without restart, like the fallback path.
+                    val installed = withContext(Dispatchers.IO) { PluginInstaller.loadInstalledPlugins(CACHE_DIR) }
+                    val cs3Files = withContext(Dispatchers.IO) { PluginInstaller.getInstalledFiles(CACHE_DIR) }
+                    GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
+                }
+            }
         }
 
         // OTA Update Dialog
@@ -254,3 +332,106 @@ private fun copyToClipboard(text: String) {
         ServerState.warn("Could not copy to clipboard: ${e.message}")
     }
 }
+
+/** Spinner shown while the plugin's settings UI code executes on a worker thread. */
+@Composable
+private fun LoadingSettingsDialog(pluginName: String) {
+    AlertDialog(
+        onDismissRequest = {},
+        confirmButton = {},
+        title = { Text("$pluginName Settings") },
+        text = {
+            Row(
+                verticalAlignment = androidx.compose.ui.Alignment.CenterVertically,
+                horizontalArrangement = androidx.compose.foundation.layout.Arrangement.spacedBy(14.dp),
+            ) {
+                CircularProgressIndicator(modifier = Modifier.height(22.dp).width(22.dp), strokeWidth = 2.dp)
+                Text("Opening $pluginName settings…")
+            }
+        },
+    )
+}
+
+
+/**
+ * Mirrors the Android StremioForegroundService.startBridge flow:
+ *  1. Load installed plugin registry from disk
+ *  2. Refresh repos (background, non-blocking) + auto-update outdated plugins
+ *  3. Wait for GlobalPluginManager to finish loading plugins
+ *  4. Start the Ktor Stremio HTTP server
+ */
+private suspend fun startBridge(appScope: CoroutineScope) {
+    ServerState.updateStatus(ServerStatus.Starting("Loading plugin registry…"))
+    val installed = withContext(Dispatchers.IO) { PluginInstaller.loadInstalledPlugins(CACHE_DIR) }
+    RepoState.setInstalledPlugins(installed)
+    installed.forEach { RepoState.setInstallState(it.internalName, PluginInstallState.Installed) }
+    ServerState.info("Found ${installed.size} installed plugin(s)")
+
+    RepoManager.loadSavedRepos()
+    ServerState.updateStatus(ServerStatus.Starting("Refreshing repos…"))
+
+    // Refresh repos in background (does NOT block server startup)
+    appScope.launch(Dispatchers.IO) {
+        runCatching {
+            RepoManager.refreshAllRepos()
+            val toUpdate = RepoState.installedPlugins.value.filter {
+                RepoState.getInstallState(it.internalName) is PluginInstallState.UpdateAvailable
+            }
+            if (toUpdate.isNotEmpty()) {
+                ServerState.info("Auto-updating ${toUpdate.size} plugin(s)…")
+                PluginInstaller.autoUpdateInstalled(CACHE_DIR)
+            }
+        }.onFailure { e ->
+            ServerState.warn("Repo refresh error: ${e.message}")
+        }
+    }
+
+    // Wait for the global plugin load kicked off at app start (bounded, so a
+    // failed load can't wedge the server in "Waiting for plugins" forever)
+    ServerState.updateStatus(ServerStatus.Starting("Waiting for plugins…"))
+    val pluginsReady = withTimeoutOrNull(30_000) {
+        GlobalPluginManager.isPluginsLoaded.first { it }
+    }
+    if (pluginsReady == null) {
+        ServerState.warn("Timed out waiting for plugin load — starting server with whatever is available")
+    }
+    val loadedInfos = ServerState.globalLoadedPlugins.value
+
+    val ipAddress = getLocalIpAddress() ?: "127.0.0.1"
+    CloudflaredManager.deviceIp = ipAddress
+    val boundPort = StremioServer.start(DEFAULT_PORT, CACHE_DIR)
+
+    ServerState.updateStatus(
+        ServerStatus.Running(
+            port          = boundPort,
+            loadedPlugins = loadedInfos,
+            ipAddress     = ipAddress,
+        )
+    )
+    ServerState.info("🎬 Bridge running at http://$ipAddress:$boundPort/manifest.json")
+
+}
+
+private fun getLocalIpAddress(): String? = try {
+    val interfaces = NetworkInterface.getNetworkInterfaces().asSequence().toList()
+    val preferred = interfaces.filter { iface ->
+        iface.isUp && !iface.isLoopback && !iface.isPointToPoint &&
+        (iface.name.contains("wlan", ignoreCase = true) ||
+         iface.name.contains("eth", ignoreCase = true) ||
+         iface.name.contains("en", ignoreCase = true))
+    }
+    val candidates = if (preferred.isNotEmpty()) preferred else interfaces.filter { iface ->
+        iface.isUp && !iface.isLoopback && !iface.isPointToPoint &&
+        !iface.name.contains("p2p", ignoreCase = true) &&
+        !iface.name.contains("dummy", ignoreCase = true) &&
+        !iface.name.contains("tun", ignoreCase = true) &&
+        !iface.name.contains("rmnet", ignoreCase = true)
+    }
+    candidates
+        .flatMap { it.inetAddresses.asSequence() }
+        .filterIsInstance<Inet4Address>()
+        .filter { !it.isLoopbackAddress && it.isSiteLocalAddress }
+        .map { it.hostAddress }
+        .sorted()
+        .firstOrNull()
+} catch (_: Exception) { null }

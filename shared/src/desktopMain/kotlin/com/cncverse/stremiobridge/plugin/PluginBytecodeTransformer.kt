@@ -10,6 +10,7 @@ import org.objectweb.asm.Type
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
@@ -17,19 +18,128 @@ import java.util.zip.ZipOutputStream
 /**
  * Rewrites dex2jar output so plugins run safely on the desktop JVM:
  *
- *  1. Android UI calls (widgets, views, dialogs, androidx) are replaced with
- *     stack-neutral no-ops that return default values — settings dialogs and
- *     other UI code paths become inert instead of crashing with
- *     NoSuchMethodError. The stub classes still exist for verification.
+ *  1. Android UI calls (widgets, views, dialogs, androidx) are passed through
+ *     WHEN the host provides a matching recording stub member — this is what
+ *     makes full plugin settings UIs render through ShadowUi. Calls with no
+ *     stub are replaced with stack-neutral no-ops returning default values,
+ *     so unknown APIs degrade that one feature instead of crashing.
  *  2. System.exit / Runtime.exit / Runtime.exec are redirected to guards so a
  *     plugin can't kill or fork from the bridge process.
  *  3. dex2jar renames inline-class methods ("box-impl" → "box_impl"); the
  *     names are restored so Kotlin linkage works.
  *
- * Android classes we provide FUNCTIONAL stubs for (util, text, net, os,
- * content, graphics core) are deliberately NOT neutered.
+ * Android classes with FUNCTIONAL stubs (util, text, net, os, content) are not
+ * touched at all — they always ran for real.
  */
 object PluginBytecodeTransformer {
+
+    /** Cache/transformer version — bump when passthrough behavior changes. */
+    const val VERSION = 5
+
+    /** (owner, name, desc) → member exists on the host stubs? */
+    private val methodCache = ConcurrentHashMap<String, Boolean>()
+    private val fieldCache = ConcurrentHashMap<String, Boolean>()
+
+    private val hostClassLoader: ClassLoader get() = PluginBytecodeTransformer::class.java.classLoader
+
+    private fun loadHostClass(internalName: String): Class<*>? =
+        try {
+            hostClassLoader.loadClass(internalName.replace('/', '.'))
+        } catch (_: Throwable) {
+            null
+        }
+
+    private fun loadDescriptorType(descriptor: String): Class<*>? = try {
+        when (descriptor) {
+            "V" -> java.lang.Void.TYPE
+            "Z" -> java.lang.Boolean.TYPE
+            "B" -> java.lang.Byte.TYPE
+            "C" -> java.lang.Character.TYPE
+            "S" -> java.lang.Short.TYPE
+            "I" -> java.lang.Integer.TYPE
+            "J" -> java.lang.Long.TYPE
+            "F" -> java.lang.Float.TYPE
+            "D" -> java.lang.Double.TYPE
+            else -> when {
+                descriptor.startsWith("L") -> loadHostClass(descriptor.substring(1, descriptor.length - 1).replace('/', '.'))
+                descriptor.startsWith("[") -> {
+                    // Arrays: normalize to dotted name with []
+                    val element = descriptor.removePrefix("[" )
+                    val cls = when {
+                        element.startsWith("L") -> loadHostClass(element.substring(1, element.length - 1).replace('/', '.'))
+                        else -> loadDescriptorType(element)
+                    }
+                    cls?.let { c -> java.lang.reflect.Array.newInstance(c, 0).javaClass }
+                }
+                else -> null
+            }
+        }
+    } catch (_: Throwable) {
+        null
+    }
+
+    /**
+     * True when the host stub (or any supertype) declares this exact member —
+     * meaning the call can safely execute against the recording stub.
+     */
+    private fun memberResolves(owner: String, name: String, desc: String, wantMethod: Boolean): Boolean {
+        val cacheKey = "$owner|$name|$desc|$wantMethod"
+        val cached = (if (wantMethod) methodCache else fieldCache)[cacheKey]
+        if (cached != null) return cached
+
+        val result = try {
+            val cls = loadHostClass(owner) ?: return false.also { store(cacheKey, false, wantMethod) }
+            if (wantMethod) {
+                val argTypes = Type.getArgumentTypes(desc).mapNotNull { loadDescriptorType(it.descriptor) }
+                if (argTypes.size != Type.getArgumentTypes(desc).size) {
+                    // A parameter type doesn't exist on the host — cannot resolve
+                    return false.also { store(cacheKey, false, wantMethod) }
+                }
+                var c: Class<*>? = cls
+                while (c != null) {
+                    try {
+                        val m = c.getDeclaredMethod(name, *argTypes.toTypedArray())
+                        if (java.lang.reflect.Modifier.isPublic(m.modifiers)) {
+                            return true.also { store(cacheKey, true, wantMethod) }
+                        }
+                    } catch (_: NoSuchMethodException) {
+                    }
+                    c = c.superclass
+                }
+                // interface default methods (including inherited ones)
+                fun walkInterface(iface: Class<*>): Boolean {
+                    try {
+                        val m = iface.getMethod(name, *argTypes.toTypedArray())
+                        if (java.lang.reflect.Modifier.isPublic(m.modifiers)) return true
+                    } catch (_: NoSuchMethodException) {
+                    }
+                    return iface.interfaces.any { walkInterface(it) }
+                }
+                cls.interfaces.any { walkInterface(it) }
+            } else {
+                var c: Class<*>? = cls
+                while (c != null) {
+                    try {
+                        val f = c.getDeclaredField(name)
+                        if (java.lang.reflect.Modifier.isPublic(f.modifiers)) {
+                            return true.also { store(cacheKey, true, wantMethod) }
+                        }
+                    } catch (_: NoSuchFieldException) {
+                    }
+                    c = c.superclass
+                }
+                false
+            }
+        } catch (_: Throwable) {
+            false
+        }
+        store(cacheKey, result, wantMethod)
+        return result
+    }
+
+    private fun store(key: String, value: Boolean, wantMethod: Boolean) {
+        if (wantMethod) methodCache[key] = value else fieldCache[key] = value
+    }
 
     fun transform(jarFile: File) {
         val tempFile = File(jarFile.absolutePath + ".tmp")
@@ -56,7 +166,7 @@ object PluginBytecodeTransformer {
                                         // NOTE: android.view.{View,ViewGroup,LayoutInflater} stay
                                         // FUNCTIONAL (needed for inflate + findViewById during
                                         // settings discovery); widgets/dialogs/androidx/material
-                                        // calls are neutered.
+                                        // calls resolve against the recording stubs.
                                         if (owner == "android/webkit/CookieManager") return false
                                         return owner.startsWith("android/widget/") ||
                                             owner.startsWith("android/app/") ||
@@ -92,13 +202,12 @@ object PluginBytecodeTransformer {
                                         descriptor: String,
                                         isInterface: Boolean,
                                     ) {
-                                        // Keep Context.getSharedPreferences working (functional prefs stub).
-                                        // Plugins may call it on Activity / AppCompatActivity / Context
-                                        // references — all inherit the method from Context, so exempt
-                                        // `getSharedPreferences` on ANY owner within the neutered set.
+                                        // Constructors always flow to the stubs (they exist as
+                                        // verification targets; neutering <init> breaks verification).
+                                        // Everything else: pass through when the host stub implements
+                                        // it — the recording runs; otherwise neuter safely.
                                         if (methodName != "<init>" && isUIClass(owner) &&
-                                            methodName != "getSharedPreferences" &&
-                                            methodName != "getApplicationContext"
+                                            !memberResolves(owner, methodName, descriptor, wantMethod = true)
                                         ) {
                                             val argTypes = Type.getArgumentTypes(descriptor)
                                             val retType = Type.getReturnType(descriptor)
@@ -130,7 +239,9 @@ object PluginBytecodeTransformer {
                                     }
 
                                     override fun visitFieldInsn(opcode: Int, owner: String, name: String, descriptor: String) {
-                                        if (isUIClass(owner)) {
+                                        if (isUIClass(owner) &&
+                                            !memberResolves(owner, name, descriptor, wantMethod = false)
+                                        ) {
                                             val type = Type.getType(descriptor)
                                             when (opcode) {
                                                 Opcodes.GETSTATIC -> pushDefault(type)

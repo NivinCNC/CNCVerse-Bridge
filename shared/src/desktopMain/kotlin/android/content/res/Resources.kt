@@ -24,6 +24,8 @@ open class Resources {
     open fun getInteger(id: Int): Int = 0
     open fun getDimension(id: Int): Float = 0f
     open fun getDrawable(id: Int): android.graphics.drawable.Drawable? = null
+    open fun getDrawable(id: Int, theme: Theme?): android.graphics.drawable.Drawable? = getDrawable(id)
+    open fun getDrawableForDensity(id: Int, density: Int): android.graphics.drawable.Drawable? = getDrawable(id)
     open fun openRawResource(id: Int): java.io.InputStream? = null
 
     open class Configuration {
@@ -40,6 +42,9 @@ open class Resources {
 }
 
 class ColorStateList {
+    constructor()
+    constructor(states: Array<IntArray>, colors: IntArray)
+
     companion object {
         @JvmStatic
         fun valueOf(color: Int): ColorStateList = ColorStateList()
