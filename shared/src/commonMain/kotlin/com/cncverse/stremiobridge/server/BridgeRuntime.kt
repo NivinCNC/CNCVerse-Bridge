@@ -11,7 +11,10 @@ import com.cncverse.stremiobridge.state.ServerStatus
 import com.cncverse.stremiobridge.tunnel.CloudflaredManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -37,6 +40,11 @@ object BridgeRuntime {
     var appScope: CoroutineScope? = null
 
     private val loadMutex = Mutex()
+
+    /** Background hourly repo-refresh + auto-update job. Cancelled on stop. */
+    private var hourlyUpdateJob: Job? = null
+
+    private val HOURLY_INTERVAL_MS = 60L * 60L * 1000L // 1 hour
 
     fun getLocalIpAddress(): String? = try {
         val interfaces = NetworkInterface.getNetworkInterfaces().asSequence().toList()
@@ -163,10 +171,43 @@ object BridgeRuntime {
             )
         )
         ServerState.info("🎬 Bridge running at http://$ipAddress:$boundPort/manifest.json")
+
+        // Start hourly extension update checker
+        startHourlyUpdateCheck()
+    }
+
+    /** Launches a background loop that refreshes repos and auto-updates plugins every hour. */
+    private fun startHourlyUpdateCheck() {
+        hourlyUpdateJob?.cancel()
+        hourlyUpdateJob = appScope?.launch(Dispatchers.IO) {
+            // First check after 1 hour
+            delay(HOURLY_INTERVAL_MS)
+            while (isActive) {
+                runCatching {
+                    ServerState.info("Hourly update check — refreshing repos…")
+                    RepoManager.refreshAllRepos()
+                    val toUpdate = RepoState.installedPlugins.value.filter {
+                        RepoState.getInstallState(it.internalName) is PluginInstallState.UpdateAvailable
+                    }
+                    if (toUpdate.isNotEmpty()) {
+                        ServerState.info("Auto-updating ${toUpdate.size} plugin(s) found by hourly check…")
+                        PluginInstaller.autoUpdateInstalled(cacheDir)
+                        forceReloadPlugins()
+                    } else {
+                        ServerState.info("Hourly check complete — all plugins up to date")
+                    }
+                }.onFailure { e ->
+                    ServerState.warn("Hourly update check failed: ${e.message}")
+                }
+                delay(HOURLY_INTERVAL_MS)
+            }
+        }
     }
 
     /** Stop the addon server and tunnel (admin fallback engine is handled by the web admin). */
     fun stopBridge() {
+        hourlyUpdateJob?.cancel()
+        hourlyUpdateJob = null
         StremioServer.stop()
         ServerState.updateStatus(ServerStatus.Stopped)
         ServerState.info("Server stopped by user")

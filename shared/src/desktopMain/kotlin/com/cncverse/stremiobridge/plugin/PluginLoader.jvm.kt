@@ -613,6 +613,7 @@ private class DirectMainApiWrapper(
 ) : MainApiWrapper {
     override val name: String get() = api.name
     override val internalName: String get() = plugin.internalName + "_" + api.name.replace(Regex("[^A-Za-z0-9]"), "")
+    override val pluginInternalName: String get() = plugin.internalName
     override val supportedTypes: List<String> get() {
         val hasLive = api.supportedTypes.any { it.name.equals("Live", ignoreCase = true) }
         val isOnlyLive = api.supportedTypes.size == 1 && hasLive
@@ -1045,7 +1046,7 @@ private fun Any.reflectToStreams(pluginName: String, api: MainAPI? = null): List
             val encodedMpdUrl = java.net.URLEncoder.encode(url, "UTF-8")
             val hostIp = CloudflaredManager.deviceIp.ifBlank { "127.0.0.1" }
 
-            var proxyBase = "http://$hostIp:" + ServerState.serverPort
+            var proxyBase = ServerState.publicBaseUrl.ifBlank { "http://$hostIp:${ServerState.serverPort}" }
             val activeTunnel = ServerState.activeTunnelUrl.value
             if (ServerState.isStremioMode.value && !activeTunnel.isNullOrBlank()) {
                 proxyBase = activeTunnel
@@ -1090,7 +1091,7 @@ private fun Any.reflectToSubtitle(pluginName: String): StremioSubtitle? {
 
         val hostIp = CloudflaredManager.deviceIp.ifBlank { "127.0.0.1" }
 
-        var proxyBase = "http://$hostIp:" + ServerState.serverPort
+        var proxyBase = ServerState.publicBaseUrl.ifBlank { "http://$hostIp:${ServerState.serverPort}" }
         val activeTunnel = ServerState.activeTunnelUrl.value
         if (ServerState.isStremioMode.value && !activeTunnel.isNullOrBlank()) {
             proxyBase = activeTunnel

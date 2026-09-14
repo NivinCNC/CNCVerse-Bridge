@@ -78,6 +78,11 @@ object ServerState {
 
     var serverPort: Int = 8080
 
+    /** Base URL as seen by the client (e.g. "http://140.238.244.130" or "http://yourdomain.com").
+     *  Updated from the HTTP request Host header on every incoming request so that
+     *  proxy URLs and admin display URLs reflect the public domain instead of the internal LAN IP. */
+    @Volatile var publicBaseUrl: String = ""
+
     fun updateStatus(newStatus: ServerStatus) {
         _status.value = newStatus
     }

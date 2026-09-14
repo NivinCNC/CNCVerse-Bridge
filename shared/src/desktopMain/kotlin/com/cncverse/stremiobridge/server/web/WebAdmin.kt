@@ -42,6 +42,7 @@ import kotlinx.serialization.json.Json
 import java.io.File
 import java.net.InetSocketAddress
 import java.net.ServerSocket
+import java.util.concurrent.ConcurrentHashMap
 
 private val adminJson = Json {
     ignoreUnknownKeys = true
@@ -82,6 +83,12 @@ object WebAdmin {
     @Volatile var updateDownloadProgress: Float? = null
     @Volatile var currentUpdateRelease: GithubRelease? = null
 
+    /**
+     * Set of repo URLs that were added locally (not yet promoted to global storage).
+     * These repos are loaded for the current process session but not saved to disk.
+     */
+    val localOnlyRepos: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
     private fun scope(): CoroutineScope = appScope ?: CoroutineScope(Dispatchers.Default)
 
     private fun ApplicationCall.checkAdminAuth(): Boolean {
@@ -94,7 +101,7 @@ object WebAdmin {
     }
 
     private suspend fun ApplicationCall.respondUnauthorized() {
-        respondText("401 Unauthorized — append ?token=<CNC_ADMIN_TOKEN> or send an Authorization header", status = io.ktor.http.HttpStatusCode.Unauthorized)
+        respondText("401 Unauthorized", status = io.ktor.http.HttpStatusCode.Unauthorized)
     }
 
     // ─────────────────────────────────────────────────────────────────────────
@@ -197,8 +204,10 @@ object WebAdmin {
                 val body = call.receive<AdminActionRequest>()
                 val url = body.url?.trim().orEmpty()
                 if (url.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing url"))
+                val saveGlobally = body.saveGlobally ?: true
                 scope().launch {
-                    val entry = RepoManager.addRepo(url)
+                    val entry = RepoManager.addRepo(url, saveGlobally = saveGlobally)
+                    if (!saveGlobally) localOnlyRepos.add(url)
                     if (entry?.error != null) ServerState.warn("Repo add failed: ${entry.error}")
                 }
                 call.respond(AdminActionResult(true, "Adding repo…"))
@@ -209,8 +218,21 @@ object WebAdmin {
                 val body = call.receive<AdminActionRequest>()
                 val url = body.url?.trim().orEmpty()
                 if (url.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing url"))
+                localOnlyRepos.remove(url)
                 RepoManager.removeRepo(url)
                 call.respond(AdminActionResult(true, "Repo removed"))
+            }
+
+            // Promote a local-only repo to globally saved
+            post("/repos/promote-global") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val body = call.receive<AdminActionRequest>()
+                val url = body.url?.trim().orEmpty()
+                if (url.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing url"))
+                localOnlyRepos.remove(url)
+                // Re-add through manager with global persistence
+                scope().launch { RepoManager.addRepo(url, saveGlobally = true) }
+                call.respond(AdminActionResult(true, "Repo saved globally"))
             }
 
             post("/repos/refresh") {
@@ -241,7 +263,26 @@ object WebAdmin {
                         }
                     BridgeRuntime.installPlugin(ap)
                 }
+                // Return immediately; UI polls for updates
                 call.respond(AdminActionResult(true, "Installing…"))
+            }
+
+            // Install every extension from a specific repo
+            post("/plugins/install-all-from-repo") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val body = call.receive<AdminActionRequest>()
+                val repoUrl = body.repoUrl?.trim().orEmpty()
+                if (repoUrl.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing repoUrl"))
+                scope().launch {
+                    val toInstall = RepoState.availablePlugins.value.filter { it.repoEntry.url == repoUrl }
+                    ServerState.info("Installing all ${toInstall.size} extension(s) from repo: $repoUrl")
+                    toInstall.forEach { ap ->
+                        if (RepoState.getInstallState(ap.plugin.internalName) !is PluginInstallState.Installed) {
+                            BridgeRuntime.installPlugin(ap)
+                        }
+                    }
+                }
+                call.respond(AdminActionResult(true, "Installing all extensions from repo…"))
             }
 
             post("/plugins/uninstall") {
@@ -257,7 +298,8 @@ object WebAdmin {
                 val body = call.receive<AdminActionRequest>()
                 val internalName = body.internalName ?: return@post call.respond(AdminActionResult(false, "Missing internalName"))
                 val nowEnabled = StremioServer.togglePluginDisabled(internalName)
-                call.respond(AdminActionResult(true, if (nowEnabled) "Plugin enabled" else "Plugin disabled"))
+                // Return updated plugin list so the UI can refresh without an extra roundtrip
+                call.respond(buildAvailablePlugins())
             }
 
             post("/plugins/update-all") {
@@ -275,6 +317,29 @@ object WebAdmin {
                     }
                 }
                 call.respond(AdminActionResult(true, "Updating plugins…"))
+            }
+
+            // ── Profile (per-session extension disable) ──────────────────────
+
+            // Returns the current profile for the given profileId.
+            // The UI generates and stores a UUID in a cookie/localStorage and passes
+            // it here; the server keeps the disabled-set per profileId.
+            get("/profile/{profileId}") {
+                if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
+                val profileId = call.parameters["profileId"] ?: return@get call.respond(AdminActionResult(false, "Missing profileId"))
+                val disabled = StremioServer.getProfileDisabled(profileId)
+                call.respond(AdminProfile(profileId = profileId, disabledExtensions = disabled))
+            }
+
+            // Toggle an extension for the calling profile (does not affect global install).
+            post("/profile/{profileId}/toggle") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val profileId = call.parameters["profileId"] ?: return@post call.respond(AdminActionResult(false, "Missing profileId"))
+                val body = call.receive<AdminActionRequest>()
+                val internalName = body.internalName ?: return@post call.respond(AdminActionResult(false, "Missing internalName"))
+                val nowEnabled = StremioServer.toggleProfilePlugin(profileId, internalName)
+                val disabled = StremioServer.getProfileDisabled(profileId)
+                call.respond(AdminProfile(profileId = profileId, disabledExtensions = disabled))
             }
 
             // ── Plugin settings ─────────────────────────────────────────────
@@ -411,15 +476,18 @@ object WebAdmin {
     private fun buildSummary(): AdminSummary {
         val status = ServerState.status.value
         val serverInfo = when (status) {
-            is ServerStatus.Running -> AdminServerInfo(
+            is ServerStatus.Running -> {
+            val displayBase = ServerState.publicBaseUrl.ifBlank { "http://${status.ipAddress}:${status.port}" }
+            AdminServerInfo(
                 status = "Running",
                 port = status.port,
                 ipAddress = status.ipAddress,
                 pluginCount = status.pluginCount,
-                lanUrl = status.stremioUrl,
-                localhostUrl = status.localhostUrl,
+                lanUrl = "$displayBase/manifest.json",
+                localhostUrl = "$displayBase/manifest.json",
                 stremioModeUrl = status.stremioModeStremioUrl,
             )
+        }
             is ServerStatus.Starting -> AdminServerInfo(status = "Starting", message = status.message)
             is ServerStatus.Error -> AdminServerInfo(status = "Error", message = status.message)
             else -> AdminServerInfo(status = "Stopped")
@@ -434,6 +502,7 @@ object WebAdmin {
                 isLoading = repo.isLoading,
                 error = repo.error,
                 pluginCount = RepoState.availablePlugins.value.count { it.repoEntry.url == repo.url },
+                isGlobal = !localOnlyRepos.contains(repo.url),
             )
         }
 

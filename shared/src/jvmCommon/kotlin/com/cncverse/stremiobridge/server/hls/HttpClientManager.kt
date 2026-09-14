@@ -51,7 +51,6 @@ object HttpClientManager {
         if (proxyUrl.isNullOrBlank()) {
             return baseClient
         }
-
         return try {
             val proxy = parseProxy(proxyUrl)
             baseClient.newBuilder()

@@ -33,6 +33,8 @@ data class AdminRepoInfo(
     val isLoading: Boolean = false,
     val error: String? = null,
     val pluginCount: Int = 0,
+    /** True = persisted globally; false = local/session-only (not saved to disk). */
+    val isGlobal: Boolean = true,
 )
 
 @Serializable
@@ -97,6 +99,19 @@ data class AdminAvailablePlugin(
     val error: String? = null,
 )
 
+// ─── Profile (per-session extension disable) ──────────────────────────────────
+
+/**
+ * A per-browser-session profile: stores which extensions the user has disabled
+ * in their personal manifest. Globally installed extensions remain installed;
+ * only the manifest they receive omits the disabled ones.
+ */
+@Serializable
+data class AdminProfile(
+    val profileId: String,
+    val disabledExtensions: Set<String> = emptySet(),
+)
+
 // ─── Plugin settings ──────────────────────────────────────────────────────────
 
 @Serializable
@@ -130,6 +145,12 @@ data class AdminActionRequest(
     val enabled: Boolean? = null,
     val storageKey: String? = null,
     val value: String? = null,
+    /** For install-all: which repo URL to install all plugins from. */
+    val repoUrl: String? = null,
+    /** For profile toggle: the profile ID. */
+    val profileId: String? = null,
+    /** For local repo: whether to promote to globally saved. */
+    val saveGlobally: Boolean? = null,
 )
 
 // ─── Logs ────────────────────────────────────────────────────────────────────

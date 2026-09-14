@@ -34,9 +34,11 @@ object RepoManager {
 
     /**
      * Adds a new repo by URL. Fetches its metadata immediately.
+     * @param saveGlobally If true (default) the URL is persisted to disk globally.
+     *   Pass false to add a local/session-only repo that is not saved.
      * Returns the fetched [RepoEntry] or null if the URL was invalid.
      */
-    suspend fun addRepo(url: String): RepoEntry? {
+    suspend fun addRepo(url: String, saveGlobally: Boolean = true): RepoEntry? {
         val trimmed = PluginRepository.resolveShortCode(url)
         if (RepoState.repos.value.any { it.url == trimmed }) return null
 
@@ -58,7 +60,7 @@ object RepoManager {
         }
 
         RepoState.updateRepo(trimmed) { entry }
-        persistUrls()
+        if (saveGlobally) persistUrls()
 
         // Fetch plugins for this repo
         if (meta != null) fetchPluginsForRepo(entry, meta)

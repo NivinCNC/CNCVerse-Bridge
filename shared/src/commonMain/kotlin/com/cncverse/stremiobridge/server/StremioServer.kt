@@ -77,6 +77,56 @@ object StremioServer {
     val disabledPlugins: MutableSet<String> = mutableSetOf()
     private var disabledPluginsFile: File? = null
 
+    /**
+     * Per-profile disabled-extensions map. Key = profile UUID (cookie),
+     * Value = set of internalNames that profile has disabled.
+     * Stored in-memory only — survives server restart within a session.
+     * Profiles are lightweight: globally-installed extensions stay installed;
+     * only their manifest entry is omitted when the profile disables them.
+     */
+    val profileDisabledPlugins: MutableMap<String, MutableSet<String>> = mutableMapOf()
+    private var profilesFile: File? = null
+
+    private fun loadProfiles() {
+        val file = profilesFile ?: return
+        if (file.exists()) {
+            try {
+                val json = file.readText()
+                val map = serverJson.decodeFromString<Map<String, Set<String>>>(json)
+                profileDisabledPlugins.clear()
+                map.forEach { (k, v) -> profileDisabledPlugins[k] = v.toMutableSet() }
+            } catch (e: Exception) {
+                ServerState.warn("Failed to load profiles: ${e.message}")
+            }
+        }
+    }
+
+    private fun saveProfiles() {
+        val file = profilesFile ?: return
+        try {
+            val map: Map<String, Set<String>> = profileDisabledPlugins
+            file.writeText(serverJson.encodeToString(map))
+        } catch (e: Exception) {
+            ServerState.warn("Failed to save profiles: ${e.message}")
+        }
+    }
+
+    fun getProfileDisabled(profileId: String): Set<String> =
+        profileDisabledPlugins[profileId] ?: emptySet()
+
+    fun toggleProfilePlugin(profileId: String, internalName: String): Boolean {
+        val set = profileDisabledPlugins.getOrPut(profileId) { mutableSetOf() }
+        val nowEnabled = if (set.contains(internalName)) {
+            set.remove(internalName)
+            true
+        } else {
+            set.add(internalName)
+            false
+        }
+        saveProfiles()
+        return nowEnabled
+    }
+
     private fun loadDisabledPlugins() {
         val file = disabledPluginsFile ?: return
         if (file.exists()) {
@@ -154,6 +204,8 @@ object StremioServer {
         if (cacheDir != null) {
             disabledPluginsFile = File(cacheDir, "disabled_plugins.json")
             loadDisabledPlugins()
+            profilesFile = File(cacheDir, "profiles.json")
+            loadProfiles()
         }
         val targetPort = findAvailablePort(port)
         activePort = targetPort
@@ -201,6 +253,17 @@ object StremioServer {
         intercept(io.ktor.server.application.ApplicationCallPipeline.Call) {
             call.response.header("Access-Control-Allow-Origin", "*")
             call.response.header("Access-Control-Allow-Headers", "*")
+
+            // Track the public base URL from the Host header so proxy/admin URLs
+            // reflect the domain the client is connecting through (not the LAN IP).
+            val reqHost = call.request.host()
+            val reqPort = call.request.port()
+            val inferredBase = if (reqPort > 0 && reqPort != 80 && reqPort != 443) {
+                "http://$reqHost:$reqPort"
+            } else {
+                "http://$reqHost"
+            }
+            ServerState.publicBaseUrl = inferredBase
             
             if (call.request.httpMethod == HttpMethod.Options) {
                 call.respond(HttpStatusCode.OK)
@@ -213,9 +276,56 @@ object StremioServer {
         setupMpdProxyRoutes()
         setupWebAdminRoutes()
         routing {
-            // 📺 Status Page 📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺
+            // 📺 User-facing index page 📺
             get("/") {
-                call.respondText(buildStatusHtml(), ContentType.Text.Html)
+                call.respondText(buildIndexHtml(), ContentType.Text.Html)
+            }
+
+            // ── User profile API (no auth — served from main server for all users) ──
+
+            // Returns the profile's disabled-extension set
+            get("/api/profile/{profileId}") {
+                val profileId = call.parameters["profileId"] ?: return@get call.respond(HttpStatusCode.BadRequest)
+                val disabled = getProfileDisabled(profileId)
+                val disabledJson = disabled.joinToString(",") { "\"${it.replace("\"", "\\\"")}\"" }
+                call.respondText(
+                    """{"profileId":"$profileId","disabledExtensions":[$disabledJson]}""",
+                    ContentType.Application.Json
+                )
+            }
+
+            // Toggle an extension on/off for this profile
+            post("/api/profile/{profileId}/toggle") {
+                val profileId = call.parameters["profileId"] ?: return@post call.respond(HttpStatusCode.BadRequest)
+                val body = try { call.receive<Map<String, String>>() } catch (e: Exception) { emptyMap() }
+                val internalName = body["internalName"] ?: return@post call.respond(HttpStatusCode.BadRequest)
+                val nowEnabled = toggleProfilePlugin(profileId, internalName)
+                val disabled = getProfileDisabled(profileId)
+                val disabledJson = disabled.joinToString(",") { "\"${it.replace("\"", "\\\"")}\"" }
+                call.respondText(
+                    """{"profileId":"$profileId","disabledExtensions":[$disabledJson],"nowEnabled":$nowEnabled}""",
+                    ContentType.Application.Json
+                )
+            }
+
+            // Returns loaded extensions for the user page
+            get("/api/extensions") {
+                val sb = StringBuilder("[")
+                loadedApis.forEachIndexed { i, api ->
+                    if (i > 0) sb.append(",")
+                    val name = api.name.replace("\"", "\\\"")
+                    val id = api.internalName.replace("\"", "\\\"")
+                    val repoUrl = com.cncverse.stremiobridge.state.RepoState.installedPlugins.value
+                        .find { it.internalName == api.pluginInternalName }?.repoUrl?.replace("\"", "\\\"") ?: ""
+                    val repoName = com.cncverse.stremiobridge.state.RepoState.repos.value
+                        .find { it.url == repoUrl }?.name?.replace("\"", "\\\"") ?: ""
+                    val iconUrl = com.cncverse.stremiobridge.state.RepoState.installedPlugins.value
+                        .find { it.internalName == api.internalName }?.iconUrl?.replace("\"", "\\\"") ?: ""
+                    val enabled = !disabledPlugins.contains(api.internalName)
+                    sb.append("""{"internalName":"$id","name":"$name","enabled":$enabled,"repoUrl":"$repoUrl","repoName":"$repoName","iconUrl":"$iconUrl"}""")
+                }
+                sb.append("]")
+                call.respondText(sb.toString(), ContentType.Application.Json)
             }
 
             get("/api/toggle-plugin") {
@@ -229,7 +339,13 @@ object StremioServer {
                 call.respondRedirect("/")
             }
 
-            // 📺 Manifest 📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺─────────────────────────────────────────────────────
+            // ── Profile manifests — per-session extension disable ─────────────
+            // The profile UUID lives in the browser as localStorage; the manifest
+            // it receives only includes extensions not disabled for that profile.
+            get("/u/{profileId}/manifest.json") {
+                val profileId = call.parameters["profileId"] ?: return@get call.respond(HttpStatusCode.BadRequest)
+                call.respond(buildManifest(profileId = profileId))
+            }
             get("/manifest.json") {
                 call.respond(buildManifest())
             }
@@ -307,8 +423,15 @@ object StremioServer {
 
     // 📺 Manifest builder 📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺
 
-    private suspend fun buildManifest(): StremioManifest {
-        val activeApis = loadedApis.filter { !disabledPlugins.contains(it.internalName) }
+    /**
+     * Builds the Stremio manifest.
+     * @param profileId If non-null, also excludes extensions the profile has disabled.
+     */
+    suspend fun buildManifest(profileId: String? = null): StremioManifest {
+        val profileDisabled = if (profileId != null) getProfileDisabled(profileId) else emptySet()
+        val activeApis = loadedApis.filter {
+            !disabledPlugins.contains(it.internalName) && !profileDisabled.contains(it.internalName)
+        }
         val types = listOf("movie","series", "other", "tv")
 
         val catalogs = activeApis.flatMap { api ->
@@ -533,40 +656,247 @@ object StremioServer {
         }
     }
 
-    // ── HTML status page ──────────────────────────────────────────────────────
 
-    private fun buildStatusHtml(): String {
-        val pluginRows = loadedApis.joinToString("") { api ->
-            val isEnabled = !disabledPlugins.contains(api.internalName)
-            val statusHtml = if (isEnabled) "<td style=\"color:#4ade80\">&#9679; Enabled</td>" else "<td style=\"color:#f87171\">&#9679; Disabled</td>"
-            val actionText = if (isEnabled) "Disable" else "Enable"
-            """<tr>
-               <td>${api.name}</td>
-               <td>${api.internalName}</td>
-               <td>${api.supportedTypes.joinToString(", ")}</td>
-               $statusHtml
-               <td><a class="btn" style="padding:0.25rem 0.75rem;margin:0;font-size:0.9rem;" href="/api/toggle-plugin?id=${api.internalName}">$actionText</a></td>
-             </tr>"""
-        }
+    // ── User-facing index page ─────────────────────────────────────────────────
+
+    private fun buildIndexHtml(): String {
+        val port = ServerState.serverPort
         return """<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8">
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>CNCVerse Bridge</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-  body{background:#0f0f1a;color:#e0e0f0;font-family:sans-serif;padding:2rem}
-  h1{color:#a78bfa}
-  table{border-collapse:collapse;width:100%;margin-top:1rem}
-  th,td{padding:.5rem 1rem;border:1px solid #2a2a4a;text-align:left}
-  th{background:#1a1a2e}
-  .btn{display:inline-block;margin-top:1rem;padding:.75rem 1.5rem;background:#7c3aed;color:#fff;border-radius:.5rem;text-decoration:none;font-weight:bold}
-</style></head><body>
-<h1>&#127916; CNCVerse Bridge</h1>
-<p>Loaded plugins: <strong>${loadedApis.size}</strong></p>
-<a class="btn" href="stremio://localhost:${ServerState.serverPort}/manifest.json">&#9654; Add to Stremio</a>
-<table><thead><tr><th>Name</th><th>Internal</th><th>Types</th><th>Status</th><th>Action</th></tr></thead>
-<tbody>$pluginRows</tbody></table>
-</body></html>"""
+:root{--bg:#03030a;--card:#0e0e1a;--card2:#14141f;--border:#1e1e2e;--v:#7c3aed;--v4:#a78bfa;--v3:#c4b5fd;--vg:rgba(124,58,237,.18);--vb:rgba(124,58,237,.35);--t:#f0f0ff;--t2:#9b9bba;--mu:#5c5c7a;--green:#4ade80;--red:#f87171}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:var(--bg);color:var(--t);min-height:100vh;font-family:'Inter',-apple-system,sans-serif;font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.sw{position:relative;display:inline-block;width:42px;height:23px;flex:0 0 auto}
+.sw input{opacity:0;width:0;height:0}
+.sw .sl{position:absolute;inset:0;background:var(--card2);border:1px solid var(--border);border-radius:999px;transition:.2s;cursor:pointer}
+.sw .sl:before{content:"";position:absolute;height:17px;width:17px;left:2px;top:2px;background:var(--mu);border-radius:50%;transition:.2s}
+.sw input:checked+.sl{background:var(--v);border-color:var(--v)}
+.sw input:checked+.sl:before{transform:translateX(19px);background:#fff}
+.hero{text-align:center;padding:44px 20px 28px;background:radial-gradient(ellipse 80% 50% at 50% -10%,rgba(124,58,237,.22),transparent)}
+.logo{width:66px;height:66px;border-radius:20px;background:linear-gradient(135deg,#6d28d9,#a78bfa);display:flex;align-items:center;justify-content:center;font-weight:900;font-size:19px;color:#fff;margin:0 auto 14px;box-shadow:0 0 36px rgba(124,58,237,.4)}
+.hero h1{font-size:clamp(20px,5vw,30px);font-weight:800;letter-spacing:-.5px;background:linear-gradient(135deg,#fff 40%,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hero p{color:var(--t2);margin-top:7px;font-size:13.5px;max-width:480px;margin-left:auto;margin-right:auto}
+.tabs{display:flex;gap:5px;justify-content:center;margin-top:20px;flex-wrap:wrap}
+.tab{font-size:12.5px;font-weight:600;padding:7px 18px;border-radius:999px;border:1px solid var(--border);color:var(--t2);background:var(--card2);cursor:pointer;transition:.15s}
+.tab:hover{border-color:var(--v);color:var(--t)}
+.tab.active{background:var(--vg);border-color:var(--vb);color:var(--v3)}
+main{max-width:820px;margin:0 auto;padding:18px 14px 60px}
+.stl{font-size:10px;font-weight:800;letter-spacing:1.5px;text-transform:uppercase;color:var(--mu);margin-bottom:8px;margin-top:18px;padding-bottom:5px;border-bottom:1px solid rgba(124,58,237,.08)}
+.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px 18px;margin-bottom:10px}
+.card h2{font-size:14.5px;font-weight:700;margin-bottom:3px}
+.hint{font-size:12px;color:var(--t2);margin-bottom:10px}
+.urlbox{display:flex;align-items:center;gap:8px;background:#050510;border:1px solid var(--vb);border-radius:11px;padding:9px 12px;margin:9px 0}
+.urlbox code{font-family:ui-monospace,Menlo,monospace;font-size:11.5px;color:var(--v3);word-break:break-all;flex:1}
+.cbtn{background:rgba(124,58,237,.14);border:1px solid var(--vb);border-radius:7px;color:var(--v4);padding:4px 11px;font-size:11.5px;font-weight:600;cursor:pointer;flex:0 0 auto;font:inherit}
+.cbtn:hover{background:rgba(124,58,237,.26)}
+.openbtn{display:inline-flex;align-items:center;gap:5px;font-size:12px;font-weight:600;padding:6px 14px;border-radius:999px;border:1px solid var(--vb);color:var(--v4);background:var(--vg);text-decoration:none;margin-top:8px}
+.openbtn:hover{background:rgba(124,58,237,.25)}
+.rgroup{margin-bottom:16px}
+.rghead{display:flex;align-items:center;gap:9px;margin-bottom:8px}
+.rgletter{width:26px;height:26px;border-radius:7px;background:linear-gradient(135deg,#1e1b4b,#6d28d9);display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:800;color:#fff;flex:0 0 auto}
+.rgname{font-size:12px;font-weight:700;color:var(--t2)}
+.rgcount{font-size:10.5px;color:var(--mu);margin-left:auto}
+.egrid{display:grid;gap:7px;grid-template-columns:repeat(auto-fill,minmax(220px,1fr))}
+@media(max-width:500px){.egrid{grid-template-columns:1fr}}
+.ecard{background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:10px 12px;display:flex;align-items:center;gap:9px}
+.eicon{width:32px;height:32px;border-radius:8px;object-fit:cover;flex:0 0 auto}
+.eletter{width:32px;height:32px;border-radius:8px;background:linear-gradient(135deg,#1e1b4b,#6d28d9);display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:800;color:#fff;flex:0 0 auto}
+.ename{font-weight:600;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.estatus{font-size:10.5px;margin-top:1px}
+.son{color:var(--green)} .soff{color:var(--red)}
+.steps{display:flex;flex-direction:column;gap:8px;margin-bottom:14px}
+.step{display:flex;gap:11px;background:var(--card2);border:1px solid var(--border);border-radius:11px;padding:12px 13px}
+.snum{width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,#7c3aed,#a78bfa);color:#fff;font-weight:800;font-size:11px;display:flex;align-items:center;justify-content:center;flex:0 0 auto;margin-top:1px}
+.sbody strong{display:block;font-size:13px;font-weight:700;margin-bottom:1px}
+.sbody span{font-size:11.5px;color:var(--t2)}
+.bgray{display:inline-block;font-size:10.5px;font-weight:700;padding:2px 8px;border-radius:999px;background:#111120;color:var(--t2)}
+.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:#111124;border:1px solid var(--vb);color:var(--t);padding:9px 18px;border-radius:11px;font-size:12.5px;box-shadow:0 8px 28px rgba(124,58,237,.25);opacity:0;transition:.2s;pointer-events:none;z-index:99}
+.toast.show{opacity:1}
+.empty{padding:24px;text-align:center;color:var(--t2);font-size:12.5px}
+@media(max-width:500px){.hero{padding:28px 12px 20px}.card{padding:13px 14px}}
+</style>
+</head>
+<body>
+<div class="hero">
+  <div class="logo">CNC</div>
+  <h1>CNCVerse Bridge</h1>
+  <p>Your personal Stremio addon gateway. Use the global manifest or create your own profile.</p>
+  <div class="tabs">
+    <span class="tab active" id="tab-g" onclick="showTab('g')">&#127760; Global</span>
+    <span class="tab" id="tab-p" onclick="showTab('p')">&#128100; My Profile</span>
+  </div>
+</div>
+<main>
+  <div id="sec-g">
+    <div class="stl">Manifest URL</div>
+    <div class="card">
+      <h2>&#127916; Global Manifest</h2>
+      <div class="hint">Add this to Stremio. All admin-enabled extensions are included.</div>
+      <div class="urlbox"><code id="g-url"></code><button class="cbtn" onclick="cp('g-url')">Copy</button></div>
+      <a id="g-btn" class="openbtn" href="#">&#9654; Open in Stremio</a>
+    </div>
+    <div class="stl">Extensions by Repo</div>
+    <div id="g-body"><div class="empty">Loading extensions...</div></div>
+  </div>
+  <div id="sec-p" style="display:none">
+    <div class="stl">How It Works</div>
+    <div class="steps">
+      <div class="step"><div class="snum">1</div><div class="sbody"><strong>Your browser gets a unique profile</strong><span>Auto-created and stored locally. Each device or browser has its own ID.</span></div></div>
+      <div class="step"><div class="snum">2</div><div class="sbody"><strong>Copy your profile manifest URL below</strong><span>Use it in Stremio instead of the global URL.</span></div></div>
+      <div class="step"><div class="snum">3</div><div class="sbody"><strong>Toggle extensions below</strong><span>Pick what appears in your Stremio. Other users are not affected.</span></div></div>
+    </div>
+    <div class="stl">Your Profile Manifest</div>
+    <div class="card">
+      <h2>&#128100; Your Personal URL</h2>
+      <div class="hint">Add THIS to Stremio. Only extensions you enable below will appear.</div>
+      <div class="urlbox"><code id="p-url"></code><button class="cbtn" onclick="cp('p-url')">Copy</button></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px">
+        <a id="p-btn" class="openbtn" href="#">&#9654; Open in Stremio</a>
+        <span class="bgray" id="pid-lbl"></span>
+      </div>
+    </div>
+    <div class="stl">Your Extension Preferences</div>
+    <div class="hint" style="margin-bottom:8px">Toggle which extensions appear in your manifest. Admin-installed extensions are not changed for other users.</div>
+    <div id="p-body"><div class="empty">Loading...</div></div>
+  </div>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+"use strict";
+var PK = "cnc_pid";
+var pid = localStorage.getItem(PK);
+if (!pid) { pid = "p" + Math.random().toString(36).substr(2,14) + Date.now().toString(36); localStorage.setItem(PK, pid); }
+var pData = null;
+var exts = [];
+var curTab = "g";
+
+function showTab(t) {
+  curTab = t;
+  document.getElementById("tab-g").classList.toggle("active", t==="g");
+  document.getElementById("tab-p").classList.toggle("active", t==="p");
+  document.getElementById("sec-g").style.display = t==="g" ? "" : "none";
+  document.getElementById("sec-p").style.display = t==="p" ? "" : "none";
+  if (t==="p" && !pData) loadProfile();
+  else if (t==="p") renderProfile();
+}
+
+function initUrls() {
+  var h = window.location.host;
+  var base = window.location.protocol + "//" + h;
+  document.getElementById("g-url").textContent = base + "/manifest.json";
+  document.getElementById("g-btn").href = "stremio://" + h + "/manifest.json";
+  document.getElementById("p-url").textContent = base + "/u/" + encodeURIComponent(pid) + "/manifest.json";
+  document.getElementById("p-btn").href = "stremio://" + h + "/u/" + encodeURIComponent(pid) + "/manifest.json";
+  document.getElementById("pid-lbl").textContent = "ID: " + pid.substring(0,12) + "...";
+}
+
+function loadExts() {
+  fetch("/api/extensions")
+    .then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function(list) {
+      exts = list;
+      renderGlobal();
+      if (curTab==="p" && pData) renderProfile();
+    })
+    .catch(function(e) {
+      document.getElementById("g-body").innerHTML = '<div class="empty">Could not load extensions: ' + esc(e.message) + '</div>';
+    });
+}
+
+function loadProfile() {
+  fetch("/api/profile/" + encodeURIComponent(pid))
+    .then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function(p) { pData = p; pData._d = new Set(p.disabledExtensions||[]); renderProfile(); })
+    .catch(function(e) { document.getElementById("p-body").innerHTML = '<div class="empty">Could not load profile: ' + esc(e.message) + '</div>'; });
+}
+
+function byRepo(list) {
+  var m = {}, ord = [];
+  list.forEach(function(e) {
+    var k = e.repoUrl || "_";
+    if (!m[k]) { m[k] = {name: e.repoName || e.repoUrl || "Unknown", items:[]}; ord.push(k); }
+    m[k].items.push(e);
+  });
+  return ord.map(function(k){ return m[k]; });
+}
+
+function iconEl(e) {
+  if (e.iconUrl)
+    return '<img class="eicon" src="' + esc(e.iconUrl) + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" alt=""><div class="eletter" style="display:none">' + esc(e.name.charAt(0).toUpperCase()) + '</div>';
+  return '<div class="eletter">' + esc(e.name.charAt(0).toUpperCase()) + '</div>';
+}
+
+function repoBlock(groups, cardFn) {
+  if (!groups.length) return '<div class="empty">No extensions loaded yet.</div>';
+  return groups.map(function(g) {
+    return '<div class="rgroup"><div class="rghead"><div class="rgletter">' + esc(g.name.charAt(0).toUpperCase()) + '</div>'
+      + '<span class="rgname">' + esc(g.name) + '</span>'
+      + '<span class="rgcount">' + g.items.length + (g.items.length===1?" ext":" exts") + '</span></div>'
+      + '<div class="egrid">' + g.items.map(cardFn).join("") + '</div></div>';
+  }).join("");
+}
+
+function renderGlobal() {
+  var el = document.getElementById("g-body"); if (!el) return;
+  el.innerHTML = repoBlock(byRepo(exts), function(e) {
+    return '<div class="ecard">' + iconEl(e)
+      + '<div style="min-width:0;flex:1"><div class="ename">' + esc(e.name) + '</div>'
+      + '<div class="estatus ' + (e.enabled?"son":"soff") + '">' + (e.enabled?"Active":"Disabled by admin") + '</div></div></div>';
+  });
+}
+
+function renderProfile() {
+  var el = document.getElementById("p-body"); if (!el || !pData) return;
+  var active = exts.filter(function(e){ return e.enabled; });
+  el.innerHTML = repoBlock(byRepo(active), function(e) {
+    var off = pData._d && pData._d.has(e.internalName);
+    return '<div class="ecard">' + iconEl(e)
+      + '<div style="min-width:0;flex:1"><div class="ename">' + esc(e.name) + '</div>'
+      + '<div class="estatus ' + (off?"soff":"son") + '">' + (off?"Hidden from manifest":"In your manifest") + '</div></div>'
+      + '<label class="sw"><input type="checkbox" ' + (off?"":"checked") + ' onchange="tog(\'' + esc(e.internalName) + '\')"><span class="sl"></span></label>'
+      + '</div>';
+  });
+}
+
+function tog(name) {
+  fetch("/api/profile/" + encodeURIComponent(pid) + "/toggle", {
+    method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({internalName:name})
+  }).then(function(r){ if(!r.ok) throw new Error("HTTP "+r.status); return r.json(); })
+    .then(function(p){ pData=p; pData._d=new Set(p.disabledExtensions||[]); renderProfile(); toast(name+(p.nowEnabled?" added to":" removed from")+" your manifest"); })
+    .catch(function(e){ toast("Error: "+e.message); });
+}
+
+function cp(id) {
+  var t = document.getElementById(id).textContent;
+  if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(t).then(function(){ toast("Copied!"); }); return; }
+  var ta = document.createElement("textarea"); ta.value=t; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); toast("Copied!");
+}
+
+function esc(s) { return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
+
+function toast(msg) {
+  var el = document.getElementById("toast");
+  el.textContent=msg; el.classList.add("show");
+  clearTimeout(el._t); el._t=setTimeout(function(){ el.classList.remove("show"); }, 2600);
+}
+
+initUrls();
+loadExts();
+setInterval(loadExts, 15000);
+</script>
+</body>
+</html>"""
     }
 }
+
 
 // ── MainApiWrapper ─────────────────────────────────────────────────────────────
 
@@ -577,6 +907,8 @@ object StremioServer {
 interface MainApiWrapper {
     val name: String
     val internalName: String
+    /** The bare plugin internalName used for repo/settings lookups (no API-name suffix). */
+    val pluginInternalName: String get() = internalName
     val supportedTypes: List<String>
     suspend fun getMainPageSections(): List<String>
 
