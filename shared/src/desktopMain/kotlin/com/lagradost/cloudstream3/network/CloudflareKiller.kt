@@ -1,5 +1,6 @@
 package com.lagradost.cloudstream3.network
 
+import com.cncverse.stremiobridge.network.FlareSolverrBypass
 import com.cncverse.stremiobridge.network.SettledPageCache
 import com.cncverse.stremiobridge.network.SystemBrowserCdpBypass
 import com.cncverse.stremiobridge.state.ServerState
@@ -37,6 +38,14 @@ class CloudflareKiller : Interceptor {
         private val failedHosts = ConcurrentHashMap.newKeySet<String>()
         // Hosts confirmed to require browser-level TLS (cf_clearance bound to TLS fingerprint)
         val tlsBoundHosts: MutableSet<String> = ConcurrentHashMap.newKeySet()
+        /**
+         * Hosts where FlareSolverr successfully proxied after TLS rejection.
+         * All future requests to these hosts are routed through FlareSolverr so we
+         * never need to open a browser again — FlareSolverr's Chromium TLS fingerprint
+         * matches what Cloudflare expects, and we pass the saved cf_clearance cookie
+         * to skip re-solving the Turnstile challenge.
+         */
+        val flareSolverrBoundHosts: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
         val savedCookies: MutableMap<String, Map<String, String>> = ConcurrentHashMap()
         val savedUserAgents: MutableMap<String, String> = ConcurrentHashMap()
@@ -122,6 +131,7 @@ class CloudflareKiller : Interceptor {
             savedCookies.clear()
             savedUserAgents.clear()
             tlsBoundHosts.clear()
+            flareSolverrBoundHosts.clear()
             failedHosts.clear()
         }
     }
@@ -166,10 +176,12 @@ class CloudflareKiller : Interceptor {
             return chain.proceed(request)
         }
 
-        // Route TLS-bound image requests via browser proxy
+        // (flareSolverrBound is used only as a cookie-clearing guard — no per-request proxy routing)
         val isImage = isImageAsset(request.url)
         val isStream = isStatic && !isImage
-        if (!isStream && isTlsBound(host) && SystemBrowserCdpBypass.hasActiveProxy(host)) {
+
+        // Route TLS-bound image requests via browser proxy (CDP path only, not used when FlareSolverr is enabled)
+        if (!isStream && !FlareSolverrBypass.isEnabled && isTlsBound(host) && SystemBrowserCdpBypass.hasActiveProxy(host)) {
             val proxyResponse = fetchViaBrowserProxy(request, isBinary = isImage)
             if (proxyResponse != null) return proxyResponse
         }
@@ -209,7 +221,10 @@ class CloudflareKiller : Interceptor {
         if (isCloudflareChallenge) {
             ServerState.warn("[CF] Cloudflare challenge detected for $host (HTTP ${response.code})")
 
-            if (usedSavedCookie && !isTlsBound(host)) {
+            if (usedSavedCookie && !isTlsBound(host)
+                && !flareSolverrBoundHosts.contains(host)
+                && !flareSolverrBoundHosts.contains(apex)
+            ) {
                 ServerState.warn("[CF-DBG] Clearing stale cookies for $host")
                 savedCookies.remove(host)
                 savedCookies.remove(apex)
@@ -232,12 +247,40 @@ class CloudflareKiller : Interceptor {
                         ServerState.info("[CF-DBG] Already have cookies for $host (${existing.keys}) — skipping browser launch")
                         return@synchronized true
                     }
-                    ServerState.info("[CF] Opening browser CF solver for $host (url=${request.url})…")
-                    kotlinx.coroutines.runBlocking {
-                        SystemBrowserCdpBypass.launchManualClearance(
-                            targetUrl = request.url.toString(),
-                            hostName = host,
-                        )
+                    ServerState.info("[CF] Attempting FlareSolverr for $host (url=${request.url})…")
+                    val fsResult = if (FlareSolverrBypass.isEnabled) {
+                        kotlinx.coroutines.runBlocking {
+                            FlareSolverrBypass.solve(request.url.toString())
+                        }
+                    } else null
+
+                    if (fsResult != null && fsResult.cookies.isNotEmpty()) {
+                        saveClearance(host, fsResult.cookies, fsResult.userAgent)
+                        // Mark IMMEDIATELY so concurrent requests see this host as
+                        // FlareSolverr-managed and don't clear the valid cookies.
+                        tlsBoundHosts.add(host); tlsBoundHosts.add(apex)
+                        flareSolverrBoundHosts.add(host); flareSolverrBoundHosts.add(apex)
+                        // Cache the HTML so the calling request is served instantly
+                        // from SettledPageCache without an OkHttp retry.
+                        if (fsResult.html.isNotBlank()) {
+                            SettledPageCache.put(request.url.toString(), fsResult.html, fsResult.userAgent)
+                        }
+                        return@synchronized true
+                    }
+
+                    // FlareSolverr not configured / failed
+                    if (!FlareSolverrBypass.isEnabled) {
+                        // CDP fallback (only when FlareSolverr is disabled)
+                        ServerState.info("[CF] Opening browser CF solver for $host (url=${request.url})…")
+                        kotlinx.coroutines.runBlocking {
+                            SystemBrowserCdpBypass.launchManualClearance(
+                                targetUrl = request.url.toString(),
+                                hostName = host,
+                            )
+                        }
+                    } else {
+                        ServerState.warn("[CF] FlareSolverr failed for $host — no CDP fallback (FlareSolverr is enabled).")
+                        return@synchronized false
                     }
                 }
 
@@ -253,7 +296,7 @@ class CloudflareKiller : Interceptor {
 
                     val cachedAfter = SettledPageCache.get(request.url.toString())
                     if (cachedAfter != null) {
-                        SystemBrowserCdpBypass.closePendingSession()
+                        if (!FlareSolverrBypass.isEnabled) SystemBrowserCdpBypass.closePendingSession()
                         val bodyBytes = cachedAfter.html.toByteArray(Charsets.UTF_8)
                         val mediaType = "text/html; charset=utf-8".toMediaTypeOrNull()
                         return Response.Builder()
@@ -269,28 +312,19 @@ class CloudflareKiller : Interceptor {
                     val retryResponse = proceed(chain, request, solvedCookies, getSavedUserAgent(host))
                     ServerState.info("[CF-DBG] retry response HTTP ${retryResponse.code}")
                     if (retryResponse.code !in ERROR_CODES) {
-                        SystemBrowserCdpBypass.closePendingSession()
+                        if (!FlareSolverrBypass.isEnabled) SystemBrowserCdpBypass.closePendingSession()
+                        // OkHttp succeeded — flareSolverrBound stays as cookie-clearing guard.
                         return retryResponse
                     }
 
-                    // TLS fingerprint rejection — activate browser as fetch proxy
-                    ServerState.warn("[CF] OkHttp retry still rejected (HTTP ${retryResponse.code}). Activating browser fetch proxy for $host.")
+                    // OkHttp rejected — cookie expired or invalid. Clear it so the NEXT
+                    // request triggers a fresh FlareSolverr solve.
                     retryResponse.close()
-                    tlsBoundHosts.add(host)
-                    tlsBoundHosts.add(apex)
-
-                    val proxyActivated = kotlinx.coroutines.runBlocking {
-                        SystemBrowserCdpBypass.activateFetchProxy(host)
-                    }
-
-                    if (proxyActivated) {
-                        val proxyResponse = fetchViaBrowserProxy(request)
-                        if (proxyResponse != null && proxyResponse.code !in ERROR_CODES) return proxyResponse
-                    }
-
-                    ServerState.error("[CF] Browser proxy also failed for $host — marking as failed.")
-                    failedHosts.add(host)
-                    if (host.equals(apex, ignoreCase = true)) failedHosts.add(apex)
+                    ServerState.warn("[CF] Cookie rejected for $host after retry — clearing for re-solve on next request.")
+                    savedCookies.remove(host); savedCookies.remove(apex)
+                    savedUserAgents.remove(host); savedUserAgents.remove(apex)
+                    flareSolverrBoundHosts.remove(host); flareSolverrBoundHosts.remove(apex)
+                    tlsBoundHosts.remove(host); tlsBoundHosts.remove(apex)
                 } else {
                     ServerState.warn("[CF] Solver returned solved=$solved but cookies=${solvedCookies.keys} for $host — window closed or timed out.")
                     failedHosts.add(host)
@@ -368,5 +402,39 @@ class CloudflareKiller : Interceptor {
             .body(bodyBytes.toResponseBody(mediaType))
             .build()
     }
-}
 
+    /**
+     * Fetches [request] via FlareSolverr, passing already-saved cf_clearance cookies
+     * so FlareSolverr can skip re-solving the Turnstile challenge and return the page
+     * immediately using its correct Chromium TLS fingerprint.
+     */
+    private fun fetchViaFlareSolverr(request: Request): Response? {
+        val host = request.url.host
+        val savedCookiesForHost = getSavedCookies(host)
+        val result = kotlinx.coroutines.runBlocking {
+            FlareSolverrBypass.solve(
+                targetUrl = request.url.toString(),
+                cookies   = savedCookiesForHost,
+            )
+        } ?: return null
+
+        // Refresh cookies if FlareSolverr returned a new clearance
+        if (result.cookies.isNotEmpty()) {
+            saveClearance(host, result.cookies, result.userAgent)
+            if (result.html.isNotBlank()) {
+                SettledPageCache.put(request.url.toString(), result.html, result.userAgent)
+            }
+        }
+
+        val mediaType = "text/html; charset=utf-8".toMediaTypeOrNull()
+        val bodyBytes = result.html.toByteArray(Charsets.UTF_8)
+        return Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(200)
+            .message("OK (FlareSolverr)")
+            .header("content-type", "text/html; charset=utf-8")
+            .body(bodyBytes.toResponseBody(mediaType))
+            .build()
+    }
+}

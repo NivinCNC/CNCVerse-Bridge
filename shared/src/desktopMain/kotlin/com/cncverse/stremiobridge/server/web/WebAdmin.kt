@@ -1,6 +1,7 @@
 package com.cncverse.stremiobridge.server.web
 
 import com.cncverse.stremiobridge.Constants
+import com.cncverse.stremiobridge.network.FlareSolverrBypass
 import com.cncverse.stremiobridge.plugin.GlobalPluginManager
 import com.cncverse.stremiobridge.repo.PluginInstaller
 import com.cncverse.stremiobridge.repo.RepoManager
@@ -398,6 +399,22 @@ object WebAdmin {
                 call.respond(AdminActionResult(true, "Logs cleared"))
             }
 
+            // ── FlareSolverr ─────────────────────────────────────────────────
+
+            post("/flaresolverr") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val req = runCatching { call.receive<AdminActionRequest>() }.getOrNull()
+                val url = req?.url?.trim() ?: ""
+                FlareSolverrBypass.solverrUrl = url
+                ServerState.info("[FlareSolverr] URL ${if (url.isBlank()) "cleared (disabled)" else "set to $url"}")
+                call.respond(
+                    AdminActionResult(
+                        ok = true,
+                        message = if (url.isBlank()) "FlareSolverr disabled" else "FlareSolverr URL set to $url",
+                    )
+                )
+            }
+
             // ── OTA updates ──────────────────────────────────────────────────
 
             get("/update/check") {
@@ -555,6 +572,7 @@ object WebAdmin {
             refreshing = RepoState.isRefreshing.value,
             update = update,
             tokenRequired = adminToken != null,
+            flareSolverrUrl = FlareSolverrBypass.solverrUrl,
         )
     }
 

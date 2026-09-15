@@ -424,6 +424,19 @@ object StremioServer {
     // 📺 Manifest builder 📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺📺
 
     /**
+     * Converts a plugin display-name to a short alphanumeric slug for use in catalog IDs.
+     * Normalises special characters so JIO TV (IND) → JIOTVIND and
+     * JIO TV+ (IND) → JIOTVPlusIND, giving each variant a unique catalog ID
+     * even when two APIs share the same [internalName].
+     */
+    private fun nameSlug(name: String): String = name
+        .replace("+", "Plus")
+        .replace("&", "And")
+        .replace(Regex("[^a-zA-Z0-9]"), "")
+        .take(48)
+        .ifBlank { "unknown" }
+
+    /**
      * Builds the Stremio manifest.
      * @param profileId If non-null, also excludes extensions the profile has disabled.
      */
@@ -450,7 +463,7 @@ object StremioServer {
                     listOf(
                         StremioCatalogDef(
                             type = stremioType,
-                            id   = "cnc_${api.internalName}_$stremioType",
+                            id   = "cnc_${nameSlug(api.name)}_$stremioType",
                             name = "${api.name} ($stremioType)",
                             extra = extra
                         )
@@ -482,7 +495,13 @@ object StremioServer {
         if (!id.startsWith(prefix)) return emptyList()
         val rest = id.removePrefix(prefix)
         
-        val api = loadedApis.find { rest.startsWith(it.internalName) }
+        // Catalog id format: "cnc_{nameSlug(api.name)}_{type}"
+        // Find the API by matching the same slug derived from its display name.
+        // Also falls back to internalName-based lookup for any old-format IDs still in circulation.
+        val nameSlugFromId = rest.removeSuffix("_$type")
+        val api = loadedApis.find { nameSlug(it.name) == nameSlugFromId }
+            ?: loadedApis.find { it.internalName == nameSlugFromId }          // old-format compat
+            ?: loadedApis.find { rest.startsWith(it.internalName + "_") }    // prefix fallback
             ?: loadedApis.firstOrNull()
             ?: return emptyList()
 

@@ -63,8 +63,8 @@ kotlin {
                 implementation(libs.okhttp)
                 implementation(libs.jsoup)
                 implementation(libs.jackson.module.kotlin)
-                implementation("dev.whyoleg.cryptography:cryptography-core:0.4.0")
-                implementation("dev.whyoleg.cryptography:cryptography-provider-jdk:0.4.0")
+                implementation("dev.whyoleg.cryptography:cryptography-core:0.6.0")
+                implementation("dev.whyoleg.cryptography:cryptography-provider-jdk:0.6.0")
                 implementation("com.uwetrottmann.tmdb2:tmdb-java:2.9.0")
 
                 // Coil for image loading

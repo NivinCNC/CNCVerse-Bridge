@@ -165,7 +165,7 @@ object HttpClientManager {
         body: RequestBody? = null,
         method: String = if (body != null) "POST" else "GET"
     ): Request {
-        val requestBuilder = Request.Builder().url(url)
+        val requestBuilder = Request.Builder().url(sanitizeUrl(url))
 
         // Headers standard
         val headers = mutableMapOf(
@@ -218,6 +218,39 @@ object HttpClientManager {
         val port = if (uri.port > 0) uri.port else 1080
 
         return Proxy(proxyType, InetSocketAddress(host, port))
+    }
+
+    /**
+     * Sanitizes a URL string so that java.net.URI (used internally by OkHttp 3.x) can parse it.
+     * Only the query string portion is modified — characters illegal in URI queries
+     * (*  |  {  }  [  ]  ^  `  \  space) are percent-encoded.
+     * Characters that are already percent-encoded are left untouched.
+     */
+    private fun sanitizeUrl(url: String): String {
+        val qIdx = url.indexOf('?')
+        if (qIdx < 0) return url          // no query — nothing to sanitize
+        val base  = url.substring(0, qIdx + 1) // everything up to and including '?'
+        val query = url.substring(qIdx + 1)
+        val sanitized = buildString(query.length + 16) {
+            var i = 0
+            while (i < query.length) {
+                when (val c = query[i]) {
+                    '*'  -> append("%2A")
+                    '|'  -> append("%7C")
+                    '{'  -> append("%7B")
+                    '}'  -> append("%7D")
+                    '['  -> append("%5B")
+                    ']'  -> append("%5D")
+                    '^'  -> append("%5E")
+                    '`'  -> append("%60")
+                    '\\' -> append("%5C")
+                    ' '  -> append("%20")
+                    else -> append(c)
+                }
+                i++
+            }
+        }
+        return base + sanitized
     }
 
     /**
