@@ -514,6 +514,32 @@ object StremioServer {
         }
     }
 
+    /**
+     * Pre-warms every plugin's home page by calling [buildCatalog] (→ [getMainPage])
+     * for each catalog defined in the manifest.  Called once after server startup and
+     * then every hour after the extension refresh, so Stremio users always see
+     * instant home pages with fresh content.
+     */
+    suspend fun preWarmHomepages() {
+        val catalogs = buildManifest().catalogs
+        if (catalogs.isEmpty()) return
+        ServerState.info("🔥 Pre-warming ${catalogs.size} home page(s)…")
+        coroutineScope {
+            catalogs.map { cat ->
+                async(Dispatchers.IO) {
+                    runCatching {
+                        buildCatalog(cat.type, cat.id, null, 0, null)
+                        ServerState.info("🔥 Pre-warmed: ${cat.name}")
+                    }.onFailure { e ->
+                        ServerState.warn("🔥 Pre-warm failed for ${cat.name}: ${e.message?.take(80)}")
+                    }
+                }
+            }.awaitAll()
+        }
+        ServerState.info("🔥 Pre-warm complete (${catalogs.size} catalog(s))")
+    }
+
+
     // ── Meta builder ──────────────────────────────────────────────────────────
 
     private suspend fun buildMeta(type: String, id: String): StremioMeta? {

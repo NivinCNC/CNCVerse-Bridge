@@ -172,6 +172,13 @@ object BridgeRuntime {
         )
         ServerState.info("🎬 Bridge running at http://$ipAddress:$boundPort/manifest.json")
 
+        // Pre-warm all plugin home pages once the server is ready
+        appScope?.launch(Dispatchers.IO) {
+            delay(5_000)   // brief pause so Ktor is fully accepting connections
+            runCatching { StremioServer.preWarmHomepages() }
+                .onFailure { e -> ServerState.warn("Startup pre-warm error: ${e.message}") }
+        }
+
         // Start hourly extension update checker
         startHourlyUpdateCheck()
     }
@@ -190,12 +197,15 @@ object BridgeRuntime {
                         RepoState.getInstallState(it.internalName) is PluginInstallState.UpdateAvailable
                     }
                     if (toUpdate.isNotEmpty()) {
-                        ServerState.info("Auto-updating ${toUpdate.size} plugin(s) found by hourly check…")
+                        ServerState.info("Auto-updating ${toUpdate.size} plugin(s)…")
                         PluginInstaller.autoUpdateInstalled(cacheDir)
                         forceReloadPlugins()
                     } else {
                         ServerState.info("Hourly check complete — all plugins up to date")
                     }
+                    // Always pre-warm home pages after hourly refresh
+                    runCatching { StremioServer.preWarmHomepages() }
+                        .onFailure { e -> ServerState.warn("Hourly pre-warm error: ${e.message}") }
                 }.onFailure { e ->
                     ServerState.warn("Hourly update check failed: ${e.message}")
                 }
