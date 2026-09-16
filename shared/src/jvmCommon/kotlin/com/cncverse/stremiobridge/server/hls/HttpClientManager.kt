@@ -6,6 +6,7 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
+import com.cncverse.stremiobridge.state.ServerState
 
 /**
  * Manager singleton per OkHttp client
@@ -29,6 +30,27 @@ object HttpClientManager {
         maxRequestsPerHost = 64   // CDN usa stesso host - serve alto parallelismo
     }
 
+    // Network-level debug interceptor – runs AFTER OkHttp adds Host/Connection/Accept-Encoding
+    // so we see the EXACT bytes going over the wire. Remove once the CDN 403 is resolved.
+    private val networkDebugInterceptor = Interceptor { chain ->
+        val req = chain.request()
+        ServerState.info("NET_REQ: ${req.method} ${req.url.toString().take(120)}")
+        req.headers.forEach { (name, value) ->
+            // Mask Cookie/Auth values after first 40 chars for log brevity
+            val display = if (name.equals("Cookie", ignoreCase = true) ||
+                               name.equals("Authorization", ignoreCase = true))
+                value.take(40) + "…" else value
+            ServerState.info("NET_HDR: $name: $display")
+        }
+        val response = chain.proceed(req)
+        if (!response.isSuccessful) {
+            // Peek the error body without consuming it
+            val body = response.peekBody(512).string()
+            ServerState.warn("NET_ERR ${response.code}: body=${body.take(200)}")
+        }
+        response
+    }
+
     // Client di base ottimizzato per streaming veloce con AdaptiveHostDns e FastFallback
     private val baseClient: OkHttpClient = OkHttpClient.Builder()
         .dns(com.cncverse.stremiobridge.network.AdaptiveHostDns)
@@ -42,6 +64,7 @@ object HttpClientManager {
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(true)
+        .addNetworkInterceptor(networkDebugInterceptor)  // ← wire-level logging
         .build()
 
     /**
@@ -235,7 +258,9 @@ object HttpClientManager {
             var i = 0
             while (i < query.length) {
                 when (val c = query[i]) {
-                    '*'  -> append("%2A")
+                    // '*' is valid in query strings (RFC 3986 §3.4) and must NOT be encoded:
+                    // CDN HMAC tokens (e.g. Jio __hdnea__ acl=.../path/*) are signed over the
+                    // literal '*'. Re-encoding it to %2A breaks the signature → HTTP 403.
                     '|'  -> append("%7C")
                     '{'  -> append("%7B")
                     '}'  -> append("%7D")

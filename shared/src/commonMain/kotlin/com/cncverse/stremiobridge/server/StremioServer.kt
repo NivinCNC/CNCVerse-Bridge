@@ -314,14 +314,14 @@ object StremioServer {
                 loadedApis.forEachIndexed { i, api ->
                     if (i > 0) sb.append(",")
                     val name = api.name.replace("\"", "\\\"")
-                    val id = api.internalName.replace("\"", "\\\"")
+                    val id = nameSlug(api.name).replace("\"", "\\\"")
                     val repoUrl = com.cncverse.stremiobridge.state.RepoState.installedPlugins.value
                         .find { it.internalName == api.pluginInternalName }?.repoUrl?.replace("\"", "\\\"") ?: ""
                     val repoName = com.cncverse.stremiobridge.state.RepoState.repos.value
                         .find { it.url == repoUrl }?.name?.replace("\"", "\\\"") ?: ""
                     val iconUrl = com.cncverse.stremiobridge.state.RepoState.installedPlugins.value
                         .find { it.internalName == api.internalName }?.iconUrl?.replace("\"", "\\\"") ?: ""
-                    val enabled = !disabledPlugins.contains(api.internalName)
+                    val enabled = !disabledPlugins.contains(nameSlug(api.name)) && !disabledPlugins.contains(api.internalName)
                     sb.append("""{"internalName":"$id","name":"$name","enabled":$enabled,"repoUrl":"$repoUrl","repoName":"$repoName","iconUrl":"$iconUrl"}""")
                 }
                 sb.append("]")
@@ -443,7 +443,8 @@ object StremioServer {
     suspend fun buildManifest(profileId: String? = null): StremioManifest {
         val profileDisabled = if (profileId != null) getProfileDisabled(profileId) else emptySet()
         val activeApis = loadedApis.filter {
-            !disabledPlugins.contains(it.internalName) && !profileDisabled.contains(it.internalName)
+            !disabledPlugins.contains(nameSlug(it.name)) && !disabledPlugins.contains(it.internalName) &&
+            !profileDisabled.contains(nameSlug(it.name)) && !profileDisabled.contains(it.internalName)
         }
         val types = listOf("movie","series", "other", "tv")
 
@@ -505,7 +506,7 @@ object StremioServer {
             ?: loadedApis.firstOrNull()
             ?: return emptyList()
 
-        if (disabledPlugins.contains(api.internalName)) return emptyList()
+        if (disabledPlugins.contains(nameSlug(api.name)) || disabledPlugins.contains(api.internalName)) return emptyList()
 
         val sectionName = genre
 
@@ -517,7 +518,7 @@ object StremioServer {
                     results.filter { r -> cs3TvTypeToStremio(r.type) == type }
                         .ifEmpty { results }
                 } else results
-                filtered.map { it.toStremiMeta(api.internalName, type) }
+                filtered.map { it.toStremiMeta(nameSlug(api.name), type) }
             } else {
                 val results = api.getMainPage(page = (skip / 20) + 1, type = type, sectionName = sectionName)
                 // If plugin supports multiple types, filter strictly; otherwise return all
@@ -525,7 +526,7 @@ object StremioServer {
                     results.filter { r -> cs3TvTypeToStremio(r.type) == type }
                         .ifEmpty { results }
                 } else results
-                filtered.map { it.toStremiMeta(api.internalName, type) }
+                filtered.map { it.toStremiMeta(nameSlug(api.name), type) }
             }
         } catch (e: Throwable) {
             ServerState.warn("Catalog error for ${api.name}: ${e.message}")
@@ -562,29 +563,32 @@ object StremioServer {
     // ── Meta builder ──────────────────────────────────────────────────────────
 
     private suspend fun buildMeta(type: String, id: String): StremioMeta? {
-        val (internalName, dataUrl) = StremioIds.decode(id) ?: return null
-        val api = loadedApis.find { it.internalName == internalName } ?: return null
-        if (disabledPlugins.contains(api.internalName)) return null
+        val (pluginKey, dataUrl) = StremioIds.decode(id) ?: return null
+        val api = loadedApis.find { nameSlug(it.name) == pluginKey }
+            ?: loadedApis.find { it.internalName == pluginKey }
+            ?: return null
+        if (disabledPlugins.contains(nameSlug(api.name)) || disabledPlugins.contains(api.internalName)) return null
         return try {
-            api.load(dataUrl)?.toStremiMeta(api.internalName, type)
+            api.load(dataUrl)?.toStremiMeta(nameSlug(api.name), type)
         } catch (e: Throwable) {
-            ServerState.warn("Meta error for $internalName: ${e.message}")
+            ServerState.warn("Meta error for ${api.name}: ${e.message}")
             null
         }
     }
 
-    // ── Stream builder ────────────────────────────────────────────────────────
 
     private suspend fun buildStreams(type: String, id: String): List<StremioStream> {
         val decoded = StremioIds.decode(id)
         if (decoded != null) {
-            val (internalName, dataUrl) = decoded
-            val api = loadedApis.find { it.internalName == internalName } ?: return emptyList()
-            if (disabledPlugins.contains(api.internalName)) return emptyList()
+            val (pluginKey, dataUrl) = decoded
+            val api = loadedApis.find { nameSlug(it.name) == pluginKey }
+                ?: loadedApis.find { it.internalName == pluginKey }
+                ?: return emptyList()
+            if (disabledPlugins.contains(nameSlug(api.name)) || disabledPlugins.contains(api.internalName)) return emptyList()
             return try {
                 api.loadLinks(dataUrl)
             } catch (e: Throwable) {
-                ServerState.warn("Stream error for $internalName: ${e.message}")
+                ServerState.warn("Stream error for ${api.name}: ${e.message}")
                 emptyList()
             }
         }

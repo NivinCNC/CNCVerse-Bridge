@@ -32,22 +32,26 @@ fun Application.installMpdProxyRoutes() {
 }
 
 private suspend fun handleMpdProxy(call: ApplicationCall, converter: MpdConverter) {
-    val allParams = call.request.queryParameters.entries().joinToString(", ") { "=" }
+    val allParams = call.request.queryParameters.entries().joinToString(", ") { "${it.key}=${it.value.firstOrNull()?.take(40)}" }
     ServerState.info("MPD_PROXY_REQ [] params: $allParams")
 
     try {
         val destinationUrl = call.parameters["d"] ?: call.parameters["url"]
             ?: return call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing 'd' or 'url' parameter"))
 
-        val decodedUrl = URLDecoder.decode(destinationUrl, "UTF-8")
+        // Strip trailing '?' or '&' — Jio/Akamai stream URLs sometimes end with a bare '?'
+        // which gets URL-decoded and included in the __hdnea__ HMAC query value, corrupting
+        // the signature and causing an immediate HTTP 403 from the CDN.
+        val decodedUrl = URLDecoder.decode(destinationUrl, "UTF-8").trimEnd('?', '&')
         val repId = call.request.queryParameters["rep_id"]
         val clearKey = call.request.queryParameters["clearkey"]
             ?: buildClearKey(call.request.queryParameters["key_id"], call.request.queryParameters["key"])
 
-        ServerState.info("MPD_PROXY: url=${decodedUrl.take(100)}, repId=$repId, clearKey=${clearKey?.take(20)}")
+        ServerState.info("MPD_PROXY: url=${decodedUrl.take(120)}, repId=$repId, clearKey=${clearKey?.take(20)}")
 
         val queryParams = call.request.queryParameters.entries().associate { it.key to it.value.firstOrNull().orEmpty() }
         val customHeaders = HttpClientManager.extractHeadersFromParams(queryParams)
+        ServerState.info("MPD_PROXY_HEADERS extracted=${customHeaders.keys.joinToString()} (from ${queryParams.keys.filter { it.startsWith("h_") }.joinToString()})")
 
         val mpdContent = SegmentCache.getMpd(decodedUrl) ?: withContext(Dispatchers.IO) {
             HttpClientManager.getString(url = decodedUrl, headers = customHeaders, proxyUrl = null)
