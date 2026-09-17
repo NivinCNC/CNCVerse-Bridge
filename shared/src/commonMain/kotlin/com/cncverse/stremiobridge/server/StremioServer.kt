@@ -2871,8 +2871,15 @@ function toggleCard(name) {
 }
 
 function setAll(on) {
+  // When a chip filter is active, scope to only those extensions that match it.
+  var scope = currentFilter === "all"
+    ? exts
+    : exts.filter(function(e) {
+        return getExtTypes(e).indexOf(currentFilter) >= 0;
+      });
+
   var dis = [], en = [];
-  exts.forEach(function(e) {
+  scope.forEach(function(e) {
     if (!e.enabled) {
       if (on) en.push(e.internalName);
     } else {
@@ -2880,22 +2887,28 @@ function setAll(on) {
     }
   });
 
+  // Merge the scoped change into the existing profile state instead of wiping it.
   if (on) {
-    pData._d = new Set();
-    pData._e = new Set(en);
+    en.forEach(function(n) { pData._e.add(n); });
+    // Restore any that were manually disabled within this scope.
+    scope.forEach(function(e) { pData._d.delete(e.internalName); });
   } else {
-    pData._d = new Set(dis);
-    pData._e = new Set();
+    dis.forEach(function(n) { pData._d.add(n); });
+    // Remove any manual enables within this scope.
+    scope.forEach(function(e) { pData._e.delete(e.internalName); });
   }
 
+  var label = currentFilter === "all" ? "All" : (TYPE_LABELS[currentFilter] || currentFilter);
   updateMetrics();
   renderCards();
-  toast(on ? "All extensions enabled for your profile" : "Profile manifest cleared");
+  toast(on ? (label + " extensions enabled") : (label + " extensions cleared from profile"));
 
+  var allDis = Array.from(pData._d);
+  var allEn  = Array.from(pData._e);
   fetch("/api/profile/" + encodeURIComponent(pid) + "/set", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ disabledExtensions: dis, enabledExtensions: en })
+    body: JSON.stringify({ disabledExtensions: allDis, enabledExtensions: allEn })
   }).then(function(r){ return r.json(); })
     .then(function(p){
       pData = p;
