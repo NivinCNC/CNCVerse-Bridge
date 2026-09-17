@@ -11,3 +11,5 @@ Thumbs.db
 
 # headless server packaging output
 serverApp/dist/
+
+.kotlin/
