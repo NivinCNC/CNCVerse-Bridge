@@ -3154,12 +3154,12 @@ fun MediaInfo.toStremiMeta(pluginInternalName: String, stremioType: String) = St
     poster      = posterUrl,
     description = description,
     year        = year,
-    videos      = episodes?.map { ep ->
+    videos      = episodes?.mapIndexed { index, ep ->
         StremioVideo(
             id       = StremioIds.encode(pluginInternalName, ep.dataUrl),
-            title    = ep.name ?: "Episode ${ep.episode}",
+            title    = ep.name ?: "Episode ${ep.episode ?: (index + 1)}",
             season   = ep.season ?: 1,
-            episode  = ep.episode ?: 1,
+            episode  = ep.episode ?: (index + 1),
             thumbnail= ep.posterUrl ?: posterUrl
         )
     }
