@@ -47,10 +47,10 @@ object BridgeRuntime {
 
     private val loadMutex = Mutex()
 
-    /** Background hourly repo-refresh + auto-update job. Cancelled on stop. */
-    private var hourlyUpdateJob: Job? = null
+    /** Background periodic repo-refresh + auto-update job. Cancelled on stop. */
+    private var periodicUpdateJob: Job? = null
 
-    private val HOURLY_INTERVAL_MS = 60L * 60L * 1000L // 1 hour
+    private val REFRESH_INTERVAL_MS = 30L * 60L * 1000L // 30 minutes
 
     fun getLocalIpAddress(): String? = try {
         val interfaces = NetworkInterface.getNetworkInterfaces().asSequence().toList()
@@ -273,19 +273,19 @@ object BridgeRuntime {
                 .onFailure { e -> ServerState.warn("Startup pre-warm error: ${e.message}") }
         }
 
-        // Start hourly extension update checker
-        startHourlyUpdateCheck()
+        // Start 30-min extension update checker
+        startPeriodicUpdateCheck()
     }
 
-    /** Launches a background loop that refreshes repos and auto-updates plugins every hour. */
-    private fun startHourlyUpdateCheck() {
-        hourlyUpdateJob?.cancel()
-        hourlyUpdateJob = appScope?.launch(Dispatchers.IO) {
-            // First check after 1 hour
-            delay(HOURLY_INTERVAL_MS)
+    /** Launches a background loop that refreshes repos and auto-updates plugins every 30 minutes. */
+    private fun startPeriodicUpdateCheck() {
+        periodicUpdateJob?.cancel()
+        periodicUpdateJob = appScope?.launch(Dispatchers.IO) {
+            // First check after 30 minutes
+            delay(REFRESH_INTERVAL_MS)
             while (isActive) {
                 runCatching {
-                    ServerState.info("Hourly update check — refreshing repos…")
+                    ServerState.info("Periodic update check — refreshing repos…")
                     RepoManager.refreshAllRepos()
                     val toUpdate = RepoState.installedPlugins.value.filter {
                         RepoState.getInstallState(it.internalName) is PluginInstallState.UpdateAvailable
@@ -295,23 +295,23 @@ object BridgeRuntime {
                         PluginInstaller.autoUpdateInstalled(cacheDir)
                         forceReloadPlugins()
                     } else {
-                        ServerState.info("Hourly check complete — all plugins up to date")
+                        ServerState.info("Periodic check complete — all plugins up to date")
                     }
-                    // Always pre-warm home pages after hourly refresh
+                    // Always pre-warm home pages after refresh
                     runCatching { StremioServer.preWarmHomepages() }
-                        .onFailure { e -> ServerState.warn("Hourly pre-warm error: ${e.message}") }
+                        .onFailure { e -> ServerState.warn("Periodic pre-warm error: ${e.message}") }
                 }.onFailure { e ->
-                    ServerState.warn("Hourly update check failed: ${e.message}")
+                    ServerState.warn("Periodic update check failed: ${e.message}")
                 }
-                delay(HOURLY_INTERVAL_MS)
+                delay(REFRESH_INTERVAL_MS)
             }
         }
     }
 
     /** Stop the addon server and tunnel (admin fallback engine is handled by the web admin). */
     fun stopBridge() {
-        hourlyUpdateJob?.cancel()
-        hourlyUpdateJob = null
+        periodicUpdateJob?.cancel()
+        periodicUpdateJob = null
         StremioServer.stop()
         ServerState.updateStatus(ServerStatus.Stopped)
         ServerState.info("Server stopped by user")

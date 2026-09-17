@@ -11,7 +11,7 @@ package com.cncverse.stremiobridge.server.web
  *  - Append-only log rendering (no glitch from full DOM replacement)
  *  - Profile-based manifest URL (per-session extension disable)
  *  - Local-only repos (not saved globally) with "Save Globally" button
- *  - Hourly update check triggered client-side after 1 hour
+ *  - 30-min update check triggered client-side after 30 minutes
  *
  * NOTE: JavaScript below intentionally avoids template literals and any '$'
  * characters so it can live inside a Kotlin raw string without escaping.
@@ -1727,14 +1727,14 @@ logTimer = setInterval(function() { pollLogs(); }, 3000);
 // Plugin refresh: every 3s when on extensions tab (picks up install state changes)
 setInterval(function() { if (tab === "extensions") loadPlugins(); }, 3000);
 
-// Hourly client-side refresh trigger (belt-and-suspenders alongside server-side check)
+// 30-min client-side refresh trigger (belt-and-suspenders alongside server-side check)
 setTimeout(function() {
   setInterval(function() {
     api("/repos/refresh", {method:"POST", body:"{}"})
       .then(function() { loadPlugins(); })
       .catch(function() {});
-  }, 60 * 60 * 1000);
-}, 60 * 60 * 1000);
+  }, 30 * 60 * 1000);
+}, 30 * 60 * 1000);
 </script>
 </body>
 </html>"""

@@ -842,7 +842,7 @@ object StremioServer {
     /**
      * Pre-warms every plugin's home page by calling [buildCatalog] (→ [getMainPage])
      * for each catalog defined in the manifest.  Called once after server startup and
-     * then every hour after the extension refresh, so Stremio users always see
+     * then every 30 minutes after the extension refresh, so Stremio users always see
      * instant home pages with fresh content.
      */
     suspend fun preWarmHomepages() {
