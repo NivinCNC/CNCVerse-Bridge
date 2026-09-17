@@ -452,22 +452,21 @@ object StremioServer {
             // Returns loaded extensions for the user page
             get("/api/extensions") {
                 val sb = StringBuilder("[")
+                val installed = com.cncverse.stremiobridge.state.RepoState.installedPlugins.value
+                val knownRepos = com.cncverse.stremiobridge.state.RepoState.repos.value
                 loadedApis.forEachIndexed { i, api ->
                     if (i > 0) sb.append(",")
                     val name = api.name.replace("\"", "\\\"")
                     val id = nameSlug(api.name).replace("\"", "\\\"")
-                    val rawRepoUrl = com.cncverse.stremiobridge.state.RepoState.installedPlugins.value
-                        .find { it.internalName == api.pluginInternalName }?.repoUrl ?: ""
+                    val plugin = installed.find { it.internalName == api.pluginInternalName || it.internalName == api.internalName }
+                    val rawRepoUrl = plugin?.repoUrl ?: ""
                     // Canonicalize: prefer the URL as stored in the known repos list so that
                     // refs/heads variants don't create phantom repo groups in the UI.
-                    val knownRepo = com.cncverse.stremiobridge.state.RepoState.repos.value
-                        .find { it.url == rawRepoUrl }
-                        ?: com.cncverse.stremiobridge.state.RepoState.repos.value
-                            .find { normalizeGhUrl(it.url) == normalizeGhUrl(rawRepoUrl) }
+                    val knownRepo = knownRepos.find { it.url == rawRepoUrl }
+                        ?: knownRepos.find { normalizeGhUrl(it.url) == normalizeGhUrl(rawRepoUrl) }
                     val repoUrl = (knownRepo?.url ?: rawRepoUrl).replace("\"", "\\\"")
                     val repoName = knownRepo?.name?.replace("\"", "\\\"") ?: ""
-                    val iconUrl = com.cncverse.stremiobridge.state.RepoState.installedPlugins.value
-                        .find { it.internalName == api.internalName }?.iconUrl?.replace("\"", "\\\"") ?: ""
+                    val iconUrl = plugin?.iconUrl?.replace("\"", "\\\"") ?: ""
                     val enabled = !isGloballyDisabled(api)
                     val typesJson = api.supportedTypes.distinct().joinToString(",") { "\"" + it + "\"" }
                     sb.append("{\"internalName\":\"$id\",\"name\":\"$name\",\"enabled\":$enabled,\"repoUrl\":\"$repoUrl\",\"repoName\":\"$repoName\",\"iconUrl\":\"$iconUrl\",\"types\":[$typesJson]}")
@@ -1018,582 +1017,1493 @@ object StremioServer {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>CNCVerse Bridge</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-:root{
-  --bg:#0a0b10;--panel:#0d0e13;--surface:#14151d;--card:#161822;--card2:#1b1d29;
-  --border:#232634;--border2:#2a2d3a;
-  --text:#e4e5ea;--text2:#9ca3af;--muted:#6b7280;
-  --accent:#3b82f6;--accent2:#60a5fa;--accent-bg:rgba(59,130,246,.12);--accent-bd:rgba(59,130,246,.55);
-  --pink:#ec4899;--pink2:#f43f5e;--green:#22c55e;--red:#f87171;
+:root {
+  --bg: #090b10;
+  --surface: #111520;
+  --surface-active: #171d2d;
+  --surface-card: #131826;
+  --surface-card-hover: #181f30;
+  --border: #1e2638;
+  --border-focus: #33415e;
+  --border-active: #6366f1;
+  --text: #f1f3f7;
+  --text-sub: #94a3b8;
+  --text-dim: #64748b;
+  --accent: #6366f1;
+  --accent-hover: #4f46e5;
+  --accent-glow: rgba(99, 102, 241, 0.18);
+  --code-bg: #151a28;
+  --green: #10b981;
+  --green-bg: rgba(16, 185, 129, 0.12);
+  --cyan: #38bdf8;
+  --cyan-bg: rgba(56, 189, 248, 0.1);
+  --amber: #f59e0b;
+  --amber-bg: rgba(245, 158, 11, 0.12);
+  --red: #f87171;
+  --red-bg: rgba(248, 113, 113, 0.12);
 }
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{background:var(--bg);color:var(--text);min-height:100vh;font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
-a{color:inherit;text-decoration:none}
-button{font:inherit;cursor:pointer;border:none;background:none;color:inherit}
-::-webkit-scrollbar{width:10px;height:10px}
-::-webkit-scrollbar-thumb{background:#232634;border-radius:99px;border:2px solid var(--bg)}
-
-/* ── Layout ── */
-.sidebar{position:fixed;top:0;left:0;bottom:0;width:250px;background:var(--panel);border-right:1px solid #1a1c28;display:flex;flex-direction:column;z-index:60}
-.mainwrap{margin-left:250px;min-height:100vh;display:flex;flex-direction:column}
-.content{flex:1;width:100%;max-width:1220px;padding:26px 30px 80px}
-
-/* ── Sidebar ── */
-.brand{display:flex;align-items:center;gap:11px;padding:18px 16px 14px}
-.brand-logo{width:36px;height:36px;border-radius:11px;background:linear-gradient(135deg,#6d28d9,#a78bfa);display:flex;align-items:center;justify-content:center;font-weight:900;font-size:11px;color:#fff;letter-spacing:-.5px;flex:0 0 auto;box-shadow:0 0 22px rgba(124,58,237,.35)}
-.brand-name{font-size:14.5px;font-weight:700;color:#fff;letter-spacing:-.2px}
-.brand-sub{font-size:11.5px;color:var(--muted);margin-top:1px}
-.navsec{font-size:10.5px;font-weight:800;letter-spacing:.12em;text-transform:uppercase;color:var(--muted);padding:18px 18px 6px}
-.navitem{display:flex;align-items:center;gap:11px;margin:2px 10px;padding:9px 12px;border-radius:9px;color:var(--text2);font-size:13px;font-weight:600;cursor:pointer;transition:background .15s,color .15s}
-.navitem:hover{background:#12141d;color:var(--text)}
-.navitem.active{background:#1a2030;color:#fff}
-.navitem .ic{width:18px;height:18px;flex:0 0 auto}
-.navbadge{margin-left:auto;min-width:20px;height:20px;padding:0 6px;border-radius:999px;background:var(--accent);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center}
-.side-foot{margin-top:auto;padding:16px 18px;font-size:11px;color:var(--muted);border-top:1px solid #171925}
-
-/* ── Topbar ── */
-.topbar{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:12px;height:58px;padding:0 30px;background:rgba(10,11,16,.88);backdrop-filter:blur(14px);border-bottom:1px solid #1a1c28}
-.t-title{font-size:16px;font-weight:700;color:#fff;letter-spacing:-.2px}
-.t-sub{font-size:12.5px;color:var(--muted);margin-top:1px}
-.t-actions{margin-left:auto;display:flex;gap:8px}
-.ibtn{width:34px;height:34px;border-radius:999px;background:var(--surface);border:1px solid var(--border);color:var(--text2);display:flex;align-items:center;justify-content:center;transition:.15s}
-.ibtn:hover{border-color:var(--accent);color:#fff}
-.ibtn.heart{color:var(--pink)}
-.ibtn.heart:hover{border-color:var(--pink);color:var(--pink2)}
-.ibtn svg{width:16px;height:16px}
-.burger{display:none;width:34px;height:34px;border-radius:9px;color:var(--text2);align-items:center;justify-content:center}
-.burger svg{width:20px;height:20px}
-.scrim{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:55;opacity:0;pointer-events:none;transition:.2s}
-.scrim.show{opacity:1;pointer-events:auto}
-
-/* ── Overview ── */
-.ohero{padding:6px 0 20px}
-.ohero h1{font-size:24px;font-weight:800;letter-spacing:-.5px;color:#fff}
-.ohero p{color:var(--text2);font-size:13.5px;margin-top:5px;max-width:640px}
-.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-bottom:18px}
-.stat{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px 18px}
-.stat .v{font-size:21px;font-weight:800;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.stat .l{font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-top:4px}
-.cols2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px 20px;margin-bottom:14px}
-.card h2{font-size:14px;font-weight:700;color:#fff;display:flex;align-items:center;gap:8px}
-.hint{font-size:12.5px;color:var(--text2);margin-top:3px;margin-bottom:12px}
-.urlbox{display:flex;align-items:center;gap:8px;background:#0b0c12;border:1px solid var(--border2);border-radius:10px;padding:9px 12px}
-.urlbox code{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:11.5px;color:#93c5fd;word-break:break-all;flex:1}
-.cbtn{flex:0 0 auto;background:var(--card2);border:1px solid var(--border2);border-radius:8px;color:var(--text2);padding:5px 12px;font-size:11.5px;font-weight:600;transition:.15s}
-.cbtn:hover{color:#fff;border-color:var(--accent)}
-.btnrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:12px}
-.btn-p{display:inline-flex;align-items:center;gap:7px;background:var(--accent);color:#fff;font-size:12.5px;font-weight:700;padding:8px 16px;border-radius:9px;transition:.15s}
-.btn-p:hover{background:#2f6fe0}
-.btn-p svg{width:13px;height:13px}
-.pidtag{font-size:11px;color:var(--muted);background:var(--card2);border:1px solid var(--border);padding:3px 9px;border-radius:999px}
-.steps{display:flex;flex-direction:column;gap:9px;margin-top:12px}
-.step{display:flex;gap:12px;background:var(--card);border:1px solid var(--border);border-radius:11px;padding:12px 14px}
-.snum{width:24px;height:24px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#60a5fa);color:#fff;font-weight:800;font-size:11px;display:flex;align-items:center;justify-content:center;flex:0 0 auto;margin-top:1px}
-.step b{display:block;font-size:13px;font-weight:700;color:var(--text)}
-.step span{font-size:12px;color:var(--text2)}
-
-/* ── Page head + filter tabs ── */
-.ph h1{font-size:20px;font-weight:800;color:#fff;letter-spacing:-.4px}
-.ph p{font-size:13px;color:var(--text2);margin-top:3px;max-width:620px}
-.tabs{display:flex;gap:18px;flex-wrap:wrap;margin:16px 0 18px;border-bottom:1px solid #1a1c28}
-.ptab{font-size:12.5px;font-weight:600;color:var(--muted);padding:6px 2px 9px;border-bottom:2px solid transparent;cursor:pointer;transition:.15s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
-.ptab:hover{color:var(--text)}
-.ptab.on{color:#fff;border-bottom-color:var(--accent)}
-
-/* ── Repo groups + extension cards ── */
-.rgroup{margin-bottom:20px}
-.rghead{display:flex;align-items:center;gap:10px;margin-bottom:10px}
-.rgletter{width:26px;height:26px;border-radius:8px;background:var(--card2);border:1px solid var(--border);color:var(--accent2);font-size:12px;font-weight:800;display:flex;align-items:center;justify-content:center;flex:0 0 auto}
-.rgname{font-size:13px;font-weight:700;color:var(--text);flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.rgcount{font-size:11.5px;color:var(--muted);margin-left:auto}
-.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:12px}
-.ecard{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px;display:flex;align-items:center;gap:11px;transition:border-color .15s,background .15s}
-.ecard.vert{flex-direction:column;align-items:stretch;gap:9px}
-.ecard:hover{border-color:#2e3750}
-.ecard.selable{cursor:pointer}
-.ecard.selable:hover{border-color:var(--accent-bd)}
-.ecard.sel{border-color:var(--accent-bd);background:linear-gradient(180deg,rgba(59,130,246,.08),rgba(59,130,246,.02)),var(--surface)}
-.eic{width:34px;height:34px;border-radius:9px;object-fit:cover;flex:0 0 auto}
-.eletter{background:var(--card2);border:1px solid var(--border);color:var(--accent2);font-weight:800;font-size:13px;display:flex;align-items:center;justify-content:center}
-.ec-main{min-width:0;flex:1}
-.ename{font-size:13.5px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.etags{font-size:11.5px;color:var(--muted);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.st{flex:0 0 auto;font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px}
-.st.on{background:rgba(34,197,94,.12);color:var(--green)}
-.st.off{background:rgba(248,113,113,.12);color:var(--red)}
-.ec-top{display:flex;align-items:center;gap:11px;min-width:0;flex:1}
-.radio{width:20px;height:20px;border-radius:50%;border:2px solid #3a4054;flex:0 0 auto;position:relative;transition:.15s}
-.ecard.sel .radio{background:var(--accent);border-color:var(--accent)}
-.ecard.sel .radio:after{content:"";position:absolute;left:5.5px;top:2px;width:5px;height:10px;border:solid #fff;border-width:0 2px 2px 0;transform:rotate(45deg)}
-
-/* ── Profile progress + section heads + pills ── */
-.pcard{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:15px 18px;margin-bottom:22px}
-.prow{display:flex;align-items:baseline;justify-content:space-between;gap:10px}
-.prow .pl{font-size:13px;color:var(--text2)}
-.prow .pl b{color:#fff;font-weight:700}
-.ppct{font-size:13.5px;font-weight:800;color:var(--pink)}
-.ptrack{height:7px;border-radius:999px;background:#20232f;margin-top:11px;overflow:hidden}
-.pfill{height:100%;border-radius:999px;background:linear-gradient(90deg,var(--pink),var(--pink2));transition:width .35s}
-.sechead{display:flex;align-items:center;gap:8px;margin:4px 0 12px}
-.sechead .sic{width:16px;height:16px;color:var(--accent2);flex:0 0 auto}
-.sh-t{font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:var(--text)}
-.scount{margin-left:auto;font-size:12.5px;color:var(--muted)}
-.lnk{font-size:12.5px;font-weight:600;color:var(--accent2);cursor:pointer;margin-left:14px}
-.lnk:hover{text-decoration:underline}
-.tip{font-size:12px;color:var(--muted);margin-top:14px}
-.pillrow{display:flex;gap:8px;flex-wrap:wrap}
-.pill{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:7px 16px;border-radius:999px;border:1px solid var(--border2);background:var(--surface);color:var(--text2);font-size:12.5px;font-weight:600;cursor:pointer;transition:.15s}
-.pill:hover{color:var(--text)}
-.pill.on{background:var(--accent);border-color:var(--accent);color:#fff}
-
-/* ── Repos page ── */
-.addrow{display:flex;gap:10px;flex-wrap:wrap}
-.addrow input{flex:1;min-width:220px;background:#0b0c12;border:1px solid var(--border2);border-radius:10px;padding:9px 12px;color:var(--text);font:inherit;font-size:13px;outline:none;transition:border-color .15s}
-.addrow input:focus{border-color:var(--accent)}
-.addrow input::placeholder{color:var(--muted)}
-.btn-p:disabled{opacity:.55;cursor:default}
-.rgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:12px}
-.rcard{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px 16px;display:flex;flex-direction:column;gap:7px;transition:border-color .15s}
-.rcard:hover{border-color:#2e3750}
-.rcard .rurl{font-size:11px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
-.goffchip{flex:0 0 auto;font-size:9.5px;font-weight:800;letter-spacing:.05em;text-transform:uppercase;padding:2px 8px;border-radius:999px;background:rgba(251,191,36,.13);color:#fbbf24}
-.ecard.goff:not(.sel){border-style:dashed;opacity:.88}
-
-/* ── Misc ── */
-.empty{padding:26px;text-align:center;color:var(--muted);font-size:12.5px}
-.toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--card2);border:1px solid var(--border2);color:var(--text);padding:9px 18px;border-radius:11px;font-size:12.5px;box-shadow:0 8px 28px rgba(0,0,0,.45);opacity:0;transition:.2s;pointer-events:none;z-index:99}
-.toast.show{opacity:1}
-
-@media(max-width:920px){
-  .sidebar{transform:translateX(-100%);transition:transform .22s ease}
-  .sidebar.open{transform:none;box-shadow:0 0 40px rgba(0,0,0,.5)}
-  .mainwrap{margin-left:0}
-  .burger{display:flex}
-  .content{padding:16px 14px 70px}
-  .topbar{padding:0 14px}
-  .cols2{grid-template-columns:1fr}
+[data-theme="light"] {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --surface-active: #f1f5f9;
+  --surface-card: #ffffff;
+  --surface-card-hover: #f8fafc;
+  --border: #e2e8f0;
+  --border-focus: #cbd5e1;
+  --border-active: #4f46e5;
+  --text: #0f172a;
+  --text-sub: #475569;
+  --text-dim: #94a3b8;
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-glow: rgba(79, 70, 229, 0.12);
+  --code-bg: #f1f5f9;
+  --green: #059669;
+  --green-bg: rgba(5, 150, 105, 0.08);
+  --cyan: #0284c7;
+  --cyan-bg: rgba(2, 132, 199, 0.08);
+  --amber: #d97706;
+  --amber-bg: rgba(217, 119, 6, 0.08);
+  --red: #dc2626;
+  --red-bg: rgba(220, 38, 38, 0.08);
 }
-@media(max-width:560px){
-  .content{padding:12px 12px 64px}
-  .stats{grid-template-columns:repeat(3,1fr)}
-  .grid{grid-template-columns:repeat(auto-fill,minmax(150px,1fr))}
-  .rgrid{grid-template-columns:1fr}
-  .t-sub{display:none}
-  .ohero h1{font-size:19px}
-  .tabs{gap:10px 14px}
-  /* Source-filter chips: 2 per row */
-  .pill{flex:0 0 calc(50% - 4px);padding:7px 10px}
-  .card{padding:14px 14px}
-  .addrow input{font-size:12.5px}
-  .rcard .rurl{font-size:10.5px}
-  .etags{font-size:11px}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html, body { overflow-x: hidden; max-width: 100vw; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.5 'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  padding: 1.5rem 1.25rem 4rem;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+}
+@media (max-width: 680px) {
+  body { padding: 12px 10px 4rem; }
+}
+.container {
+  max-width: 68rem;
+  width: 100%;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-width: 0;
+}
+
+
+
+/* Header */
+.hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 0.1rem;
+}
+.brand-title {
+  font-size: 1.55rem;
+  font-weight: 800;
+  color: var(--text);
+  letter-spacing: -0.5px;
+  margin: 0 0 2px;
+}
+@media (max-width: 680px) {
+  .brand-title { font-size: 1.3rem; }
+}
+.brand-sub { font-size: 12.5px; color: var(--text-sub); margin: 0; }
+.hdr-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
+.btn-hdr {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-sub);
+  padding: 7px 11px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  text-decoration: none;
+}
+.btn-hdr:hover { color: var(--text); border-color: var(--border-focus); background: var(--surface-active); }
+.hdr-badge {
+  font-size: 10px;
+  font-weight: 700;
+  background: var(--accent-glow);
+  color: var(--accent);
+  padding: 1px 6px;
+  border-radius: 999px;
+}
+
+/* Mode Selector (2 Clean Cards) */
+.nav-cards {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.nav-card {
+  background: var(--surface-card);
+  border: 1.5px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+  text-align: left;
+  cursor: pointer;
+  transition: all 0.18s ease;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  min-width: 0;
+  overflow: hidden;
+  box-sizing: border-box;
+  font: inherit;
+}
+@media (max-width: 480px) {
+  .nav-cards { gap: 8px; }
+  .nav-card { padding: 10px 10px; gap: 2px; border-radius: 10px; }
+}
+.nav-card:hover { border-color: var(--border-focus); background: var(--surface-active); }
+.nav-card.active {
+  border-color: var(--accent);
+  background: var(--surface-card);
+  box-shadow: 0 4px 16px var(--accent-glow);
+}
+.nav-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 4px;
+  width: 100%;
+  min-width: 0;
+}
+.nav-card-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  background: var(--accent-glow);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.nav-card-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  color: var(--text-sub);
+  flex-shrink: 0;
+}
+.nav-card.active .nav-card-badge {
+  background: var(--accent-glow);
+  border-color: rgba(99, 102, 241, 0.3);
+  color: var(--accent);
+}
+.nav-card-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+  line-height: 1.25;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  width: 100%;
+}
+@media (max-width: 480px) { .nav-card-title { font-size: 12.5px; } }
+.nav-card-desc {
+  font-size: 11px;
+  color: var(--text-sub);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  width: 100%;
+}
+@media (max-width: 480px) { .nav-card-desc { font-size: 10px; } }
+
+/* Tab Panels */
+.tab-panel {
+  display: none;
+  flex-direction: column;
+  gap: 1rem;
+  width: 100%;
+}
+.tab-panel.active { display: flex; }
+
+/* Hero Card */
+.hero-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  box-shadow: 0 6px 20px -6px rgba(0, 0, 0, 0.35);
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+@media (max-width: 680px) { .hero-card { padding: 14px 14px; gap: 11px; } }
+.hero-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.hero-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--green);
+}
+.status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 7px var(--green);
+  flex-shrink: 0;
+}
+.hero-scope {
+  font-size: 11.5px;
+  color: var(--text-sub);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.hero-desc {
+  font-size: 12.5px;
+  color: var(--text-sub);
+  line-height: 1.45;
+}
+
+
+
+/* Install Button CTA */
+.btn-install {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  width: 100%;
+  background: var(--accent);
+  color: #ffffff !important;
+  font-weight: 700;
+  font-size: 14.5px;
+  padding: 12px 20px;
+  border-radius: 9px;
+  text-decoration: none;
+  cursor: pointer;
+  box-shadow: 0 4px 14px var(--accent-glow);
+  transition: all 0.15s ease;
+}
+.btn-install:hover {
+  background: var(--accent-hover);
+  box-shadow: 0 6px 18px rgba(99, 102, 241, 0.35);
+  transform: translateY(-1px);
+}
+.btn-install:active { transform: translateY(0); }
+
+/* Single-Line Compact Manifest Group */
+.manifest-input-group {
+  display: flex;
+  align-items: center;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 4px 5px 4px 10px;
+  width: 100%;
+  box-sizing: border-box;
+  gap: 8px;
+  overflow: hidden;
+  transition: border-color 0.15s;
+}
+.manifest-input-group:focus-within { border-color: var(--accent); }
+.manifest-tag {
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+  background: var(--surface);
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 3px 6px;
+  flex-shrink: 0;
+}
+.manifest-input {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  outline: none;
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.btn-copy-manifest {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 6px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.btn-copy-manifest:hover { background: var(--surface-active); border-color: var(--border-focus); }
+
+/* Bridge Specifications Card */
+.features-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+.features-title {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.8px;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.features-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+  box-sizing: border-box;
+}
+@media (max-width: 480px) {
+  .features-grid { grid-template-columns: 1fr; gap: 8px; }
+}
+.feature-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 9px 12px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-size: 12px;
+}
+.feat-label { color: var(--text-sub); font-weight: 500; }
+.feat-val { color: var(--text); font-weight: 700; }
+
+/* Customize Prompt Banner */
+.customize-prompt-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 14px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  cursor: pointer;
+  transition: all 0.18s ease;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+.customize-prompt-card:hover {
+  border-color: var(--accent);
+  background: var(--surface-card-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 16px var(--accent-glow);
+}
+.cp-content { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.cp-icon {
+  width: 36px;
+  height: 36px;
+  border-radius: 10px;
+  background: var(--accent-glow);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.cp-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.cp-title { font-size: 13.5px; font-weight: 700; color: var(--text); letter-spacing: -0.2px; }
+.cp-sub { font-size: 11.5px; color: var(--text-sub); line-height: 1.35; }
+.cp-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+@media (max-width: 480px) {
+  .customize-prompt-card { padding: 12px 14px; gap: 10px; }
+  .cp-sub { display: none; }
+}
+
+/* Customizer Bar */
+.customizer-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+}
+.customizer-hdr {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 8px;
+}
+.customizer-title {
+  font-size: 1.1rem;
+  font-weight: 800;
+  color: var(--text);
+  letter-spacing: -0.3px;
+}
+.customizer-sub { font-size: 12px; color: var(--text-sub); margin-top: 2px; }
+.customizer-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+}
+.btn-reset-action {
+  font-size: 11.5px;
+  color: var(--accent);
+  background: none;
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.btn-reset-action:hover { text-decoration: underline; }
+
+.presets-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+  scrollbar-width: none;
+  width: 100%;
+}
+.presets-row::-webkit-scrollbar { display: none; }
+.preset-btn {
+  font-size: 11.5px;
+  font-weight: 500;
+  padding: 4px 11px;
+  border-radius: 999px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  color: var(--text-sub);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+.preset-btn:hover { color: var(--text); border-color: var(--border-focus); }
+.preset-btn.active {
+  background: var(--surface-active);
+  color: var(--text);
+  border-color: var(--accent);
+  font-weight: 600;
+}
+.search-input {
+  width: 100%;
+  font: inherit;
+  font-size: 13px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 12px;
+  outline: none;
+  box-sizing: border-box;
+}
+.search-input:focus { border-color: var(--accent); }
+
+/* Sources Grid (Strict 2 columns on mobile) */
+.sources-section-hdr {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 0.1rem;
+}
+.sources-section-title {
+  font-size: 1.1rem;
+  font-weight: 800;
+  color: var(--text);
+  letter-spacing: -0.3px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.tab-badge {
+  font-size: 10.5px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--accent-glow);
+  color: var(--accent);
+  font-weight: 700;
+}
+.btn-customize-cta {
+  font-size: 12px;
+  color: var(--accent);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-weight: 600;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.btn-customize-cta:hover { background: var(--surface-active); border-color: var(--accent); }
+
+.sources-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+  gap: 12px;
+  width: 100%;
+  min-width: 0;
+}
+@media (max-width: 680px) {
+  .sources-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+}
+
+/* Cards */
+.provider-card, .overview-source-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  padding: 12px 13px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  user-select: none;
+  min-width: 0;
+  overflow: hidden;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+@media (max-width: 680px) {
+  .provider-card, .overview-source-card {
+    padding: 10px 10px;
+    gap: 6px;
+    border-radius: 9px;
+  }
+}
+.provider-card:hover, .overview-source-card:hover {
+  border-color: var(--border-focus);
+  transform: translateY(-2px);
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+}
+.provider-card.selected {
+  border-color: var(--accent);
+  background: var(--surface-active);
+  box-shadow: 0 4px 14px var(--accent-glow);
+}
+.p-top-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 6px;
+}
+.p-avatar {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  font-weight: 800;
+  color: var(--accent);
+  flex-shrink: 0;
+}
+.p-icon-img {
+  width: 30px;
+  height: 30px;
+  border-radius: 7px;
+  object-fit: cover;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.chk {
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-focus);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 18px;
+  transition: all 0.12s ease;
+  background: transparent;
+}
+.provider-card.selected .chk {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.chk-svg { display: none; stroke: #ffffff; }
+.provider-card.selected .chk-svg { display: block; }
+
+.oc-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--green);
+  background: var(--green-bg);
+  padding: 2px 6px;
+  border-radius: 999px;
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  flex-shrink: 0;
+}
+
+.p-main-info {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  width: 100%;
+}
+.p-name {
+  font-weight: 700;
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  line-height: 1.25;
+}
+@media (max-width: 680px) { .p-name { font-size: 12px; } }
+.p-repo {
+  font-size: 10.5px;
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.p-badges-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+.p-type-tag {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--code-bg);
+  color: var(--text-sub);
+  border: 1px solid var(--border);
+  text-transform: capitalize;
+}
+.p-tag-goff {
+  font-size: 9px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--amber-bg);
+  color: var(--amber);
+  border: 1px solid rgba(245, 158, 11, 0.25);
+  text-transform: uppercase;
+}
+.p-desc {
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+/* Modals */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  padding: 16px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.2s ease;
+}
+.modal-overlay.open { opacity: 1; pointer-events: auto; }
+.modal-box {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  width: 100%;
+  max-width: 520px;
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.5);
+  max-height: 88vh;
+  overflow-y: auto;
+}
+.modal-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.modal-title { font-size: 16px; font-weight: 700; color: var(--text); }
+.modal-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+}
+.modal-close:hover { color: var(--text); background: var(--surface-active); }
+.modal-hint { font-size: 12px; color: var(--text-sub); }
+.modal-input-row {
+  display: flex;
+  gap: 8px;
+}
+.modal-input {
+  flex: 1;
+  font: inherit;
+  font-size: 13px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 9px 12px;
+  outline: none;
+}
+.modal-input:focus { border-color: var(--accent); }
+.btn-primary {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 9px 15px;
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: background 0.15s;
+  flex-shrink: 0;
+}
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-primary:disabled { opacity: 0.5; cursor: default; }
+.repos-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+}
+.repo-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.repo-info { min-width: 0; flex: 1; }
+.repo-name { font-size: 13px; font-weight: 700; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.repo-url { font-size: 10.5px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.repo-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  color: var(--text-sub);
+  flex-shrink: 0;
+}
+
+/* Toast */
+.toast {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  transform: translateX(-50%) translateY(20px);
+  background: var(--surface-card);
+  border: 1px solid var(--border-focus);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 9px 18px;
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  opacity: 0;
+  pointer-events: none;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  z-index: 200;
+  white-space: nowrap;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.empty {
+  grid-column: 1 / -1;
+  text-align: center;
+  padding: 2rem 1rem;
+  color: var(--text-dim);
+  font-size: 13px;
 }
 </style>
 </head>
 <body>
-<div class="scrim" id="scrim" onclick="closeSidebar()"></div>
 
-<aside class="sidebar" id="sidebar">
-  <div class="brand">
-    <div class="brand-logo">CNC</div>
-    <div class="brand-txt">
-      <div class="brand-name">CNCVerse Bridge</div>
-      <div class="brand-sub">Addon gateway</div>
+<div class="container">
+  <!-- HEADER -->
+  <header class="hdr">
+    <div>
+      <h1 class="brand-title">CNCVerse Bridge</h1>
+      <p class="brand-sub">Universal CloudStream provider gateway for Stremio &amp; Nuvio</p>
     </div>
-  </div>
-  <div class="navsec">Configure</div>
-  <a class="navitem active" id="nav-overview" onclick="showPage('overview')">
-    <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
-    Overview
-  </a>
-  <a class="navitem" id="nav-extensions" onclick="showPage('extensions')">
-    <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2.5"/><path d="M7 4v16M17 4v16M3 9h4M3 15h4M17 9h4M17 15h4"/></svg>
-    Extensions
-    <span class="navbadge" id="nav-badge">0</span>
-  </a>
-  <a class="navitem" id="nav-repos" onclick="showPage('repos')">
-    <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/></svg>
-    Repositories
-  </a>
-  <a class="navitem" id="nav-profile" onclick="showPage('profile')">
-    <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21c0-4 3.6-6.5 8-6.5s8 2.5 8 6.5"/></svg>
-    My Profile
-  </a>
-  <div class="navsec">Support</div>
-  <a class="navitem" href="https://t.me/cncverse" target="_blank" rel="noopener">
-    <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
-    Telegram
-  </a>
-  <a class="navitem" href="https://cncverse.pages.dev" target="_blank" rel="noopener">
-    <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
-    Support Project
-  </a>
-  <div class="side-foot">Your profile is stored on this server</div>
-</aside>
-
-<div class="mainwrap">
-  <header class="topbar">
-    <button class="burger" onclick="toggleSidebar()" aria-label="Menu">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h16"/></svg>
-    </button>
-    <div class="t-title" id="t-title">Overview</div>
-    <div class="t-sub" id="t-sub"></div>
-    <div class="t-actions">
-      <a class="ibtn" href="https://t.me/cncverse" target="_blank" rel="noopener" title="Telegram">
-        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
+    <div class="hdr-actions">
+      <button class="btn-hdr" onclick="openReposModal()" title="Extension Repositories">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
+        <span>Repos</span>
+        <span class="hdr-badge" id="hdr-repo-count">0</span>
+      </button>
+      <a class="btn-hdr" href="https://t.me/cncverse" target="_blank" rel="noopener" title="Telegram Community">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
       </a>
-      <a class="ibtn heart" href="https://cncverse.pages.dev" target="_blank" rel="noopener" title="Support the project">
-        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
-      </a>
+      <button class="btn-hdr" onclick="toggleTheme()" id="theme-btn" title="Toggle theme">
+        <svg id="theme-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
     </div>
   </header>
 
-  <main class="content">
-
-    <section id="page-overview">
-      <div class="ohero">
-        <h1>Your personal Stremio addon gateway</h1>
-        <p>Every CloudStream extension on this server, straight into Stremio, Nuvio and friends — plus an optional personal profile that curates exactly what appears in yours.</p>
-      </div>
-      <div class="stats">
-        <div class="stat"><div class="v" id="st-ext">…</div><div class="l">Extensions</div></div>
-        <div class="stat"><div class="v" id="st-repo">…</div><div class="l">Repositories</div></div>
-        <div class="stat"><div class="v" id="st-since">…</div><div class="l">Profile created</div></div>
-      </div>
-      <div class="cols2">
-        <div class="card">
-          <h2>Global manifest</h2>
-          <div class="hint">Everything the admin has enabled — the same addon for everyone on this server.</div>
-          <div class="urlbox"><code id="g-url"></code><button class="cbtn" onclick="cpEl('g-url')">Copy</button></div>
-          <div class="btnrow"><a class="btn-p" id="g-btn" href="#"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5Z"/></svg>Open in Stremio</a></div>
+  <!-- 2-CARD MODE SELECTOR -->
+  <nav class="nav-cards">
+    <div class="nav-card active" id="nav-card-overview" onclick="switchTab('overview')">
+      <div class="nav-card-top">
+        <div class="nav-card-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
         </div>
-        <div class="card">
-          <h2>Your profile manifest</h2>
-          <div class="hint">Only the extensions you pick — stored on this server, so the URL keeps working from any device or player.</div>
-          <div class="urlbox"><code id="p-url"></code><button class="cbtn" onclick="cpEl('p-url')">Copy</button></div>
-          <div class="btnrow"><a class="btn-p" id="p-btn" href="#"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M7 4.5v15l13-7.5Z"/></svg>Open in Stremio</a><span class="pidtag" id="pid-lbl"></span></div>
+        <span class="nav-card-badge">Official Addon</span>
+      </div>
+      <div class="nav-card-title">Global Manifest</div>
+      <div class="nav-card-desc">Direct access to all globally enabled streams</div>
+    </div>
+
+    <div class="nav-card" id="nav-card-customize" onclick="switchTab('customize')">
+      <div class="nav-card-top">
+        <div class="nav-card-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
+        </div>
+        <span class="nav-card-badge">Personal Profile</span>
+      </div>
+      <div class="nav-card-title">Customize Sources</div>
+      <div class="nav-card-desc">Filter providers, exclude catalogs, curate manifest</div>
+    </div>
+  </nav>
+
+  <!-- TAB 1: OVERVIEW & GLOBAL MANIFEST -->
+  <main class="tab-panel active" id="panel-overview">
+    <div class="hero-card">
+      <div class="hero-top">
+        <div class="hero-status">
+          <span class="status-dot"></span>
+          <span>Online</span>
         </div>
       </div>
-      <div class="card">
-        <h2>How it works</h2>
-        <div class="steps">
-          <div class="step"><div class="snum">1</div><div><b>Your browser gets a unique profile</b><span>Auto-created and stored on this server. Each device or browser keeps its own ID.</span></div></div>
-          <div class="step"><div class="snum">2</div><div><b>Copy your profile manifest URL</b><span>Use it in Stremio instead of the global URL. Your picks follow the URL, on any player.</span></div></div>
-          <div class="step"><div class="snum">3</div><div><b>Toggle extensions in My Profile</b><span>Pick what appears in your Stremio — even extensions that are disabled globally. Other users are not affected.</span></div></div>
-          <div class="step"><div class="snum">4</div><div><b>Missing a repository? Add it</b><span>Every extension it offers downloads automatically, disabled by default — enable the ones you want in your profile.</span></div></div>
+
+      <div class="hero-desc">
+        All enabled CloudStream extensions in a single unified Stremio addon.
+      </div>
+
+      <a id="install-btn-overview" class="btn-install" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        Install Addon
+      </a>
+
+      <div class="manifest-input-group">
+        <span class="manifest-tag">URL</span>
+        <input type="text" id="manifest-url-overview" class="manifest-input" readonly value="Loading manifest URL..." onclick="this.select()">
+        <button class="btn-copy-manifest" onclick="cpManifest(false, this)" title="Copy Manifest URL">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+          <span class="copy-lbl">Copy</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- BRIDGE SPECIFICATIONS -->
+    <div class="features-card">
+      <div class="features-title">BRIDGE SPECIFICATIONS</div>
+      <div class="features-grid">
+        <div class="feature-item">
+          <span class="feat-label">Protocol</span>
+          <span class="feat-val">Direct &amp; HLS Streams</span>
+        </div>
+        <div class="feature-item">
+          <span class="feat-label">Resolution</span>
+          <span class="feat-val">4K &middot; 1080p &middot; 720p</span>
+        </div>
+        <div class="feature-item">
+          <span class="feat-label">Supported Types</span>
+          <span class="feat-val">Movies &middot; Series &middot; Anime &middot; TV</span>
+        </div>
+        <div class="feature-item">
+          <span class="feat-label">Auto Updates</span>
+          <span class="feat-val" style="color:var(--green)">Live Sync</span>
         </div>
       </div>
-    </section>
+    </div>
 
-    <section id="page-extensions" style="display:none">
-      <div class="ph">
-        <h1>Extensions</h1>
-        <p>Everything installed on this server. The admin decides what the global manifest serves — anything disabled globally can still be added to your own profile.</p>
-      </div>
-      <div class="tabs" id="ext-tabs"></div>
-      <div id="ext-body"><div class="empty">Loading extensions…</div></div>
-    </section>
-
-    <section id="page-repos" style="display:none">
-      <div class="ph">
-        <h1>Repositories</h1>
-        <p>Extension repositories installed on this server. Add one that is missing and every extension it offers is downloaded automatically — disabled by default, so you choose what shows up in your profile.</p>
-      </div>
-      <div class="card">
-        <h2>Add a repository</h2>
-        <div class="hint">Paste a repo.json URL, a GitHub shorthand like <b>user/repo</b>, or a shortcode such as <b>Hexated</b>.</div>
-        <div class="addrow">
-          <input type="text" id="repo-input" placeholder="https://raw.githubusercontent.com/user/repo/builds/repo.json" onkeydown="if(event.key==='Enter')addRepo()">
-          <button class="btn-p" id="repo-add-btn" onclick="addRepo()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg><span id="repo-add-lbl">Add repository</span></button>
+    <!-- CUSTOMIZE PROMPT BANNER -->
+    <div class="customize-prompt-card" onclick="switchTab('customize')" role="button" tabindex="0" title="Click to customize provider sources">
+      <div class="cp-content">
+        <div class="cp-icon">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
         </div>
-        <div class="tip" style="margin-top:11px">Repos added here are installed globally for everyone on this server. Their extensions stay disabled until you add them from My Profile.</div>
+        <div class="cp-text">
+          <div class="cp-title">Customize Sources</div>
+          <div class="cp-sub">Filter providers, exclude unwanted catalogs, or create a personalized Stremio manifest.</div>
+        </div>
       </div>
-      <div class="sechead" style="margin-top:22px">
-        <svg class="sic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2Z"/></svg>
-        <span class="sh-t">Installed repositories</span>
-        <span class="scount" id="repo-count">0</span>
+      <div class="cp-action">
+        <span>Configure</span>
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
       </div>
-      <div class="rgrid" id="repo-grid"><div class="empty">Loading repositories…</div></div>
-    </section>
+    </div>
 
-    <section id="page-profile" style="display:none">
-      <div class="ph">
-        <h1>My Profile</h1>
-        <p>Select providers for your personal manifest — including ones the admin keeps out of the global manifest. Stored on this server — other users are not affected.</p>
+    <!-- AVAILABLE EXTENSIONS LIST -->
+    <div class="sources-section-hdr">
+      <div class="sources-section-title">
+        Included Providers
+        <span class="tab-badge" id="overview-ext-count">0</span>
       </div>
-      <div class="pcard">
-        <div class="prow"><span class="pl"><b id="pf-count">0 of 0</b> extensions in your manifest</span><span class="ppct" id="pf-pct">0%</span></div>
-        <div class="ptrack"><div class="pfill" id="pf-fill" style="width:0%"></div></div>
-      </div>
-      <div class="sechead">
-        <svg class="sic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
-        <span class="sh-t">Extensions</span>
-        <span class="scount" id="pf-selected">0 selected</span>
-        <a class="lnk" onclick="setAll(true)">Select all</a>
-        <a class="lnk" onclick="setAll(false)">Clear all</a>
-      </div>
-      <div class="tabs" id="pro-tabs"></div>
-      <div class="grid" id="pro-grid"><div class="empty">Loading…</div></div>
-      <div class="tip">Tip: pick your favourite sources instead of everything — fewer catalogs means Discover loads faster in Stremio. Add more only if you watch regional or anime content.</div>
-      <div class="sechead" style="margin-top:26px">
-        <svg class="sic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M4 17h16"/><circle cx="14" cy="7" r="2.5"/><circle cx="8" cy="17" r="2.5"/></svg>
-        <span class="sh-t">Content types</span>
-      </div>
-      <div class="pillrow" id="type-pills"></div>
-    </section>
+      <button class="btn-customize-cta" onclick="switchTab('customize')">
+        Customize &rarr;
+      </button>
+    </div>
 
+    <div class="sources-grid" id="overview-grid">
+      <div class="empty">Loading providers...</div>
+    </div>
   </main>
+
+  <!-- TAB 2: CUSTOMIZE SOURCES -->
+  <main class="tab-panel" id="panel-customize">
+    <div class="hero-card">
+      <div class="hero-top">
+        <div class="hero-status">
+          <span class="status-dot"></span>
+          <span>Personal Profile</span>
+        </div>
+      </div>
+
+      <div class="hero-desc">
+        Select which providers appear in your addon. Your picks are saved on this server and follow your profile link.
+      </div>
+
+      <a id="install-btn-custom" class="btn-install" href="#">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+        Install Addon
+      </a>
+
+      <div class="manifest-input-group">
+        <span class="manifest-tag">Profile URL</span>
+        <input type="text" id="manifest-url-custom" class="manifest-input" readonly value="Loading personal manifest URL..." onclick="this.select()">
+        <button class="btn-copy-manifest" onclick="cpManifest(true, this)" title="Copy Personal Manifest URL">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+          <span class="copy-lbl">Copy</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- FILTER & SEARCH CONTROLS -->
+    <div class="customizer-bar">
+      <div class="customizer-hdr">
+        <div>
+          <h2 class="customizer-title">Customize Providers</h2>
+          <div class="customizer-sub">Click any card to enable or disable it for your profile.</div>
+        </div>
+        <div class="customizer-actions">
+          <button class="btn-reset-action" onclick="setAll(true)">Select All</button>
+          <span style="color:var(--text-dim)">&middot;</span>
+          <button class="btn-reset-action" onclick="setAll(false)">Clear All</button>
+        </div>
+      </div>
+
+      <div class="presets-row" id="presets-row">
+        <button class="preset-btn active" onclick="applyFilter('all', this)">All Sources</button>
+        <button class="preset-btn" onclick="applyFilter('movies', this)">Movies &amp; Series</button>
+        <button class="preset-btn" onclick="applyFilter('anime', this)">Anime</button>
+        <button class="preset-btn" onclick="applyFilter('live', this)">Live TV</button>
+      </div>
+
+      <input type="text" class="search-input" id="ext-search" placeholder="Search providers by name, repo, or content tag..." oninput="renderCards()">
+    </div>
+
+    <div class="sources-grid" id="sources-grid">
+      <div class="empty">Loading provider sources...</div>
+    </div>
+  </main>
+</div>
+
+<!-- REPOSITORIES MODAL -->
+<div class="modal-overlay" id="repos-modal" onclick="if(event.target===this)closeReposModal()">
+  <div class="modal-box">
+    <div class="modal-hdr">
+      <div class="modal-title">Extension Repositories</div>
+      <button class="modal-close" onclick="closeReposModal()" title="Close">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="modal-hint">Enter a repository URL, GitHub shorthand, or shortcode. Every extension the repo offers downloads automatically.</div>
+    <div class="modal-input-row">
+      <input type="text" id="repo-input" class="modal-input" placeholder="Hexated, user/repo, or repo.json URL" onkeydown="if(event.key==='Enter')addRepo()">
+      <button class="btn-primary" id="repo-add-btn" onclick="addRepo()">Add</button>
+    </div>
+    <div style="font-size:11px;color:var(--text-dim)">Shortcuts: <code>Hexated</code> &middot; <code>!pymd</code> &middot; <code>user/repo</code> &middot; <code>user/repo/branch</code></div>
+    <div class="repos-list" id="repos-list">
+      <div class="empty" style="padding:16px">Loading repositories...</div>
+    </div>
+  </div>
 </div>
 
 <div class="toast" id="toast"></div>
 
 <script>
 "use strict";
+
+function applyTheme(t) {
+  document.documentElement.setAttribute("data-theme", t);
+  localStorage.setItem("cnc_theme", t);
+  var icon = document.getElementById("theme-icon");
+  if (icon) {
+    if (t === "light") {
+      icon.innerHTML = '<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>';
+    } else {
+      icon.innerHTML = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
+    }
+  }
+}
+function toggleTheme() {
+  var cur = document.documentElement.getAttribute("data-theme") || "dark";
+  applyTheme(cur === "dark" ? "light" : "dark");
+}
+applyTheme(localStorage.getItem("cnc_theme") || "dark");
+
+function dismissAnnouncement() {
+  var el = document.getElementById("top-announcement");
+  if (el) {
+    el.style.opacity = "0";
+    setTimeout(function() { el.style.display = "none"; }, 200);
+    localStorage.setItem("cnc_announcement_dismissed", "1");
+  }
+}
+if (localStorage.getItem("cnc_announcement_dismissed") === "1") {
+  var ann = document.getElementById("top-announcement");
+  if (ann) ann.style.display = "none";
+}
+
 var PK = "cnc_pid";
 var pid = localStorage.getItem(PK);
-if (!pid) { pid = "p" + Math.random().toString(36).substr(2,14) + Date.now().toString(36); localStorage.setItem(PK, pid); }
-var exts = [], repos = [], pData = null, pReady = false, booted = false;
-var curPage = "overview";
-var repoFilter = "_all", repoKeys = ["_all"], typeOn = {};
-
-function esc(s) { return String(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
-function toast(m) { var el = document.getElementById("toast"); el.textContent = m; el.classList.add("show"); clearTimeout(el._t); el._t = setTimeout(function(){ el.classList.remove("show"); }, 2600); }
-function cpEl(id) { cpTxt(document.getElementById(id).textContent); }
-function cpTxt(t) {
-  if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(t).then(function(){ toast("Copied to clipboard!"); }); return; }
-  var ta = document.createElement("textarea"); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand("copy"); document.body.removeChild(ta); toast("Copied to clipboard!");
+if (!pid) {
+  pid = "p" + Math.random().toString(36).substr(2, 14) + Date.now().toString(36);
+  localStorage.setItem(PK, pid);
 }
-function toggleSidebar() { document.getElementById("sidebar").classList.toggle("open"); document.getElementById("scrim").classList.toggle("show"); }
-function closeSidebar() { document.getElementById("sidebar").classList.remove("open"); document.getElementById("scrim").classList.remove("show"); }
+var pData = { disabledExtensions: [], enabledExtensions: [] };
+pData._d = new Set();
+pData._e = new Set();
+var exts = [];
+var repos = [];
+var currentFilter = "all";
+var activeTab = "overview";
 
-function showPage(p) {
-  curPage = p;
-  var pages = ["overview","extensions","repos","profile"];
-  for (var i = 0; i < pages.length; i++) {
-    var key = pages[i];
-    document.getElementById("nav-" + key).classList.toggle("active", key === p);
-    document.getElementById("page-" + key).style.display = key === p ? "" : "none";
+function switchTab(tab) {
+  activeTab = tab;
+  document.getElementById("nav-card-overview").classList.toggle("active", tab === "overview");
+  document.getElementById("nav-card-customize").classList.toggle("active", tab === "customize");
+  document.getElementById("panel-overview").classList.toggle("active", tab === "overview");
+  document.getElementById("panel-customize").classList.toggle("active", tab === "customize");
+  if (tab === "customize") {
+    var searchInput = document.getElementById("ext-search");
+    if (searchInput) searchInput.focus();
   }
-  closeSidebar();
-  if (p === "profile" && !pReady) loadProfile();
-  render();
 }
 
-function initUrls() {
-  var base = window.location.protocol + "//" + window.location.host;
-  var host = window.location.host;
-  document.getElementById("g-url").textContent = base + "/manifest.json";
-  document.getElementById("g-btn").href = "stremio://" + host + "/manifest.json";
-  document.getElementById("p-url").textContent = base + "/u/" + encodeURIComponent(pid) + "/manifest.json";
-  document.getElementById("p-btn").href = "stremio://" + host + "/u/" + encodeURIComponent(pid) + "/manifest.json";
-  document.getElementById("pid-lbl").textContent = "ID " + pid.substring(0,10) + "…";
-}
+function updateUrls() {
+  var h = window.location.host;
+  var proto = window.location.protocol;
+  var gUrl = proto + "//" + h + "/manifest.json";
+  var pUrl = proto + "//" + h + "/u/" + encodeURIComponent(pid) + "/manifest.json";
 
-function activeExts() { return exts.filter(function(e){ return e.enabled; }); }
-function isOn(e) {
-  if (!e.enabled) return !!(pData && pData._e && pData._e.has(e.internalName));
-  return !(pData && pData._d && pData._d.has(e.internalName));
-}
+  var gStremio = "stremio://" + h + "/manifest.json";
+  var pStremio = "stremio://" + h + "/u/" + encodeURIComponent(pid) + "/manifest.json";
 
-function byRepo(list) {
-  var m = {}, ord = [];
-  list.forEach(function(e) {
-    var k = e.repoUrl || "_";
-    if (!m[k]) { m[k] = { key: k, name: e.repoName || e.repoUrl || "Unknown repo", items: [] }; ord.push(k); }
-    m[k].items.push(e);
-  });
-  return ord.map(function(k){ return m[k]; });
-}
+  var gInp = document.getElementById("manifest-url-overview");
+  var pInp = document.getElementById("manifest-url-custom");
+  if (gInp) gInp.value = gUrl;
+  if (pInp) pInp.value = pUrl;
 
-function prettyType(t) {
-  t = String(t||"").toLowerCase();
-  if (t === "movie") return "Movies";
-  if (t === "tv" || t === "live") return "Live TV";
-  if (t === "series") return "Series";
-  if (t === "other") return "Other";
-  return t.charAt(0).toUpperCase() + t.slice(1);
-}
-
-function tagsFor(e) {
-  var t = (e.types||[]).map(prettyType);
-  if (t.length > 3) t = t.slice(0,3);
-  if (e.repoName) t.push(e.repoName);
-  return t.join(" · ");
-}
-
-function iconHtml(e) {
-  var initial = esc((e.name||"?").charAt(0).toUpperCase());
-  if (e.iconUrl)
-    return '<img class="eic" src="' + esc(e.iconUrl) + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" alt=""><div class="eic eletter" style="display:none">' + initial + '</div>';
-  return '<div class="eic eletter">' + initial + '</div>';
-}
-
-function repoTabs(groups) {
-  repoKeys = ["_all"];
-  var h = '<a class="ptab' + (repoFilter === "_all" ? " on" : "") + '" onclick="setRepo(0)">All</a>';
-  groups.forEach(function(g, i) {
-    repoKeys.push(g.key);
-    h += '<a class="ptab' + (repoFilter === g.key ? " on" : "") + '" onclick="setRepo(' + (i+1) + ')">' + esc(g.name) + '</a>';
-  });
-  return h;
-}
-function setRepo(i) { repoFilter = repoKeys[i] || "_all"; render(); }
-
-function typeOk(e) {
-  var list = e.types || [];
-  if (!list.length) return true;
-  for (var i = 0; i < list.length; i++) { if (typeOn[list[i]] !== false) return true; }
-  return false;
-}
-function cardVisible(e) {
-  var repoOk = repoFilter === "_all" || (e.repoUrl || "_") === repoFilter;
-  return repoOk && typeOk(e);
-}
-
-function renderTopbar() {
-  var titles = { overview: "Overview", extensions: "Extensions", repos: "Repositories", profile: "My Profile" };
-  document.getElementById("t-title").textContent = titles[curPage] || "Overview";
-  var act = activeExts(), repoMap = {};
-  act.forEach(function(e){ repoMap[e.repoUrl || "_"] = 1; });
-  var nR = Object.keys(repoMap).length;
-  var sub = act.length + " extension" + (act.length === 1 ? "" : "s") + " · " + nR + " repositor" + (nR === 1 ? "y" : "ies");
-  if (curPage === "repos" && repos.length) {
-    sub = repos.length + " repositor" + (repos.length === 1 ? "y" : "ies") + " installed";
-  }
-  if (curPage === "profile" && pReady && pData) {
-    var sel = exts.filter(isOn).length;
-    sub = sel + " of " + exts.length + " in your manifest";
-  }
-  document.getElementById("t-sub").textContent = sub;
-  document.getElementById("nav-badge").textContent = act.length;
-}
-
-function renderOverview() {
-  var el = document.getElementById("st-since");
-  if (pReady && pData && pData.createdAt > 0) {
-    var d = new Date(pData.createdAt);
-    el.textContent = d.toLocaleDateString();
-  } else if (pReady) {
-    el.textContent = "—";
-  }
-  if (!booted) return;
-  var act = activeExts(), repoMap = {};
-  act.forEach(function(e){ repoMap[e.repoUrl || "_"] = 1; });
-  document.getElementById("st-ext").textContent = exts.length;
-  document.getElementById("st-repo").textContent = repos.length || Object.keys(repoMap).length;
-}
-
-function renderExtensions() {
-  if (!booted) return;
-  var groups = byRepo(exts);
-  document.getElementById("ext-tabs").innerHTML = repoTabs(groups);
-  var el = document.getElementById("ext-body");
-  if (!exts.length) { el.innerHTML = '<div class="empty">No extensions loaded yet.</div>'; return; }
-  var vis = exts.filter(cardVisible);
-  var g2 = byRepo(vis);
-  el.innerHTML = g2.map(function(g) {
-    return '<div class="rgroup"><div class="rghead"><div class="rgletter">' + esc(g.name.charAt(0).toUpperCase()) + '</div>'
-      + '<span class="rgname">' + esc(g.name) + '</span>'
-      + '<span class="rgcount">' + g.items.length + (g.items.length === 1 ? " extension" : " extensions") + '</span></div>'
-      + '<div class="grid">' + g.items.map(function(e) {
-        return '<div class="ecard">' + iconHtml(e)
-          + '<div class="ec-main"><div class="ename">' + esc(e.name) + '</div>'
-          + '<div class="etags">' + esc(tagsFor(e)) + '</div></div>'
-          + '<span class="st ' + (e.enabled ? "on" : "off") + '">' + (e.enabled ? "Active" : "Disabled by admin") + '</span></div>';
-      }).join("") + '</div></div>';
-  }).join("") || '<div class="empty">Nothing matches this filter.</div>';
-}
-
-function typePillsHtml() {
-  var seen = {}, list = [];
-  exts.forEach(function(e) {
-    (e.types||[]).forEach(function(t) { if (!seen[t]) { seen[t] = 1; list.push(t); } });
-  });
-  list.sort();
-  if (list.length < 2) return '<span class="tip" style="margin:0">All content types are already included.</span>';
-  return list.map(function(t) {
-    var on = typeOn[t] !== false;
-    return '<a class="pill' + (on ? " on" : "") + '" onclick="togType(\'' + esc(t) + '\')">' + esc(prettyType(t)) + (on ? " ✓" : "") + '</a>';
-  }).join("");
-}
-function togType(t) { typeOn[t] = typeOn[t] === false; render(); }
-
-function renderProfile() {
-  var el = document.getElementById("pro-grid");
-  if (!booted) return;
-  if (!pReady) { el.innerHTML = '<div class="empty">Loading your profile…</div>'; return; }
-  var all = exts;
-  var groups = byRepo(all);
-  document.getElementById("pro-tabs").innerHTML = repoTabs(groups);
-  var vis = all.filter(cardVisible);
-  var sel = all.filter(isOn).length;
-  var pct = all.length ? Math.round(sel * 100 / all.length) : 0;
-  document.getElementById("pf-count").textContent = sel + " of " + all.length;
-  document.getElementById("pf-pct").textContent = pct + "%";
-  document.getElementById("pf-fill").style.width = (sel > 0 ? Math.max(pct, 4) : 0) + "%";
-  document.getElementById("pf-selected").textContent = sel + " selected";
-  document.getElementById("type-pills").innerHTML = typePillsHtml();
-  if (!all.length) { el.innerHTML = '<div class="empty">No extensions available yet.</div>'; return; }
-  el.innerHTML = vis.map(function(e) {
-    var on = isOn(e);
-    return '<div class="ecard vert selable' + (on ? " sel" : "") + (e.enabled ? "" : " goff") + '" onclick="tog(\'' + esc(e.internalName) + '\')">'
-      + '<div class="ec-top">' + iconHtml(e)
-      + '<div class="ename">' + esc(e.name) + '</div>'
-      + (e.enabled ? "" : '<span class="goffchip" title="Disabled in the global manifest — add it here to use it">Global off</span>')
-      + '<span class="radio"></span></div>'
-      + '<div class="etags">' + esc(tagsFor(e)) + '</div></div>';
-  }).join("") || '<div class="empty">Nothing matches this filter.</div>';
-}
-
-function renderRepos() {
-  var el = document.getElementById("repo-grid");
-  if (!el) return;
-  document.getElementById("repo-count").textContent = repos.length + (repos.length === 1 ? " repository" : " repositories");
-  if (!repos.length) { el.innerHTML = '<div class="empty">No repositories installed yet.</div>'; return; }
-  el.innerHTML = repos.map(function(r) {
-    var initial = esc((r.name||"?").charAt(0).toUpperCase());
-    var icon = r.iconUrl
-      ? '<img class="eic" src="' + esc(r.iconUrl) + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" alt=""><div class="eic eletter" style="display:none">' + initial + '</div>'
-      : '<div class="eic eletter">' + initial + '</div>';
-    var status;
-    if (r.isLoading) status = '<span class="st on" style="background:rgba(59,130,246,.12);color:var(--accent2)">Installing…</span>';
-    else if (r.error) status = '<span class="st off" title="' + esc(r.error) + '">Failed</span>';
-    else status = '<span class="st on">Active</span>';
-    return '<div class="rcard">'
-      + '<div class="ec-top">' + icon
-      + '<div class="ec-main"><div class="ename">' + esc(r.name) + '</div>'
-      + '<div class="rurl">' + esc(r.url) + '</div></div>' + status + '</div>'
-      + '<div class="etags">' + r.pluginCount + (r.pluginCount === 1 ? " extension" : " extensions")
-      + (r.description ? " · " + esc(r.description) : "") + '</div></div>';
-  }).join("");
-}
-
-function render() {
-  renderTopbar();
-  renderOverview();
-  renderExtensions();
-  renderRepos();
-  renderProfile();
+  var gBtn = document.getElementById("install-btn-overview");
+  var pBtn = document.getElementById("install-btn-custom");
+  if (gBtn) gBtn.href = gStremio;
+  if (pBtn) pBtn.href = pStremio;
 }
 
 function loadExts() {
   fetch("/api/extensions")
-    .then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-    .then(function(list) { exts = list || []; booted = true; render(); })
-    .catch(function() {});
+    .then(function(r){ if(!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function(data){
+      exts = data || [];
+      updateMetrics();
+      renderCards();
+    })
+    .catch(function(){});
 }
 
 function loadRepos() {
   fetch("/api/repos")
-    .then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-    .then(function(list) { repos = list || []; renderRepos(); renderTopbar(); renderOverview(); })
-    .catch(function() {});
+    .then(function(r){ if(!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function(data){
+      repos = data || [];
+      document.getElementById("hdr-repo-count").textContent = repos.length;
+      document.getElementById("st-repo-count").textContent = repos.length;
+      renderReposModal();
+    })
+    .catch(function(){});
+}
+
+function loadProfile() {
+  fetch("/api/profile/" + encodeURIComponent(pid))
+    .then(function(r){ if(!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function(p){
+      pData = p;
+      pData._d = new Set(p.disabledExtensions || []);
+      pData._e = new Set(p.enabledExtensions || []);
+      pData._loaded = true;
+      updateMetrics();
+      renderCards();
+    })
+    .catch(function(){});
+}
+
+function isExtActiveInProfile(e) {
+  if (e.enabled) {
+    return !pData._d.has(e.internalName);
+  } else {
+    return pData._e.has(e.internalName);
+  }
+}
+
+function updateMetrics() {
+  var globalCount = exts.filter(function(e){ return e.enabled; }).length;
+  var customCount = exts.filter(function(e){ return isExtActiveInProfile(e); }).length;
+
+  var stExt = document.getElementById("st-ext-count");
+  if (stExt) stExt.textContent = globalCount;
+
+  var ovBadge = document.getElementById("overview-ext-count");
+  if (ovBadge) ovBadge.textContent = globalCount;
+
+  var customBadge = document.getElementById("custom-active-count");
+  if (customBadge) customBadge.textContent = customCount + " of " + exts.length + " Sources Active";
+}
+
+function applyFilter(f, btn) {
+  currentFilter = f;
+  var btns = document.querySelectorAll(".preset-btn");
+  for (var i = 0; i < btns.length; i++) btns[i].classList.remove("active");
+  if (btn) btn.classList.add("active");
+  renderCards();
+}
+
+function renderCards() {
+  var q = (document.getElementById("ext-search") ? document.getElementById("ext-search").value : "").toLowerCase().trim();
+
+  // 1. Overview Grid (Globally enabled only)
+  var ovEl = document.getElementById("overview-grid");
+  if (ovEl) {
+    var ovExts = exts.filter(function(e){ return e.enabled; });
+    if (!ovExts.length) {
+      ovEl.innerHTML = '<div class="empty">No extensions enabled globally.</div>';
+    } else {
+      ovEl.innerHTML = ovExts.map(function(e){
+        var initial = (e.name || "?").charAt(0).toUpperCase();
+        var iconHtml = e.iconUrl
+          ? '<img class="p-icon-img" src="' + esc(e.iconUrl) + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" alt=""><div class="p-avatar" style="display:none">' + esc(initial) + '</div>'
+          : '<div class="p-avatar">' + esc(initial) + '</div>';
+
+        var typeBadges = (e.types || []).map(function(t){
+          return '<span class="p-type-tag">' + esc(t) + '</span>';
+        }).join("");
+
+        return '<div class="overview-source-card" onclick="switchTab(\'customize\')">' +
+          '<div class="p-top-row">' +
+            iconHtml +
+            '<span class="oc-status-pill"><span class="status-dot"></span>Active</span>' +
+          '</div>' +
+          '<div class="p-main-info">' +
+            '<div class="p-name" title="' + esc(e.name) + '">' + esc(e.name) + '</div>' +
+            '<div class="p-repo">' + esc(e.repoName || "Installed") + '</div>' +
+          '</div>' +
+          '<div class="p-badges-row">' + typeBadges + '</div>' +
+          (e.description ? '<div class="p-desc">' + esc(e.description) + '</div>' : '') +
+        '</div>';
+      }).join("");
+    }
+  }
+
+  // 2. Customize Grid (Interactive with checkboxes)
+  var custEl = document.getElementById("sources-grid");
+  if (custEl) {
+    var filtered = exts.filter(function(e){
+      if (q) {
+        var matchName = (e.name || "").toLowerCase().indexOf(q) >= 0;
+        var matchRepo = (e.repoName || "").toLowerCase().indexOf(q) >= 0;
+        var matchDesc = (e.description || "").toLowerCase().indexOf(q) >= 0;
+        if (!matchName && !matchRepo && !matchDesc) return false;
+      }
+      if (currentFilter === "movies") {
+        return (e.types || []).some(function(t){ return /movie|series|tv/i.test(t); });
+      } else if (currentFilter === "anime") {
+        return (e.types || []).some(function(t){ return /anime/i.test(t); }) || /anime/i.test(e.name);
+      } else if (currentFilter === "live") {
+        return (e.types || []).some(function(t){ return /live|stream|iptv/i.test(t); }) || /live|iptv|tv/i.test(e.name);
+      }
+      return true;
+    });
+
+    if (!filtered.length) {
+      custEl.innerHTML = '<div class="empty">No extensions match your filter.</div>';
+    } else {
+      custEl.innerHTML = filtered.map(function(e){
+        var isSelected = isExtActiveInProfile(e);
+        var initial = (e.name || "?").charAt(0).toUpperCase();
+
+        var iconHtml = e.iconUrl
+          ? '<img class="p-icon-img" src="' + esc(e.iconUrl) + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" alt=""><div class="p-avatar" style="display:none">' + esc(initial) + '</div>'
+          : '<div class="p-avatar">' + esc(initial) + '</div>';
+
+        var chkHtml = '<div class="chk"><svg class="chk-svg" width="10" height="8" viewBox="0 0 10 8" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4.2L3.5 6.7L9 1.2"/></svg></div>';
+
+        var typeBadges = (e.types || []).map(function(t){
+          return '<span class="p-type-tag">' + esc(t) + '</span>';
+        }).join("");
+
+        var goffBadge = !e.enabled ? '<span class="p-tag-goff">Global Off</span>' : '';
+
+        return '<div class="provider-card ' + (isSelected ? "selected" : "") + '" onclick="toggleCard(\'' + esc(e.internalName).replace(/\'/g, "%27") + '\')">' +
+          '<div class="p-top-row">' +
+            iconHtml +
+            chkHtml +
+          '</div>' +
+          '<div class="p-main-info">' +
+            '<div class="p-name" title="' + esc(e.name) + '">' + esc(e.name) + '</div>' +
+            '<div class="p-repo">' + esc(e.repoName || "Installed") + '</div>' +
+          '</div>' +
+          '<div class="p-badges-row">' + typeBadges + goffBadge + '</div>' +
+          (e.description ? '<div class="p-desc">' + esc(e.description) + '</div>' : '') +
+        '</div>';
+      }).join("");
+    }
+  }
+}
+
+function toggleCard(name) {
+  name = decodeURIComponent(name.replace(/%27/g, "'"));
+  var ext = exts.find(function(e){ return e.internalName === name; });
+  if (!ext) return;
+
+  var willBeActive = !isExtActiveInProfile(ext);
+  if (ext.enabled) {
+    if (willBeActive) pData._d.delete(name); else pData._d.add(name);
+  } else {
+    if (willBeActive) pData._e.add(name); else pData._e.delete(name);
+  }
+
+  updateMetrics();
+  renderCards();
+  toast(ext.name + (willBeActive ? " added to" : " removed from") + " your profile");
+
+  fetch("/api/profile/" + encodeURIComponent(pid) + "/toggle", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ internalName: name })
+  }).then(function(r){ return r.json(); })
+    .then(function(p){
+      pData = p;
+      pData._d = new Set(p.disabledExtensions || []);
+      pData._e = new Set(p.enabledExtensions || []);
+      updateMetrics();
+      renderCards();
+    })
+    .catch(function(e){ toast("Error: " + e.message); });
+}
+
+function setAll(on) {
+  var dis = [], en = [];
+  exts.forEach(function(e) {
+    if (!e.enabled) {
+      if (on) en.push(e.internalName);
+    } else {
+      if (!on) dis.push(e.internalName);
+    }
+  });
+
+  if (on) {
+    pData._d = new Set();
+    pData._e = new Set(en);
+  } else {
+    pData._d = new Set(dis);
+    pData._e = new Set();
+  }
+
+  updateMetrics();
+  renderCards();
+  toast(on ? "All extensions enabled for your profile" : "Profile manifest cleared");
+
+  fetch("/api/profile/" + encodeURIComponent(pid) + "/set", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ disabledExtensions: dis, enabledExtensions: en })
+  }).then(function(r){ return r.json(); })
+    .then(function(p){
+      pData = p;
+      pData._d = new Set(p.disabledExtensions || []);
+      pData._e = new Set(p.enabledExtensions || []);
+      updateMetrics();
+      renderCards();
+    })
+    .catch(function(e){ toast("Error: " + e.message); });
+}
+
+function cpManifest(isCustom, btn) {
+  var h = window.location.host;
+  var base = window.location.protocol + "//" + h;
+  var path = isCustom ? ("/u/" + encodeURIComponent(pid) + "/manifest.json") : "/manifest.json";
+  var url = base + path;
+
+  function onDone() {
+    if (btn) {
+      var lbl = btn.querySelector(".copy-lbl");
+      if (lbl) {
+        var origText = lbl.textContent;
+        lbl.textContent = "Copied!";
+        btn.style.borderColor = "var(--green)";
+        btn.style.color = "var(--green)";
+        setTimeout(function(){
+          lbl.textContent = origText;
+          btn.style.borderColor = "";
+          btn.style.color = "";
+        }, 1800);
+      }
+    }
+    toast("Copied Stremio manifest URL!");
+  }
+
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(onDone);
+    return;
+  }
+  var ta = document.createElement("textarea");
+  ta.value = url;
+  ta.style.position = "fixed";
+  ta.style.opacity = "0";
+  document.body.appendChild(ta);
+  ta.select();
+  document.execCommand("copy");
+  document.body.removeChild(ta);
+  onDone();
+}
+
+/* Repositories Modal */
+function openReposModal() {
+  var m = document.getElementById("repos-modal");
+  if (m) m.classList.add("open");
+  renderReposModal();
+}
+function closeReposModal() {
+  var m = document.getElementById("repos-modal");
+  if (m) m.classList.remove("open");
+}
+function renderReposModal() {
+  var el = document.getElementById("repos-list");
+  if (!el) return;
+  if (!repos.length) {
+    el.innerHTML = '<div class="empty" style="padding:16px">No repositories connected yet.</div>';
+    return;
+  }
+  el.innerHTML = repos.map(function(r) {
+    var status = r.isLoading
+      ? '<span class="repo-badge" style="color:var(--accent)">Installing...</span>'
+      : (r.error ? '<span class="repo-badge" style="color:var(--red)">Failed</span>' : '<span class="repo-badge" style="color:var(--green)">Active</span>');
+    return '<div class="repo-card">' +
+      '<div class="repo-info">' +
+        '<div class="repo-name">' + esc(r.name || r.url) + '</div>' +
+        '<div class="repo-url" title="' + esc(r.url) + '">' + esc(r.url) + '</div>' +
+      '</div>' +
+      '<div style="display:flex;align-items:center;gap:6px">' +
+        '<span class="repo-badge">' + r.pluginCount + ' ext</span>' +
+        status +
+      '</div>' +
+    '</div>';
+  }).join("");
 }
 
 function normalizeRepoUrl(raw) {
@@ -1616,66 +2526,51 @@ function normalizeRepoUrl(raw) {
 function addRepo() {
   var input = document.getElementById("repo-input");
   var url = normalizeRepoUrl(input ? input.value : "");
-  if (!url) { toast("Enter a repository URL"); return; }
+  if (!url) { toast("Please enter a valid repository URL"); return; }
+
   var btn = document.getElementById("repo-add-btn");
-  var lbl = document.getElementById("repo-add-lbl");
-  if (btn) btn.disabled = true;
-  if (lbl) lbl.textContent = "Adding…";
+  if (btn) { btn.disabled = true; btn.textContent = "Adding..."; }
+
   fetch("/api/repos/add", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url: url })
-  }).then(function(r) { return r.json().catch(function() { return {}; }).then(function(j) {
-    if (!r.ok && !j.message) throw new Error("HTTP " + r.status);
-    return j;
-  }); })
-    .then(function(j) {
-      if (j.ok === false) { toast(j.message || "Could not add repository"); return; }
-      toast(j.message || "Adding repository…");
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ url: url })
+  }).then(function(r){ return r.json(); })
+    .then(function(res){
+      toast(res.message || "Adding repository...");
       if (input) input.value = "";
       loadRepos();
-      var n = 0;
-      var t = setInterval(function() { loadRepos(); loadExts(); if (++n > 40) clearInterval(t); }, 3000);
+      loadExts();
+      var count = 0;
+      var interval = setInterval(function(){
+        loadRepos();
+        loadExts();
+        if (++count > 10) clearInterval(interval);
+      }, 3000);
     })
-    .catch(function(e) { toast("Error: " + e.message); })
-    .finally(function() {
-      var b = document.getElementById("repo-add-btn");
-      var l = document.getElementById("repo-add-lbl");
-      if (b) b.disabled = false;
-      if (l) l.textContent = "Add repository";
+    .catch(function(err){ toast("Error: " + err.message); })
+    .finally(function(){
+      if (btn) { btn.disabled = false; btn.textContent = "Add"; }
     });
 }
 
-function loadProfile() {
-  fetch("/api/profile/" + encodeURIComponent(pid))
-    .then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-    .then(function(p) { pData = p; pData._d = new Set(p.disabledExtensions || []); pData._e = new Set(p.enabledExtensions || []); pReady = true; render(); })
-    .catch(function() { document.getElementById("pro-grid").innerHTML = '<div class="empty">Could not load your profile.</div>'; });
+function esc(s) {
+  return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
 
-function tog(name) {
-  fetch("/api/profile/" + encodeURIComponent(pid) + "/toggle", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ internalName: name })
-  }).then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-    .then(function(p) { pData = p; pData._d = new Set(p.disabledExtensions || []); pData._e = new Set(p.enabledExtensions || []); pReady = true; render(); toast(name + (p.nowEnabled ? " added to" : " removed from") + " your manifest"); })
-    .catch(function(e) { toast("Error: " + e.message); });
+function toast(msg) {
+  var el = document.getElementById("toast");
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.add("show");
+  clearTimeout(el._t);
+  el._t = setTimeout(function(){ el.classList.remove("show"); }, 2400);
 }
 
-function setAll(on) {
-  var dis = [], en = [];
-  exts.forEach(function(e) {
-    if (!e.enabled) { if (on) en.push(e.internalName); }
-    else if (!on) { dis.push(e.internalName); }
-  });
-  fetch("/api/profile/" + encodeURIComponent(pid) + "/set", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ disabledExtensions: dis, enabledExtensions: en })
-  }).then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-    .then(function(p) { pData = p; pData._d = new Set(p.disabledExtensions || []); pData._e = new Set(p.enabledExtensions || []); pReady = true; render(); toast(on ? "All extensions added to your manifest" : "Manifest cleared"); })
-    .catch(function(e) { toast("Error: " + e.message); });
-}
-
-initUrls();
-loadProfile();
+updateUrls();
 loadExts();
 loadRepos();
+loadProfile();
 setInterval(function(){ loadExts(); loadRepos(); }, 15000);
 </script>
 </body>

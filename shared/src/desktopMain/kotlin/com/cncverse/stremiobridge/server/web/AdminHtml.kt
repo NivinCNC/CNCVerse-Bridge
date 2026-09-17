@@ -22,236 +22,887 @@ object AdminHtml {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>CNCVerse Bridge — Admin</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>CNCVerse Bridge — Admin Panel</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-:root{
-  --bg:#030306; --surface:#07070f; --card:#0e0e1a; --card2:#14141f;
-  --border:#1e1e2e; --divider:#181828;
-  --violet:#7c3aed; --violet400:#a78bfa; --violet300:#c4b5fd; --violet200:#ddd6fe;
-  --violet-glow:rgba(124,58,237,.18); --violet-border:rgba(124,58,237,.35);
-  --text:#f0f0ff; --text2:#9b9bba; --muted:#5c5c7a;
-  --green:#4ade80; --red:#f87171; --amber:#fbbf24; --blue:#60a5fa;
-  --green-glow:rgba(74,222,128,.15); --red-glow:rgba(248,113,113,.12);
+:root {
+  --bg: #090a10;
+  --surface: #10121a;
+  --surface-active: #171a26;
+  --card: #131622;
+  --card2: #191d2c;
+  --border: #1e2335;
+  --border-focus: #333a54;
+  --divider: rgba(255, 255, 255, 0.07);
+  --accent: #6366f1;
+  --accent-hover: #4f46e5;
+  --accent-light: rgba(99, 102, 241, 0.14);
+  --text: #f1f3f8;
+  --text2: #94a0b8;
+  --muted: #64708a;
+  --green: #10b981;
+  --green-bg: rgba(16, 185, 129, 0.12);
+  --red: #f43f5e;
+  --red-bg: rgba(244, 63, 94, 0.12);
+  --amber: #f59e0b;
+  --amber-bg: rgba(245, 158, 11, 0.12);
+  --blue: #38bdf8;
+  --blue-bg: rgba(56, 189, 248, 0.12);
+  --shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
 }
-*{box-sizing:border-box;margin:0;padding:0}
-html,body{background:var(--bg);color:var(--text);min-height:100vh}
-body{font-family:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
-a{color:var(--violet400);text-decoration:none}
-a:hover{color:var(--violet200)}
-button{font:inherit;cursor:pointer;border:none;border-radius:10px;padding:9px 16px;background:var(--card2);color:var(--text);transition:background .15s,opacity .15s,box-shadow .15s}
-button:hover{background:#1c1c2e}
-button:disabled{opacity:.4;cursor:default}
-button.primary{background:linear-gradient(135deg,#7c3aed,#6d28d9);color:#fff;font-weight:600;box-shadow:0 0 18px rgba(124,58,237,.28)}
-button.primary:hover:not(:disabled){background:linear-gradient(135deg,#8b5cf6,#7c3aed);box-shadow:0 0 28px rgba(124,58,237,.4)}
-button.danger{background:var(--red-glow);color:var(--red);border:1px solid rgba(248,113,113,.3)}
-button.danger:hover:not(:disabled){background:rgba(248,113,113,.2)}
-button.ghost{background:transparent;border:1px solid var(--border);color:var(--text2)}
-button.ghost:hover:not(:disabled){border-color:var(--violet);color:var(--text)}
-button.success{background:var(--green-glow);color:var(--green);border:1px solid rgba(74,222,128,.3);font-weight:600}
-button.success:hover:not(:disabled){background:rgba(74,222,128,.22)}
-button.small{padding:5px 12px;border-radius:8px;font-size:12.5px}
-input[type=text],input[type=password],input[type=number]{font:inherit;background:var(--card2);border:1px solid var(--border);border-radius:10px;color:var(--text);padding:9px 12px;outline:none;width:100%;transition:border-color .15s}
-input:focus{border-color:var(--violet);box-shadow:0 0 0 3px rgba(124,58,237,.12)}
-::placeholder{color:var(--muted)}
-.switch{position:relative;display:inline-block;width:44px;height:24px;flex:0 0 auto}
-.switch input{opacity:0;width:0;height:0}
-.switch .track{position:absolute;inset:0;background:var(--card2);border:1px solid var(--border);border-radius:999px;transition:.2s;cursor:pointer}
-.switch .track:before{content:"";position:absolute;height:18px;width:18px;left:2px;top:2px;background:var(--muted);border-radius:50%;transition:.2s}
-.switch input:checked + .track{background:var(--violet);border-color:var(--violet)}
-.switch input:checked + .track:before{transform:translateX(20px);background:#fff}
-
-/* ── Header ── */
-header{display:flex;align-items:center;gap:14px;padding:14px 20px;border-bottom:1px solid var(--divider);position:sticky;top:0;background:rgba(3,3,6,.92);backdrop-filter:blur(16px);z-index:100}
-.logo{width:36px;height:36px;border-radius:11px;background:linear-gradient(135deg,#6d28d9,#a78bfa);display:flex;align-items:center;justify-content:center;font-weight:900;font-size:10px;color:#fff;letter-spacing:-.5px;flex:0 0 auto;box-shadow:0 0 20px rgba(124,58,237,.35)}
-.hdr-text h1{font-size:16px;font-weight:700;letter-spacing:-.3px}
-.hdr-text .sub{font-size:11.5px;color:var(--muted)}
-.statuspill{margin-left:auto;display:flex;align-items:center;gap:8px;background:var(--card);border:1px solid var(--border);border-radius:999px;padding:5px 13px;font-size:12px;font-weight:600;white-space:nowrap}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block;flex:0 0 auto}
-.dot.green{background:var(--green);box-shadow:0 0 8px var(--green)}
-.dot.amber{background:var(--amber);box-shadow:0 0 8px var(--amber);animation:pulse 1.2s infinite}
-.dot.red{background:var(--red);box-shadow:0 0 8px var(--red)}
-.dot.gray{background:var(--muted)}
-@keyframes pulse{50%{opacity:.35}}
-
-/* ── Nav ── */
-nav{display:flex;gap:2px;padding:8px 20px 0;border-bottom:1px solid var(--divider);overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none}
-nav::-webkit-scrollbar{display:none}
-nav button{background:transparent;color:var(--text2);border-radius:10px 10px 0 0;padding:9px 16px;font-weight:600;font-size:13.5px;border-bottom:2px solid transparent;white-space:nowrap;flex:0 0 auto}
-nav button.active{color:var(--text);border-bottom-color:var(--violet)}
-nav button:hover{color:var(--text);background:rgba(255,255,255,.03)}
-
-/* ── Main ── */
-main{padding:20px;max-width:1100px;margin:0 auto}
-.grid{display:grid;gap:14px}
-.cols2{grid-template-columns:1fr 1fr}
-@media(max-width:800px){.cols2{grid-template-columns:1fr}}
-.card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:18px 20px}
-.card h2{font-size:14.5px;font-weight:700;display:flex;align-items:center;gap:8px;margin-bottom:3px;letter-spacing:-.2px}
-.card .hint{font-size:12px;color:var(--muted);margin-bottom:14px}
-.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.spacer{flex:1 1 0}
-.muted{color:var(--text2);font-size:12.5px}
-
-/* ── URL box ── */
-.urlbox{display:flex;align-items:center;gap:8px;background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:8px 12px;margin-top:8px}
-.urlbox code{font-family:ui-monospace,'Cascadia Code',Menlo,Consolas,monospace;font-size:12px;color:var(--violet300);word-break:break-all;flex:1}
-.iconbtn{background:transparent;padding:5px 9px;color:var(--text2);border-radius:7px}
-.iconbtn:hover{background:var(--card2);color:var(--text)}
-
-/* ── Progress ── */
-.progress{height:6px;border-radius:99px;background:var(--surface);overflow:hidden;margin-top:10px}
-.progress > div{height:100%;background:linear-gradient(90deg,var(--violet),var(--violet400));border-radius:99px;transition:width .4s}
-
-/* ── Badges ── */
-.badge{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:700;padding:3px 9px;border-radius:999px;letter-spacing:.2px}
-.badge.green{background:var(--green-glow);color:var(--green)}
-.badge.red{background:var(--red-glow);color:var(--red)}
-.badge.amber{background:rgba(251,191,36,.12);color:var(--amber)}
-.badge.violet{background:var(--violet-glow);color:var(--violet400)}
-.badge.gray{background:#111120;color:var(--text2)}
-.badge.blue{background:rgba(96,165,250,.12);color:var(--blue)}
-.badge.local{background:rgba(251,191,36,.1);color:var(--amber);border:1px solid rgba(251,191,36,.25)}
-
-/* ── Pills / filters ── */
-.pillrow{display:flex;gap:7px;flex-wrap:wrap;margin:12px 0}
-.pill{font-size:12px;padding:5px 13px;border-radius:999px;background:var(--card2);border:1px solid var(--border);color:var(--text2);cursor:pointer;transition:all .15s}
-.pill:hover{border-color:var(--violet);color:var(--text)}
-.pill.active{background:var(--violet-glow);border-color:var(--violet-border);color:var(--violet300);font-weight:600}
-
-/* ── Plugin grid ── */
-.plugins{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(300px,1fr))}
-@media(max-width:600px){.plugins{grid-template-columns:1fr}}
-.pcard{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:15px;display:flex;flex-direction:column;gap:10px;transition:border-color .15s}
-.pcard:hover{border-color:#2a2a40}
-.pcard.loading{opacity:.65}
-.pcard .top{display:flex;gap:11px;align-items:flex-start}
-.picon{width:44px;height:44px;border-radius:11px;object-fit:cover;background:var(--card2);border:1px solid var(--border);flex:0 0 auto}
-.pletter{width:44px;height:44px;border-radius:11px;background:linear-gradient(135deg,#1e1b4b,#6d28d9);display:flex;align-items:center;justify-content:center;font-size:18px;font-weight:800;color:#fff;flex:0 0 auto}
-.pcard .name{font-weight:700;font-size:14px;letter-spacing:-.2px}
-.pcard .meta{font-size:11px;color:var(--muted);margin-top:2px}
-.pcard .desc{font-size:12.5px;color:var(--text2);display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
-.pcard .actions{display:flex;gap:7px;margin-top:auto;flex-wrap:wrap;align-items:center}
-
-/* ── Settings modal popup ── */
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.55);backdrop-filter:blur(3px);z-index:1000;display:none;align-items:center;justify-content:center;padding:16px}
-.modal-overlay.open{display:flex}
-.modal-box{background:var(--card);border:1px solid var(--border);border-radius:18px;padding:22px 24px;max-width:560px;width:100%;max-height:85vh;overflow-y:auto;box-shadow:0 24px 64px rgba(0,0,0,.5);animation:modalIn .18s ease}
-@keyframes modalIn{from{opacity:0;transform:translateY(18px) scale(.97)}to{opacity:1;transform:none}}
-.modal-title{font-size:16px;font-weight:700;margin-bottom:16px;display:flex;align-items:center;gap:8px}
-.modal-close{margin-left:auto;background:none;border:none;color:var(--text2);font-size:20px;cursor:pointer;line-height:1;padding:2px 6px;border-radius:6px}
-.modal-close:hover{background:var(--border);color:var(--text)}
-.setting{background:var(--card2);border:1px solid rgba(30,30,46,.8);border-radius:11px;padding:13px 15px;margin-bottom:10px}
-.setting .label{font-weight:600;font-size:13.5px}
-.setting .desc2{font-size:11.5px;color:var(--text2);margin:2px 0 9px}
-.checkgrid{display:grid;grid-template-columns:1fr 1fr;gap:3px 14px}
-.checkrow{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:12.5px;cursor:pointer}
-.checkrow input{accent-color:var(--violet);width:14px;height:14px}
-.category{margin:16px 0 8px;color:var(--violet400);font-size:10.5px;font-weight:800;letter-spacing:1.4px;text-transform:uppercase;border-bottom:1px solid rgba(124,58,237,.12);padding-bottom:5px}
-select{font:inherit;background:var(--card2);border:1px solid var(--border);border-radius:10px;color:var(--text);padding:9px 12px;width:100%;outline:none}
-select:focus{border-color:var(--violet)}
-
-/* ── Repo row ── */
-.reporow{background:var(--card2);border:1px solid var(--border);border-radius:12px;padding:12px 15px;display:flex;gap:11px;align-items:center}
-.reporow:hover{border-color:#2a2a40}
-.ricon{width:32px;height:32px;border-radius:9px;object-fit:cover;flex:0 0 auto}
-.rletter{width:32px;height:32px;border-radius:9px;background:linear-gradient(135deg,#1e1b4b,#6d28d9);display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:800;color:#fff;flex:0 0 auto}
-.rinfo{flex:1;min-width:0}
-.rname{font-weight:600;font-size:13.5px}
-.rurl{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.raction{display:flex;gap:7px;align-items:center;flex-wrap:wrap}
-
-/* ── Logs ── */
-.logs-wrap{background:#02020a;border:1px solid var(--border);border-radius:14px;overflow:hidden;max-height:65vh;display:flex;flex-direction:column}
-.logs-toolbar{display:flex;align-items:center;gap:8px;padding:10px 14px;background:var(--card);border-bottom:1px solid var(--border);flex-shrink:0}
-.loglist{padding:10px 14px;overflow-y:auto;flex:1;font-family:ui-monospace,'Cascadia Code',Menlo,Consolas,monospace;font-size:12px}
-.loglist::-webkit-scrollbar{width:6px}
-.loglist::-webkit-scrollbar-thumb{background:#1e1e2e;border-radius:3px}
-.logline{padding:2px 6px;border-radius:5px;white-space:pre-wrap;word-break:break-word;margin-bottom:1px;line-height:1.55}
-.logline .t{color:var(--muted);margin-right:7px;user-select:none}
-.logline.INFO{color:#c0c0d8}
-.logline.WARN{color:var(--amber);background:rgba(251,191,36,.04)}
-.logline.ERROR{color:var(--red);background:rgba(248,113,113,.05)}
-
-/* ── Profile manifest section ── */
-.manifest-box{background:var(--surface);border:1px solid var(--violet-border);border-radius:12px;padding:14px 16px;margin-top:14px}
-.manifest-box h3{font-size:13px;font-weight:700;color:var(--violet400);margin-bottom:8px;display:flex;align-items:center;gap:7px}
-.manifest-ext-list{display:grid;gap:7px;margin-top:10px}
-.mext-row{display:flex;align-items:center;gap:10px;padding:8px 12px;background:var(--card2);border:1px solid var(--border);border-radius:9px}
-.mext-row .mname{flex:1;font-size:13px;font-weight:500}
-.mext-row .mbadge{font-size:10.5px}
-
-/* ── Toast ── */
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:#111124;border:1px solid var(--violet-border);color:var(--text);padding:10px 22px;border-radius:12px;font-size:13px;box-shadow:0 8px 40px rgba(124,58,237,.3);opacity:0;transition:opacity .22s;pointer-events:none;z-index:999;max-width:90vw;text-align:center}
-.toast.show{opacity:1}
-
-/* ── Banner / alert ── */
-.banner{background:var(--violet-glow);border:1px solid var(--violet-border);border-radius:11px;padding:11px 15px;font-size:12.5px;color:var(--violet300);margin-bottom:13px}
-.banner.warn{background:rgba(251,191,36,.08);border-color:rgba(251,191,36,.3);color:var(--amber)}
-.banner.err{background:var(--red-glow);border-color:rgba(248,113,113,.3);color:var(--red)}
-
-/* ── Spinner ── */
-.loader{display:inline-block;width:13px;height:13px;border:2px solid var(--violet);border-top-color:transparent;border-radius:50%;animation:spin .75s linear infinite;vertical-align:-2px}
-@keyframes spin{to{transform:rotate(360deg)}}
-
-/* ── KV table ── */
-.kv{display:grid;grid-template-columns:130px 1fr;gap:5px 12px;font-size:13px}
-.kv .k{color:var(--muted)}
-.empty{padding:40px 20px;text-align:center;color:var(--text2);font-size:13px}
-
-/* ── Mobile overrides ── */
-@media(max-width:600px){
-  header{padding:10px 14px;gap:10px}
-  .hdr-text .sub{display:none}
-  nav{padding:6px 14px 0}
-  nav button{padding:8px 12px;font-size:13px}
-  main{padding:14px}
-  .card{padding:14px}
-  .plugins{grid-template-columns:1fr}
-  .statuspill{padding:5px 10px;font-size:11.5px}
-  .raction{flex-direction:column;align-items:flex-start;gap:5px}
+[data-theme="light"] {
+  --bg: #f8fafc;
+  --surface: #ffffff;
+  --surface-active: #f1f5f9;
+  --card: #ffffff;
+  --card2: #f8fafc;
+  --border: #e2e8f0;
+  --border-focus: #cbd5e1;
+  --divider: rgba(0, 0, 0, 0.08);
+  --accent: #4f46e5;
+  --accent-hover: #4338ca;
+  --accent-light: rgba(79, 70, 229, 0.1);
+  --text: #0f172a;
+  --text2: #475569;
+  --muted: #94a3b8;
+  --green: #059669;
+  --green-bg: rgba(5, 150, 105, 0.1);
+  --red: #e11d48;
+  --red-bg: rgba(225, 29, 72, 0.1);
+  --amber: #d97706;
+  --amber-bg: rgba(217, 119, 6, 0.1);
+  --blue: #0284c7;
+  --blue-bg: rgba(2, 132, 199, 0.1);
+  --shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
 }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html {
+  background: var(--bg);
+  color: var(--text);
+  min-height: 100vh;
+  overflow-x: clip;
+}
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-size: 13.5px;
+  line-height: 1.5;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  overflow-x: clip;
+  max-width: 100vw;
+  width: 100%;
+}
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ── Sticky Top Navigation Header ────────────────────── */
+.sticky-nav-header {
+  position: sticky;
+  top: 0;
+  z-index: 1000;
+  background: var(--surface);
+  border-bottom: 1px solid var(--divider);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.25);
+  width: 100%;
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 16px;
+  height: 52px;
+  gap: 10px;
+  width: 100%;
+}
+.hdr-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.logo-box {
+  width: 32px; height: 32px;
+  border-radius: 8px;
+  background: var(--accent-light);
+  border: 1px solid rgba(99, 102, 241, 0.3);
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 800; font-size: 11px;
+  color: var(--accent); letter-spacing: -0.5px;
+  flex: 0 0 32px;
+}
+.hdr-title-wrap { display: flex; flex-direction: column; min-width: 0; }
+.hdr-title {
+  font-size: 14px; font-weight: 800; letter-spacing: -0.3px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  color: var(--text); line-height: 1.2;
+}
+.hdr-sub { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.hdr-actions {
+  display: flex; align-items: center; gap: 8px;
+  flex-shrink: 0;
+}
+.statuspill {
+  display: flex; align-items: center; gap: 6px;
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 999px; padding: 4px 11px;
+  font-size: 11.5px; font-weight: 600; white-space: nowrap;
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; flex-shrink: 0; }
+.dot.green { background: var(--green); box-shadow: 0 0 6px var(--green); }
+.dot.amber { background: var(--amber); }
+.dot.red { background: var(--red); }
+.dot.gray { background: var(--muted); }
+.btn-icon-sq {
+  width: 32px; height: 32px; padding: 0;
+  border-radius: 8px; background: var(--card);
+  border: 1px solid var(--border); color: var(--text2);
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.btn-icon-sq:hover { color: var(--text); border-color: var(--border-focus); background: var(--surface-active); }
+
+@media (max-width: 680px) {
+  header { padding: 0 12px; height: 48px; }
+  .hdr-sub { display: none; }
+  .statuspill { padding: 3px 8px; font-size: 11px; }
+}
+
+/* ── Navigation Tabs ─────────────────────────────────── */
+nav#tabs {
+  display: flex;
+  background: var(--surface);
+  border-top: 1px solid var(--divider);
+  padding: 0 12px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  gap: 4px;
+  width: 100%;
+}
+nav#tabs::-webkit-scrollbar { display: none; }
+nav#tabs button {
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  border-bottom: 2px solid transparent;
+  color: var(--text2);
+  padding: 10px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+  gap: 6px;
+  transition: all 0.15s ease;
+}
+nav#tabs button:hover { color: var(--text); background: transparent; }
+nav#tabs button.active {
+  color: var(--accent);
+  border-bottom-color: var(--accent);
+}
+@media (max-width: 680px) {
+  nav#tabs { padding: 0 8px; }
+  nav#tabs button { padding: 9px 10px; font-size: 12px; gap: 4px; }
+}
+
+/* ── Buttons ─────────────────────────────────────────── */
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 13px;
+  background: var(--card2);
+  color: var(--text);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  transition: all 0.15s ease;
+  line-height: 1.2;
+  white-space: nowrap;
+  -webkit-tap-highlight-color: transparent;
+}
+button:hover:not(:disabled) { background: var(--surface-active); border-color: var(--border-focus); }
+button:disabled { opacity: 0.4; cursor: not-allowed; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #ffffff; }
+button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.danger { background: var(--red-bg); color: var(--red); border-color: rgba(244, 63, 94, 0.28); }
+button.danger:hover:not(:disabled) { background: rgba(244, 63, 94, 0.2); }
+button.ghost { background: transparent; color: var(--text2); border-color: var(--border); }
+button.ghost:hover:not(:disabled) { background: var(--card2); color: var(--text); border-color: var(--border-focus); }
+button.success { background: var(--green-bg); color: var(--green); border-color: rgba(16, 185, 129, 0.28); }
+button.success:hover:not(:disabled) { background: rgba(16, 185, 129, 0.2); }
+button.small { padding: 5px 10px; border-radius: 6px; font-size: 12px; }
+
+input[type=text], input[type=password], input[type=number] {
+  font: inherit;
+  background: var(--card2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 8px 12px;
+  outline: none;
+  width: 100%;
+  max-width: 100%;
+  box-sizing: border-box;
+  transition: border-color 0.15s;
+}
+input:focus { border-color: var(--accent); }
+::placeholder { color: var(--muted); }
+
+/* Switch control */
+.switch { position: relative; display: inline-block; width: 36px; height: 20px; flex: 0 0 36px; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch .track {
+  position: absolute; inset: 0;
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 999px; transition: 0.2s; cursor: pointer;
+}
+.switch .track:before {
+  content: ""; position: absolute; height: 14px; width: 14px;
+  left: 2px; top: 2px; background: var(--muted);
+  border-radius: 50%; transition: 0.2s;
+}
+.switch input:checked + .track { background: var(--accent); border-color: var(--accent); }
+.switch input:checked + .track:before { transform: translateX(16px); background: #ffffff; }
+
+/* ── Main View Container ─────────────────────────────── */
+main#view {
+  max-width: 1120px;
+  width: 100%;
+  margin: 0 auto;
+  padding: 18px 16px 48px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+@media (max-width: 680px) {
+  main#view { padding: 12px 10px 48px; gap: 11px; }
+}
+
+/* ── Stat Cards Grid (pengu.uk inspired) ─────────────── */
+.stat-cards-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  width: 100%;
+  box-sizing: border-box;
+}
+@media (max-width: 760px) {
+  .stat-cards-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+}
+.stat-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+@media (max-width: 680px) {
+  .stat-card { padding: 10px 11px; }
+}
+.stat-label {
+  font-size: 9.5px;
+  font-weight: 800;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+.stat-val {
+  font-size: 18px;
+  font-weight: 800;
+  color: var(--text);
+  letter-spacing: -0.4px;
+  line-height: 1.2;
+}
+.stat-val.green { color: var(--green); }
+.stat-sub {
+  font-size: 10.5px;
+  color: var(--text2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Card Containers ─────────────────────────────────── */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 20px;
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.15);
+}
+@media (max-width: 680px) {
+  .card { padding: 13px 12px; border-radius: 10px; }
+}
+.card h2 {
+  font-size: 14px;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 3px;
+  color: var(--text);
+  letter-spacing: -0.2px;
+}
+.card .hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 14px;
+}
+
+/* ── Grids & Rows ────────────────────────────────────── */
+.grid { display: grid; gap: 12px; min-width: 0; max-width: 100%; width: 100%; box-sizing: border-box; }
+.cols2 { grid-template-columns: 1fr 1fr; }
+@media (max-width: 680px) { .cols2 { grid-template-columns: 1fr; } }
+.row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.spacer { flex: 1 1 0; }
+.muted { color: var(--text2); font-size: 12px; }
+
+/* ── URL Box ─────────────────────────────────────────── */
+.urlbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--card2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 11px;
+  margin-top: 8px;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+}
+.urlbox code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--text);
+  word-break: break-all;
+  flex: 1;
+  min-width: 0;
+}
+@media (max-width: 680px) {
+  .urlbox { padding: 6px 9px; }
+  .urlbox code { font-size: 11px; }
+}
+.iconbtn {
+  background: transparent;
+  border: none;
+  padding: 5px 7px;
+  color: var(--text2);
+  border-radius: 6px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+.iconbtn:hover { background: var(--surface); color: var(--text); }
+.iconbtn.danger-btn:hover { color: var(--red); background: var(--red-bg); }
+
+/* Progress */
+.progress {
+  height: 5px;
+  border-radius: 99px;
+  background: var(--surface);
+  overflow: hidden;
+  margin-top: 10px;
+}
+.progress > div {
+  height: 100%;
+  background: var(--accent);
+  border-radius: 99px;
+  transition: width 0.35s ease;
+}
+
+/* ── Badges ──────────────────────────────────────────── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 7px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  white-space: nowrap;
+  line-height: 1.3;
+}
+.badge.green { background: var(--green-bg); color: var(--green); border-color: rgba(16, 185, 129, 0.28); }
+.badge.red { background: var(--red-bg); color: var(--red); border-color: rgba(244, 63, 94, 0.28); }
+.badge.amber { background: var(--amber-bg); color: var(--amber); border-color: rgba(245, 158, 11, 0.28); }
+.badge.violet { background: var(--accent-light); color: var(--accent); border-color: rgba(99, 102, 241, 0.28); }
+.badge.gray { background: var(--card2); color: var(--text2); }
+.badge.blue { background: var(--blue-bg); color: var(--blue); border-color: rgba(56, 189, 248, 0.28); }
+
+/* ── Filter Pills ────────────────────────────────────── */
+.pillrow {
+  display: flex;
+  gap: 6px;
+  overflow-x: auto;
+  scrollbar-width: none;
+  margin: 10px 0 14px;
+  padding-bottom: 4px;
+  max-width: 100%;
+  width: 100%;
+  box-sizing: border-box;
+  -webkit-overflow-scrolling: touch;
+}
+.pillrow::-webkit-scrollbar { display: none; }
+.pill {
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border-radius: 999px;
+  background: var(--card2);
+  border: 1px solid var(--border);
+  color: var(--text2);
+  cursor: pointer;
+  white-space: nowrap;
+  flex-shrink: 0;
+  transition: all 0.15s ease;
+}
+.pill:hover { border-color: var(--border-focus); color: var(--text); }
+.pill.active {
+  background: var(--accent-light);
+  border-color: var(--accent);
+  color: var(--text);
+  font-weight: 700;
+}
+
+/* ── Repositories List (Responsive, Zero Overflow) ────── */
+.reporow {
+  background: var(--card2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  transition: border-color 0.15s;
+}
+.reporow:hover { border-color: var(--border-focus); }
+
+@media (min-width: 768px) {
+  .reporow {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+  }
+}
+
+.repo-main {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  max-width: 100%;
+  width: 100%;
+  overflow: hidden;
+}
+.ricon { width: 32px; height: 32px; border-radius: 7px; object-fit: cover; flex-shrink: 0; }
+.rletter {
+  width: 32px; height: 32px; border-radius: 7px;
+  background: var(--surface); border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 800; color: var(--text); flex-shrink: 0;
+}
+.rinfo {
+  flex: 1;
+  min-width: 0;
+  max-width: calc(100% - 42px);
+  overflow: hidden;
+}
+@media (min-width: 768px) {
+  .rinfo { max-width: none; }
+}
+.rname {
+  font-weight: 700;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  max-width: 100%;
+}
+.rurl {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  display: block;
+  margin-top: 1px;
+}
+.repo-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  width: 100%;
+  border-top: 1px solid var(--divider);
+  padding-top: 8px;
+  flex-wrap: wrap;
+}
+@media (min-width: 768px) {
+  .repo-actions {
+    width: auto;
+    border-top: none;
+    padding-top: 0;
+    flex-shrink: 0;
+  }
+}
+
+/* ── STRICT 2-COLUMN MOBILE EXTENSION GRID ───────────── */
+/* CRITICAL: NEVER collapse to 1fr! Always 2 columns on mobile */
+.plugins {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  width: 100%;
+  box-sizing: border-box;
+}
+@media (max-width: 680px) {
+  .plugins {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 8px;
+  }
+}
+
+/* ── Modern Plugin Card (Mobile-First) ───────────────── */
+.pcard {
+  background: var(--card2);
+  border: 1px solid var(--border);
+  border-radius: 11px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+  overflow: hidden;
+  transition: all 0.15s ease;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.12);
+}
+@media (max-width: 680px) {
+  .pcard {
+    padding: 10px 9px;
+    gap: 6px;
+    border-radius: 9px;
+  }
+}
+.pcard:hover {
+  border-color: var(--border-focus);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 16px rgba(0, 0, 0, 0.2);
+}
+.pcard-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  width: 100%;
+}
+.picon {
+  width: 32px; height: 32px;
+  border-radius: 8px; object-fit: cover;
+  background: var(--surface); border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+.pletter {
+  width: 32px; height: 32px;
+  border-radius: 8px; background: var(--surface);
+  border: 1px solid var(--border);
+  display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 800; color: var(--text);
+  flex-shrink: 0;
+}
+@media (max-width: 680px) {
+  .picon, .pletter { width: 28px; height: 28px; border-radius: 7px; font-size: 12px; }
+}
+
+.pcard-body {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  width: 100%;
+  overflow: hidden;
+}
+.pcard-body .name {
+  font-weight: 700;
+  font-size: 12.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  line-height: 1.25;
+  max-width: 100%;
+}
+@media (max-width: 680px) {
+  .pcard-body .name { font-size: 11.5px; }
+}
+.pcard-body .meta {
+  font-size: 10.5px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.pcard-body .desc {
+  font-size: 11px;
+  color: var(--text2);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  line-height: 1.35;
+  margin-top: 2px;
+}
+
+.pcard-actions {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: auto;
+  padding-top: 6px;
+  border-top: 1px solid var(--divider);
+  width: 100%;
+}
+.pcard-ctrls {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  gap: 4px;
+}
+
+/* ── Modals ──────────────────────────────────────────── */
+.modal-overlay {
+  position: fixed; inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px);
+  z-index: 2000; display: none;
+  align-items: center; justify-content: center;
+  padding: 16px;
+}
+.modal-overlay.open { display: flex; }
+.modal-box {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; padding: 20px;
+  max-width: 520px; width: 100%;
+  max-height: 85vh; overflow-y: auto;
+  box-shadow: 0 20px 48px rgba(0, 0, 0, 0.6);
+}
+.modal-title {
+  font-size: 14.5px; font-weight: 700; margin-bottom: 14px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.modal-close {
+  background: none; border: none; color: var(--text2);
+  cursor: pointer; padding: 4px; border-radius: 6px;
+  display: inline-flex;
+}
+.modal-close:hover { background: var(--border); color: var(--text); }
+.setting {
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 9px; padding: 11px 13px; margin-bottom: 9px;
+}
+.setting .label { font-weight: 600; font-size: 12.5px; }
+.setting .desc2 { font-size: 11px; color: var(--text2); margin: 2px 0 8px; }
+.checkgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; }
+.checkrow { display: flex; align-items: center; gap: 7px; padding: 3px 0; font-size: 12px; cursor: pointer; }
+.checkrow input { accent-color: var(--accent); width: 13px; height: 13px; }
+.category {
+  margin: 14px 0 8px; color: var(--muted);
+  font-size: 10px; font-weight: 800; letter-spacing: 0.8px;
+  text-transform: uppercase; border-bottom: 1px solid var(--border);
+  padding-bottom: 4px;
+}
+
+/* ── Logs Panel ──────────────────────────────────────── */
+.logs-wrap {
+  background: var(--card2); border: 1px solid var(--border);
+  border-radius: 10px; overflow: hidden;
+  max-height: 65vh; display: flex; flex-direction: column;
+}
+.logs-toolbar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 8px 12px; background: var(--card);
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0; flex-wrap: wrap;
+}
+.loglist {
+  padding: 10px 12px; overflow-y: auto; flex: 1;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11.5px;
+}
+.loglist::-webkit-scrollbar { width: 5px; }
+.loglist::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+.logline {
+  padding: 2px 5px; border-radius: 4px;
+  white-space: pre-wrap; word-break: break-word;
+  margin-bottom: 1px; line-height: 1.5;
+}
+.logline .t { color: var(--muted); margin-right: 7px; user-select: none; font-size: 10.5px; }
+.logline.INFO { color: var(--text2); }
+.logline.WARN { color: var(--amber); background: var(--amber-bg); }
+.logline.ERROR { color: var(--red); background: var(--red-bg); }
+
+/* Key-value summary */
+.kv { display: grid; grid-template-columns: 130px 1fr; gap: 8px; font-size: 12.5px; }
+.kv .k { color: var(--muted); font-weight: 600; }
+
+.toast {
+  position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%);
+  background: var(--card); border: 1px solid var(--border-focus);
+  color: var(--text); padding: 8px 18px; border-radius: 8px;
+  font-size: 12.5px; font-weight: 600;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+  opacity: 0; transition: opacity 0.2s ease;
+  pointer-events: none; z-index: 3000; max-width: 90vw; text-align: center;
+}
+.toast.show { opacity: 1; }
+.banner {
+  background: var(--accent-light); border: 1px solid rgba(99, 102, 241, 0.3);
+  border-radius: 8px; padding: 10px 14px; font-size: 12.5px;
+  color: var(--text); margin-bottom: 12px;
+}
+.banner.err { background: var(--red-bg); border-color: rgba(244, 63, 94, 0.3); color: var(--red); }
+.loader {
+  display: inline-block; width: 11px; height: 11px;
+  border: 2px solid var(--accent); border-top-color: transparent;
+  border-radius: 50%; animation: spin 0.75s linear infinite; vertical-align: -1px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.empty { padding: 32px 16px; text-align: center; color: var(--text2); font-size: 13px; }
 </style>
 </head>
 <body>
-<header>
-  <div class="logo">CNC</div>
-  <div class="hdr-text">
-    <h1>CNCVerse Bridge</h1>
-    <div class="sub" id="subtitle">web admin</div>
-  </div>
-  <div class="statuspill" id="statuspill"><span class="dot gray"></span><span id="statustext">connecting&hellip;</span></div>
-</header>
-<nav id="tabs">
-  <button data-tab="server" class="active">Server</button>
-  <button data-tab="extensions">Extensions</button>
-  <button data-tab="logs">Logs</button>
-  <button data-tab="about">About</button>
-</nav>
+
+<div class="sticky-nav-header">
+  <header>
+    <div class="hdr-brand">
+      <div class="logo-box">CNC</div>
+      <div class="hdr-title-wrap">
+        <div class="hdr-title">CNCVerse Bridge</div>
+        <div class="hdr-sub" id="subtitle">Admin Panel</div>
+      </div>
+    </div>
+    <div class="hdr-actions">
+      <div class="statuspill" id="statuspill">
+        <span class="dot gray"></span>
+        <span id="statustext">connecting...</span>
+      </div>
+      <button class="btn-icon-sq" id="theme-btn" onclick="toggleTheme()" title="Toggle Theme">
+        <svg id="theme-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <nav id="tabs">
+    <button data-tab="server" class="active">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+      Server
+    </button>
+    <button data-tab="extensions">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 11V4a1 1 0 0 0-1-1h-7a1 1 0 0 0-1 1v1a2 2 0 0 1-4 0V4a1 1 0 0 0-1-1H2a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h1a2 2 0 0 1 0 4H2a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1v-1a2 2 0 0 1 4 0v1a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1v-7a1 1 0 0 0-1-1h-1a2 2 0 0 1 0-4h1a1 1 0 0 0 1-1Z"/></svg>
+      Extensions
+    </button>
+    <button data-tab="logs">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+      Logs
+    </button>
+    <button data-tab="about">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
+      About
+    </button>
+  </nav>
+</div>
+
 <main id="view"></main>
+
 <div class="toast" id="toast"></div>
+
+<!-- SETTINGS MODAL -->
 <div class="modal-overlay" id="settings-modal" onclick="if(event.target===this)closeSettingsModal()">
   <div class="modal-box" id="settings-modal-box">
-    <div class="muted" style="text-align:center;padding:20px"><span class="loader"></span> Loading…</div>
+    <div class="muted" style="text-align:center;padding:20px"><span class="loader"></span> Loading...</div>
   </div>
 </div>
+
+<!-- ADD REPO MODAL -->
 <div class="modal-overlay" id="add-repo-modal" onclick="if(event.target===this)closeAddRepoModal()">
-  <div class="modal-box" style="max-width:480px">
-    <div class="modal-title">➕ Add Repository<button class="modal-close" onclick="closeAddRepoModal()" title="Close">&times;</button></div>
-    <div class="hint" style="margin-bottom:14px">Enter a full URL, GitHub shorthand, or cutt.ly shortcode. Every extension the repo offers is downloaded automatically.</div>
-    <input type="text" id="add-repo-input" placeholder="https://raw.githubusercontent.com/…/repo.json" style="width:100%;box-sizing:border-box;margin-bottom:6px" onkeydown="if(event.key===\'Enter\')submitAddRepo()">
-    <div class="muted" style="font-size:11.5px;margin-bottom:14px">Shortcuts: <code>user/repo</code> &middot; <code>user/repo/branch</code> &middot; <code>Hexated</code> (cutt.ly) &middot; <code>!pymd</code> (py.md)</div>
-    <div class="row" style="gap:10px">
-      <button class="primary" onclick="submitAddRepo()" id="add-repo-btn">Add</button>
+  <div class="modal-box" style="max-width:460px">
+    <div class="modal-title">
+      Add Repository
+      <button class="modal-close" onclick="closeAddRepoModal()" title="Close">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div class="hint" style="margin-bottom:12px">Enter a full URL, GitHub shorthand, or shortcode. Every extension the repo offers is downloaded automatically.</div>
+    <input type="text" id="add-repo-input" placeholder="https://raw.githubusercontent.com/.../repo.json" style="margin-bottom:8px" onkeydown="if(event.key==='Enter')submitAddRepo()">
+    <div class="muted" style="font-size:11.5px;margin-bottom:14px">Shortcuts: <code>user/repo</code> &middot; <code>user/repo/branch</code> &middot; <code>Hexated</code> &middot; <code>!pymd</code></div>
+    <div class="row" style="gap:8px">
+      <button class="primary" onclick="submitAddRepo()" id="add-repo-btn">Add Repository</button>
       <button class="ghost" onclick="closeAddRepoModal()">Cancel</button>
     </div>
   </div>
 </div>
+
 <script>
 "use strict";
+
+function applyTheme(t) {
+  document.documentElement.setAttribute("data-theme", t);
+  localStorage.setItem("cnc_theme", t);
+  var icon = document.getElementById("theme-icon");
+  if (icon) {
+    if (t === "light") {
+      icon.innerHTML = '<circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>';
+    } else {
+      icon.innerHTML = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>';
+    }
+  }
+}
+function toggleTheme() {
+  var cur = document.documentElement.getAttribute("data-theme") || "dark";
+  applyTheme(cur === "dark" ? "light" : "dark");
+}
+var savedTheme = localStorage.getItem("cnc_theme") || "dark";
+applyTheme(savedTheme);
 
 var TOKEN = new URLSearchParams(window.location.search).get("token") || "";
 var BASE = "/api/admin";
@@ -269,50 +920,19 @@ var lastLogTimestamp = 0;
 var logsData = [];
 var autoScroll = true;
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+// SVG Icons
+var svgCopy = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
+var svgServer = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>';
+var svgCloud = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.5 19H9a7 7 0 1 1 6.71-9h1.79a4.5 4.5 0 1 1 0 9Z"/></svg>';
+var svgBox = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m7.5 4.27 9 5.15"/><path d="M21 8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16Z"/><path d="m3.3 7 8.7 5 8.7-5"/><path d="M12 22V12"/></svg>';
+var svgPuzzle = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 11V4a1 1 0 0 0-1-1h-7a1 1 0 0 0-1 1v1a2 2 0 0 1-4 0V4a1 1 0 0 0-1-1H2a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h1a2 2 0 0 1 0 4H2a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1v-1a2 2 0 0 1 4 0v1a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1v-7a1 1 0 0 0-1-1h-1a2 2 0 0 1 0-4h1a1 1 0 0 0 1-1Z"/></svg>';
+var svgTerminal = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>';
+var svgInfo = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>';
+var svgGear = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>';
+var svgRefresh = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16"/><path d="M16 21h5v-5"/></svg>';
+var svgTrash = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg>';
 
 // ── Utilities ────────────────────────────────────────────────────────────────
-
 function api(path, opts) {
   opts = opts || {};
   var url = BASE + path;
@@ -338,14 +958,22 @@ function toast(msg) {
   el._t = setTimeout(function() { el.classList.remove("show"); }, 2500);
 }
 
-function copyText(text) {
+function copyText(text, btn) {
+  function onDone() {
+    if (btn) {
+      var orig = btn.innerHTML;
+      btn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>';
+      setTimeout(function() { btn.innerHTML = orig; }, 1600);
+    }
+    toast("Copied!");
+  }
   if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(text).then(function() { toast("Copied!"); });
+    navigator.clipboard.writeText(text).then(onDone);
   } else {
     var ta = document.createElement("textarea");
     ta.value = text; document.body.appendChild(ta); ta.select();
     document.execCommand("copy"); document.body.removeChild(ta);
-    toast("Copied!");
+    onDone();
   }
 }
 
@@ -356,7 +984,6 @@ function fmtTime(ts) {
 }
 
 // ── Polling ───────────────────────────────────────────────────────────────────
-
 function poll() {
   api("/summary").then(function(s) {
     summary = s;
@@ -376,7 +1003,6 @@ function pollLogs() {
 }
 
 // ── Header status pill ────────────────────────────────────────────────────────
-
 function renderStatusPill() {
   if (!summary) return;
   var s = summary.server;
@@ -391,7 +1017,6 @@ function renderStatusPill() {
 }
 
 // ── Render dispatch ────────────────────────────────────────────────────────────
-
 function render() {
   if (!summary) return;
   if (tab === "server") renderServer();
@@ -401,122 +1026,148 @@ function render() {
 }
 
 // ── Server tab ────────────────────────────────────────────────────────────────
-
 function urlBox(label, url) {
-  return '<div class="urlbox"><span class="muted">' + esc(label) + '</span><code>' + esc(url) +
-    '</code><button class="iconbtn small" onclick="copyText(\'' + esc(url).replace(/\x27/g,"&#39;") + '\')">&#128203;</button></div>';
+  return '<div class="urlbox"><span class="muted" style="font-weight:600">' + esc(label) + '</span><code>' + esc(url) +
+    '</code><button class="iconbtn small" title="Copy URL" onclick="copyText(\'' + esc(url).replace(/\x27/g,"&#39;") + '\', this)">' + svgCopy + '</button></div>';
 }
 
 function renderServer() {
   var s = summary.server;
   var t = summary.tunnel;
-  var html = '<div class="grid cols2">';
+  var html = '';
+
+  // Quick Stat Cards (pengu.uk inspired)
+  html += '<div class="stat-cards-grid">';
+  html += '<div class="stat-card"><div class="stat-label">Server Status</div><div class="stat-val' + (s.status === "Running" ? ' green' : '') + '">' + esc(s.status) + '</div><div class="stat-sub">Port :' + s.port + '</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Active Plugins</div><div class="stat-val">' + (s.pluginCount || 0) + '</div><div class="stat-sub">Ready in manifest</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Bridge Mode</div><div class="stat-val">' + (summary.headless ? 'Server' : 'Desktop') + '</div><div class="stat-sub">v' + esc(summary.version) + '</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Tunnel &amp; HTTPS</div><div class="stat-val' + (t && t.activeUrl ? ' green' : '') + '">' + (t && t.activeUrl ? 'Active' : (t && t.stremioMode ? 'Ready' : 'Off')) + '</div><div class="stat-sub">' + (t && t.cloudflaredInstalled ? 'cloudflared' : 'Local only') + '</div></div>';
+  html += '</div>';
+
+  html += '<div class="grid cols2">';
 
   // Server card
-  html += '<div class="card"><h2>&#127916; Server</h2><div class="hint">Stremio addon server and network endpoints.</div>';
+  html += '<div class="card"><h2>' + svgServer + ' Addon Gateway</h2><div class="hint">Network endpoints exposing the Stremio protocol.</div>';
   if (s.status === "Running") {
-    html += '<div class="row"><span class="badge green">&#9679; Running</span><span class="muted">' + s.pluginCount + ' plugin(s)</span></div>';
+    html += '<div class="row" style="margin-bottom:8px"><span class="badge green">Running</span><span class="muted">' + s.pluginCount + ' active plugin(s)</span></div>';
     html += urlBox("LAN", s.lanUrl || ("http://" + s.ipAddress + ":" + s.port + "/manifest.json"));
     if (s.localhostUrl) html += urlBox("Localhost", s.localhostUrl);
-    if (t.stremioMode && s.stremioModeUrl) html += urlBox("Tunnel URL", s.stremioModeUrl);
-    html += '<div class="row" style="margin-top:14px">';
-    html += '<button class="primary" onclick="act(\'/server/restart\',{method:\'POST\',body:\'{}\'}, \'Restarting\u2026\')">Restart</button>';
-    html += '<button class="danger" onclick="act(\'/server/stop\',{method:\'POST\',body:\'{}\'}, \'Stopping\u2026\')">Stop</button>';
-    html += '<a class="pill" href="/manifest.json" target="_blank">Manifest</a>';
+    if (t.stremioMode && s.stremioModeUrl) html += urlBox("Tunnel", s.stremioModeUrl);
+    html += '<div class="row" style="margin-top:14px;gap:8px">';
+    html += '<button class="primary small" onclick="act(\'/server/restart\',{method:\'POST\',body:\'{}\'}, \'Restarting server...\')">Restart</button>';
+    html += '<button class="danger small" onclick="act(\'/server/stop\',{method:\'POST\',body:\'{}\'}, \'Stopping server...\')">Stop</button>';
+    html += '<a class="pill" href="/manifest.json" target="_blank">View Manifest</a>';
     html += '</div>';
   } else if (s.status === "Starting") {
-    html += '<div class="row"><span class="badge amber"><span class="loader"></span>&nbsp; ' + esc(s.message || "Starting\u2026") + '</span></div>';
+    html += '<div class="row"><span class="badge amber"><span class="loader"></span> ' + esc(s.message || "Starting...") + '</span></div>';
   } else if (s.status === "Error") {
     html += '<div class="banner err">' + esc(s.message) + '</div>';
-    html += '<button class="primary" onclick="act(\'/server/start\',{method:\'POST\',body:\'{}\'}, \'Starting\u2026\')">Start server</button>';
+    html += '<button class="primary small" onclick="act(\'/server/start\',{method:\'POST\',body:\'{}\'}, \'Starting server...\')">Start Server</button>';
   } else {
-    html += '<div class="badge gray">Stopped</div><div class="muted" style="margin-top:8px">The web admin stays reachable while the addon server is off.</div>';
-    html += '<div style="margin-top:14px"><button class="primary" onclick="act(\'/server/start\',{method:\'POST\',body:\'{}\'}, \'Starting\u2026\')">Start server</button></div>';
+    html += '<div class="badge gray">Stopped</div><div class="muted" style="margin-top:8px">The web admin stays reachable while the addon server is stopped.</div>';
+    html += '<div style="margin-top:14px"><button class="primary small" onclick="act(\'/server/start\',{method:\'POST\',body:\'{}\'}, \'Starting server...\')">Start Server</button></div>';
   }
   html += '</div>';
 
   // Tunnel card
-  html += '<div class="card"><h2>&#9925; Stremio Mode &amp; Tunnel</h2><div class="hint">Stremio Web needs HTTPS. Cloudflare tunnel exposes your bridge publicly.</div>';
-  html += '<div class="row"><span class="muted">Stremio mode</span><div class="spacer"></div>';
+  html += '<div class="card"><h2>' + svgCloud + ' Stremio Mode &amp; Tunnel</h2><div class="hint">Stremio Web requires HTTPS. Cloudflare tunnel exposes your bridge securely.</div>';
+  html += '<div class="row" style="margin-bottom:8px"><span class="muted" style="font-weight:600">Stremio Mode (HTTPS)</span><div class="spacer"></div>';
   html += '<label class="switch"><input type="checkbox" ' + (t.stremioMode ? "checked" : "") + ' onchange="toggleStremioMode(this.checked)"><span class="track"></span></label></div>';
   if (t.downloadProgress !== null && t.downloadProgress !== undefined) {
     html += '<div class="progress"><div style="width:' + Math.round((t.downloadProgress||0)*100) + '%"></div></div>';
-    html += '<div class="muted" style="margin-top:6px">Downloading cloudflared\u2026 ' + Math.round((t.downloadProgress||0)*100) + '%</div>';
+    html += '<div class="muted" style="margin-top:6px">Downloading cloudflared... ' + Math.round((t.downloadProgress||0)*100) + '%</div>';
   } else if (t.activeUrl) {
     html += urlBox("Tunnel", t.activeUrl);
-    html += '<div class="row" style="margin-top:10px"><span class="badge green">Tunnel active</span></div>';
-    html += '<div style="margin-top:10px"><button class="ghost" onclick="act(\'/tunnel/stop\',{method:\'POST\',body:\'{}\'}, \'Stopping tunnel\u2026\')">Stop tunnel</button></div>';
+    html += '<div class="row" style="margin-top:10px"><span class="badge green">Tunnel Active</span></div>';
+    html += '<div style="margin-top:10px"><button class="ghost small" onclick="act(\'/tunnel/stop\',{method:\'POST\',body:\'{}\'}, \'Stopping tunnel...\')">Stop Tunnel</button></div>';
   } else {
     html += '<div class="row" style="margin-top:10px"><span class="badge ' + (t.cloudflaredInstalled ? "green" : "gray") + '">' + (t.cloudflaredInstalled ? "cloudflared ready" : "cloudflared not installed") + '</span></div>';
-    html += '<div style="margin-top:10px"><button class="primary" onclick="act(\'/tunnel/start\',{method:\'POST\',body:\'{}\'}, \'Starting tunnel\u2026\')">' + (t.cloudflaredInstalled ? "Start tunnel" : "Download &amp; start tunnel") + '</button></div>';
+    html += '<div style="margin-top:10px"><button class="primary small" onclick="act(\'/tunnel/start\',{method:\'POST\',body:\'{}\'}, \'Starting tunnel...\')">' + (t.cloudflaredInstalled ? "Start Tunnel" : "Download &amp; Start Tunnel") + '</button></div>';
   }
   html += '</div></div>';
-
 
   el("view").innerHTML = html;
 }
 
-
 function toggleStremioMode(enabled) {
   act("/stremio-mode", {method:"POST", body: JSON.stringify({enabled: enabled})},
-    enabled ? "Enabling Stremio mode\u2026" : "Disabling Stremio mode\u2026");
+    enabled ? "Enabling Stremio mode..." : "Disabling Stremio mode...");
 }
 
 // ── Extensions tab ────────────────────────────────────────────────────────────
-
 function renderExtensions() {
   var html = "";
 
-  // ── Repos section ──
-  html += '<div class="card"><h2>&#128230; Repositories</h2><div class="hint">CloudStream extension repos. Added repos are saved globally and all their extensions download automatically. Disabling an extension keeps it installed but hides it from the global manifest — users can still add it to their own profile.</div>';
+  // Repositories section
+  html += '<div class="card"><h2>' + svgBox + ' Repositories</h2><div class="hint">CloudStream extension repos. Added repos are saved globally and all their extensions download automatically. Disabling an extension keeps it installed but hides it from the global manifest — users can still add it to their own profile.</div>';
   html += '<div class="row" style="margin-bottom:12px">';
-  html += '<button class="primary small" onclick="openAddRepoModal()">&#43; Add repo</button>';
-
-  html += '<button class="ghost small" onclick="act(\'/repos/refresh\',{method:\'POST\',body:\'{}\'}, \'Refreshing\u2026\')">' + (summary.refreshing ? '<span class="loader"></span> ' : "") + 'Refresh all</button>';
+  html += '<button class="primary small" onclick="openAddRepoModal()">Add Repository</button>';
+  html += '<button class="ghost small" onclick="act(\'/repos/refresh\',{method:\'POST\',body:\'{}\'}, \'Refreshing repositories...\')">' + (summary.refreshing ? '<span class="loader"></span> ' : svgRefresh + ' ') + 'Refresh All</button>';
   html += '</div>';
 
-  if (summary.repos.length) {
-    html += '<div class="grid" style="gap:9px">';
+  if (summary.repos && summary.repos.length) {
+    html += '<div class="grid" style="gap:8px">';
     summary.repos.forEach(function(r) {
       html += '<div class="reporow">';
+      html += '<div class="repo-main">';
       if (r.iconUrl) {
         html += '<img class="ricon" src="' + esc(r.iconUrl) + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" alt="">';
         html += '<div class="rletter" style="display:none">' + esc((r.name||'?').charAt(0).toUpperCase()) + '</div>';
-      } else html += '<div class="rletter">' + esc((r.name||'?').charAt(0).toUpperCase()) + '</div>';
-      html += '<div class="rinfo"><div class="rname">' + esc(r.name||r.url) + '</div><div class="rurl">' + esc(r.url) + '</div></div>';
-      html += '<div class="raction">';
-      if (r.isLoading) html += '<span class="badge amber"><span class="loader"></span></span>';
-      else if (r.error) html += '<span class="badge red" title="' + esc(r.error) + '">error</span>';
-      else html += '<span class="badge gray">' + r.pluginCount + '</span>';
-      if (!r.isLoading && !r.error) {
-        html += '<button class="small success" onclick="installAllFromRepo(\'' + esc(r.url).replace(/\'/g,"%27") + '\')">Install all</button>';
+      } else {
+        html += '<div class="rletter">' + esc((r.name||'?').charAt(0).toUpperCase()) + '</div>';
       }
-      html += '<button class="small danger" onclick="removeRepo(\'' + esc(r.url).replace(/\'/g,"%27") + '\')">' + '&#x2715; Remove</button>';
-      html += '</div></div>';
+      html += '<div class="rinfo"><div class="rname">' + esc(r.name||r.url) + '</div><div class="rurl" title="' + esc(r.url) + '">' + esc(r.url) + '</div></div>';
+      html += '</div>';
 
-
-
-
+      html += '<div class="repo-actions">';
+      if (r.isLoading) html += '<span class="badge amber"><span class="loader"></span></span>';
+      else if (r.error) html += '<span class="badge red" title="' + esc(r.error) + '">Error</span>';
+      else html += '<span class="badge gray">' + r.pluginCount + ' extensions</span>';
+      if (!r.isLoading && !r.error) {
+        html += '<button class="small success" onclick="installAllFromRepo(\'' + esc(r.url).replace(/\'/g,"%27") + '\')">Install All</button>';
+      }
+      html += '<button class="small danger" onclick="removeRepo(\'' + esc(r.url).replace(/\'/g,"%27") + '\')">Remove</button>';
+      html += '</div>';
+      html += '</div>';
     });
     html += '</div>';
   } else {
-    html += '<div class="empty">No repositories added yet.</div>';
+    html += '<div class="empty">No repositories connected yet.</div>';
   }
   html += '</div>';
 
-  // ── Plugin catalog ──
-  html += '<div class="card" style="margin-top:14px"><h2>&#129490; Extensions</h2><div class="hint">Install, update and configure extensions from your repos.</div>';
+  // Plugin catalog
+  html += '<div class="card" style="margin-top:14px"><h2>' + svgPuzzle + ' Extension Catalog</h2><div class="hint">Install, update and configure provider extensions.</div>';
+  
+  var totalPlugins = plugins ? plugins.length : 0;
+  var installedCount = 0;
+  if (plugins) {
+    plugins.forEach(function(p) { if (p.installed) installedCount++; });
+  }
+
   html += '<div class="pillrow">';
-  html += '<span class="pill' + (repoFilter === "all" ? " active" : "") + '" onclick="setRepoFilter(\'all\')">All</span>';
-  html += '<span class="pill' + (repoFilter === "installed" ? " active" : "") + '" onclick="setRepoFilter(\'installed\')">Installed</span>';
-  summary.repos.forEach(function(r) {
-    html += '<span class="pill' + (repoFilter === r.url ? " active" : "") + '" onclick="setRepoFilter(\'' + esc(r.url).replace(/\x27/g,"%27") + '\')">' + esc(r.name || r.url) + '</span>';
-  });
+  html += '<span class="pill' + (repoFilter === "all" ? " active" : "") + '" onclick="setRepoFilter(\'all\')">All (' + totalPlugins + ')</span>';
+  html += '<span class="pill' + (repoFilter === "installed" ? " active" : "") + '" onclick="setRepoFilter(\'installed\')">Installed (' + installedCount + ')</span>';
+  if (summary.repos) {
+    summary.repos.forEach(function(r) {
+      var rCount = 0;
+      if (plugins) {
+        plugins.forEach(function(p) { if (p.repoUrl === r.url) rCount++; });
+      }
+      html += '<span class="pill' + (repoFilter === r.url ? " active" : "") + '" onclick="setRepoFilter(\'' + esc(r.url).replace(/\x27/g,"%27") + '\')">' + esc(r.name || r.url) + ' (' + rCount + ')</span>';
+    });
+  }
   html += '</div>';
-  html += '<input type="text" placeholder="Search extensions\u2026" value="' + esc(searchQuery) + '" oninput="setSearch(this.value)" style="margin-bottom:14px">';
+
+  html += '<div style="position:relative;margin-bottom:14px">';
+  html += '<input type="text" id="ext-search-input" placeholder="Search extensions by name, tag, or author..." value="' + esc(searchQuery) + '" oninput="setSearch(this.value)" style="padding-right:32px">';
+  if (searchQuery) {
+    html += '<button onclick="setSearch(\'\');var el=document.getElementById(\'ext-search-input\');if(el)el.value=\'\';" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);padding:4px;cursor:pointer;font-size:14px;line-height:1;" title="Clear search">&times;</button>';
+  }
+  html += '</div>';
 
   if (!plugins) {
-    html += '<div class="empty"><span class="loader"></span> loading\u2026</div>';
+    html += '<div class="empty"><span class="loader"></span> Loading extensions...</div>';
   } else {
     var list = plugins.filter(function(p) {
       if (repoFilter === "installed" && !p.installed) return false;
@@ -528,7 +1179,7 @@ function renderExtensions() {
       return true;
     });
     if (!list.length) {
-      html += '<div class="empty">No extensions match. Add a repository above.</div>';
+      html += '<div class="empty">No extensions match your filter.</div>';
     } else {
       html += '<div class="plugins">';
       list.forEach(function(p) {
@@ -543,48 +1194,68 @@ function renderExtensions() {
 
 function renderPluginCard(p) {
   var inst = null;
-  if (summary) {
+  if (summary && summary.installedPlugins) {
     for (var i = 0; i < summary.installedPlugins.length; i++) {
       if (summary.installedPlugins[i].internalName === p.internalName) { inst = summary.installedPlugins[i]; break; }
     }
   }
   var html = '<div class="pcard" id="pc-' + esc(p.internalName) + '">';
-  html += '<div class="top">';
+  
+  // Top: Icon + Status badge
+  html += '<div class="pcard-header">';
   if (p.iconUrl) {
     html += '<img class="picon" src="' + esc(p.iconUrl) + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" alt="">';
-    html += '<div class="pletter" style="display:none">' + esc(p.displayName.charAt(0).toUpperCase()) + '</div>';
-  } else html += '<div class="pletter">' + esc(p.displayName.charAt(0).toUpperCase()) + '</div>';
-  html += '<div style="min-width:0"><div class="name">' + esc(p.displayName) + '</div>';
-  html += '<div class="meta">v' + p.version + (p.language ? " \xb7 " + esc(p.language) : "") + (p.authors && p.authors.length ? " \xb7 " + esc(p.authors.join(", ")) : "") + " \xb7 " + esc(p.repoName) + '</div></div></div>';
-  if (p.description) html += '<div class="desc">' + esc(p.description) + '</div>';
-
-  html += '<div class="actions">';
-  if (p.installState === "Installing") {
-    html += '<span class="badge amber"><span class="loader"></span>&nbsp; ' + esc(p.installProgress || "Installing\u2026") + '</span>';
-  } else if (p.installState === "Failed") {
-    html += '<span class="badge red" title="' + esc(p.error||"") + '">Failed</span>';
-    html += '<button class="small primary" onclick="installPlugin(\'' + esc(p.internalName) + '\')">Retry</button>';
-  } else if (p.installed && p.updateAvailable) {
-    html += '<span class="badge amber">Update \u2192 v' + p.version + '</span>';
-    html += '<button class="small primary" onclick="installPlugin(\'' + esc(p.internalName) + '\')">Update</button>';
-  } else if (p.installed) {
-    html += '<span class="badge green">v' + p.installedVersion + ' installed</span>';
+    html += '<div class="pletter" style="display:none">' + esc((p.displayName||p.name||'?').charAt(0).toUpperCase()) + '</div>';
   } else {
-    html += '<button class="small primary" onclick="installPlugin(\'' + esc(p.internalName) + '\')">Install</button>';
+    html += '<div class="pletter">' + esc((p.displayName||p.name||'?').charAt(0).toUpperCase()) + '</div>';
   }
 
-  if (p.installed) {
-    if (inst && inst.hasSettings) {
-      html += '<button class="small ghost" onclick="toggleSettingsDrawer(\'' + esc(p.internalName) + '\')">&#9881; Settings</button>';
-    }
-    if (inst) {
-      html += '<label class="switch" title="' + (inst.enabled ? "Disable" : "Enable") + '"><input type="checkbox" ' + (inst.enabled ? "checked" : "") + ' onchange="togglePlugin(\'' + esc(p.internalName) + '\')"><span class="track"></span></label>';
-    }
-    html += '<button class="small danger" onclick="uninstallPlugin(\'' + esc(p.internalName) + '\')">Uninstall</button>';
+  if (p.installState === "Installing") {
+    html += '<span class="badge amber"><span class="loader"></span></span>';
+  } else if (p.installState === "Failed") {
+    html += '<span class="badge red">Failed</span>';
+  } else if (p.installed && p.updateAvailable) {
+    html += '<span class="badge amber">Update</span>';
+  } else if (p.installed) {
+    html += '<span class="badge green">v' + esc(p.installedVersion || p.version || "1.0") + '</span>';
+  } else {
+    html += '<span class="badge gray">Available</span>';
   }
   html += '</div>';
 
-  // No inline drawer — settings open as a modal popup
+  // Body: Name, Meta, Description
+  html += '<div class="pcard-body">';
+  html += '<div class="name" title="' + esc(p.displayName || p.name) + '">' + esc(p.displayName || p.name) + '</div>';
+  html += '<div class="meta">v' + esc(p.version || "1.0") + (p.language ? ' &middot; ' + esc(p.language) : '') + (p.repoName ? ' &middot; ' + esc(p.repoName) : '') + '</div>';
+  if (p.description) {
+    html += '<div class="desc" title="' + esc(p.description) + '">' + esc(p.description) + '</div>';
+  }
+  html += '</div>';
+
+  // Actions footer
+  html += '<div class="pcard-actions">';
+  if (p.installState === "Installing") {
+    html += '<button class="small ghost" disabled style="width:100%"><span class="loader"></span> ' + esc(p.installProgress || "Installing...") + '</button>';
+  } else if (p.installState === "Failed") {
+    html += '<button class="small primary" style="flex:1" onclick="installPlugin(\'' + esc(p.internalName) + '\')">Retry</button>';
+  } else if (p.installed && p.updateAvailable) {
+    html += '<button class="small primary" style="flex:1" onclick="installPlugin(\'' + esc(p.internalName) + '\')">Update v' + esc(p.version) + '</button>';
+  } else if (!p.installed) {
+    html += '<button class="small primary" style="width:100%" onclick="installPlugin(\'' + esc(p.internalName) + '\')">Install</button>';
+  }
+
+  if (p.installed) {
+    html += '<div class="pcard-ctrls">';
+    if (inst) {
+      html += '<label class="switch" title="' + (inst.enabled ? "Disable" : "Enable") + '"><input type="checkbox" ' + (inst.enabled ? "checked" : "") + ' onchange="togglePlugin(\'' + esc(p.internalName) + '\')"><span class="track"></span></label>';
+    }
+    if (inst && inst.hasSettings) {
+      html += '<button class="iconbtn small" title="Settings" onclick="toggleSettingsDrawer(\'' + esc(p.internalName) + '\')">' + svgGear + '</button>';
+    }
+    html += '<button class="iconbtn small danger-btn" title="Uninstall" onclick="uninstallPlugin(\'' + esc(p.internalName) + '\')">' + svgTrash + '</button>';
+    html += '</div>';
+  }
+  html += '</div>';
   html += '</div>';
   return html;
 }
@@ -595,14 +1266,9 @@ function setSearch(q) { searchQuery = q; renderExtensions(); }
 function normalizeRepoUrl(raw) {
   raw = (raw || "").trim();
   if (!raw) return null;
-
-  // Single-word shortcode like "Hexated" or "!pymd" — no slashes, dots, or protocol.
-  // Pass through unchanged; the server resolves via cutt.ly / py.md.
   if (!raw.includes("/") && !raw.includes(".") && !raw.includes(":")) {
     return raw;
   }
-
-  // GitHub shorthand: "user/repo" or "user/repo/branch" — no dots, no protocol
   if (!raw.includes("://") && raw.indexOf(".") < 0) {
     var parts = raw.split("/").filter(Boolean);
     if (parts.length === 2) {
@@ -611,8 +1277,6 @@ function normalizeRepoUrl(raw) {
       return "https://raw.githubusercontent.com/" + parts[0] + "/" + parts[1] + "/" + parts[2] + "/repo.json";
     }
   }
-
-  // github.com/user/repo → raw.githubusercontent.com
   if (raw.indexOf("github.com") >= 0 && raw.indexOf("raw.githubusercontent.com") < 0 && raw.indexOf(".json") < 0) {
     var stripped = raw.replace(/^https?:\/\//, "").replace(/^\/+/, "");
     var seg = stripped.replace(/^github\.com\//, "").split("/").filter(Boolean);
@@ -620,10 +1284,7 @@ function normalizeRepoUrl(raw) {
       return "https://raw.githubusercontent.com/" + seg[0] + "/" + seg[1] + "/builds/repo.json";
     }
   }
-
-  // Add https:// if protocol missing
   if (raw.indexOf("://") < 0) raw = "https://" + raw;
-
   return raw;
 }
 
@@ -642,7 +1303,6 @@ function submitAddRepo() {
   var input = el("add-repo-input");
   var url = normalizeRepoUrl(input ? input.value : "");
   if (!url) return;
-  // Show resolved URL briefly in the input so user sees what was sent
   if (input) input.value = url;
   var btn = el("add-repo-btn");
   if (btn) { btn.disabled = true; btn.textContent = "Adding\u2026"; }
@@ -663,26 +1323,19 @@ function removeRepo(url) {
   act("/repos/remove", {method:"POST", body: JSON.stringify({url: url})}, "Repo removed");
 }
 
-
-
-
-
 function installAllFromRepo(repoUrl) {
   api("/plugins/install-all-from-repo", {method:"POST", body: JSON.stringify({repoUrl: repoUrl})})
     .then(function(r) {
       toast(r && r.message ? r.message : "Installing all extensions\u2026");
-      // Reload plugin list immediately to show Installing states
       loadPlugins();
       poll();
     }).catch(function(e) { toast("Action failed: " + e.message); });
 }
 
 function installPlugin(id) {
-  // Optimistically mark as Installing in UI
   updatePluginCardState(id, "Installing", null, null);
   api("/plugins/install", {method:"POST", body: JSON.stringify({internalName: id})})
     .then(function() {
-      // Start polling aggressively to pick up install state
       loadPlugins();
       poll();
     }).catch(function(e) { toast("Install failed: " + e.message); });
@@ -696,7 +1349,6 @@ function uninstallPlugin(id) {
 function togglePlugin(id) {
   api("/plugins/toggle", {method:"POST", body: JSON.stringify({internalName: id})})
     .then(function(newPlugins) {
-      // Backend returns updated plugin list directly
       if (Array.isArray(newPlugins)) {
         plugins = newPlugins;
         if (tab === "extensions") renderExtensions();
@@ -706,7 +1358,6 @@ function togglePlugin(id) {
 }
 
 function updatePluginCardState(id, state, progress, error) {
-  // Optimistic in-place card update without full re-render
   if (!plugins) return;
   plugins = plugins.map(function(p) {
     if (p.internalName !== id) return p;
@@ -727,7 +1378,6 @@ function updatePluginCardState(id, state, progress, error) {
 }
 
 // ── Settings modal popup ──────────────────────────────────────────────────────
-
 var settingsModalPluginId = null;
 
 function closeSettingsModal() {
@@ -738,22 +1388,20 @@ function closeSettingsModal() {
 function toggleSettingsDrawer(id) {
   var modal = el("settings-modal");
   var box   = el("settings-modal-box");
-  // If already open for same plugin, close it
   if (modal.classList.contains("open") && settingsModalPluginId === id) {
     closeSettingsModal();
     return;
   }
   settingsModalPluginId = id;
-  // Find plugin name for title
   var pluginName = id;
   if (plugins) {
     var pm = plugins.find(function(x) { return x.internalName === id; });
-    if (pm) pluginName = pm.name || id;
+    if (pm) pluginName = pm.displayName || pm.name || id;
   }
   box.innerHTML = '<div class="modal-title">' + esc(pluginName) + ' Settings<button class="modal-close" onclick="closeSettingsModal()" title="Close">&times;</button></div>' +
     '<div class="muted" style="text-align:center;padding:20px"><span class="loader"></span> Loading settings…</div>';
   modal.classList.add("open");
-  // Discover then load settings
+
   api("/plugins/" + encodeURIComponent(id) + "/settings/discover", {method:"POST", body:"{}"})
     .then(function() { return new Promise(function(res) { setTimeout(res, 700); }); })
     .then(function() { return api("/plugins/" + encodeURIComponent(id) + "/settings"); })
@@ -787,7 +1435,6 @@ function toggleSettingsDrawer(id) {
     });
 }
 
-// Close modals on Escape key
 document.addEventListener("keydown", function(e) {
   if (e.key === "Escape") {
     if (el("settings-modal").classList.contains("open")) closeSettingsModal();
@@ -842,25 +1489,8 @@ function saveSettingValue(pluginId, storageKey, value) {
 }
 
 function toggleSetVal(pluginId, storageKey, item, disabledStyle, checkbox) {
-  // Re-read current set from DOM (since we don't track st state in drawer)
-  // Just serialize based on checkbox state
   var form = checkbox.closest(".checkgrid");
   if (!form) return;
-  var selected = [];
-  form.querySelectorAll("input[type=checkbox]").forEach(function(cb) {
-    var label = cb.nextElementSibling ? cb.nextElementSibling.textContent : "";
-    if (disabledStyle ? !cb.checked : cb.checked) selected.push(cb.value || label.trim());
-  });
-  // Since we lost the option labels, just use the item directly
-  // Simpler approach: just call saveSettingValue from checked state
-  var allChecks = form.querySelectorAll("input[type=checkbox]");
-  var cur = [];
-  allChecks.forEach(function(cb) {
-    if (disabledStyle ? !cb.checked : cb.checked) {
-      // get the item value from the onchange attr - approximate
-    }
-  });
-  // Simplest correct approach: read checked items from siblings, item is already known
   api("/plugins/" + encodeURIComponent(pluginId) + "/settings", {})
     .then(function(data) {
       var st = data.settings.find(function(s) { return s.storageKey === storageKey; });
@@ -891,26 +1521,45 @@ function applySettings(pluginId) {
 }
 
 // ── Logs tab ─────────────────────────────────────────────────────────────────
+var logLevelFilter = "ALL";
+
+function setLogLevelFilter(lvl) {
+  logLevelFilter = lvl;
+  renderLogs();
+}
+
+function getFilteredLogs() {
+  if (logLevelFilter === "ALL") return logsData;
+  return logsData.filter(function(l) { return l.level === logLevelFilter; });
+}
 
 function renderLogs() {
-  var html = '<div class="card"><h2>&#128203; Logs</h2><div class="hint">Live application log \u2014 auto-updates every 3s.</div>';
+  var filtered = getFilteredLogs();
+  var html = '<div class="card"><h2>' + svgTerminal + ' Live Logs</h2><div class="hint">Real-time system events, search requests, and plugin operations.</div>';
   html += '<div class="logs-wrap"><div class="logs-toolbar">';
-  html += '<button class="ghost small" onclick="copyLogs()">Copy all</button>';
+  html += '<button class="ghost small" onclick="copyLogs()">' + svgCopy + ' Copy All</button>';
   html += '<button class="ghost small" onclick="clearLogs()">Clear</button>';
-  html += '<label class="row" style="gap:6px;font-size:12px;color:var(--text2)"><input type="checkbox" id="autoscrollcb" ' + (autoScroll?"checked":"") + ' onchange="autoScroll=this.checked"> auto-scroll</label>';
+  html += '<div class="row" style="gap:4px;margin-left:6px">';
+  html += '<button class="small ' + (logLevelFilter==="ALL"?"primary":"ghost") + '" onclick="setLogLevelFilter(\'ALL\')" style="padding:2px 8px;font-size:11px">All</button>';
+  html += '<button class="small ' + (logLevelFilter==="ERROR"?"danger":"ghost") + '" onclick="setLogLevelFilter(\'ERROR\')" style="padding:2px 8px;font-size:11px">Errors</button>';
+  html += '<button class="small ' + (logLevelFilter==="WARN"?"primary":"ghost") + '" onclick="setLogLevelFilter(\'WARN\')" style="padding:2px 8px;font-size:11px">Warnings</button>';
+  html += '<button class="small ' + (logLevelFilter==="INFO"?"primary":"ghost") + '" onclick="setLogLevelFilter(\'INFO\')" style="padding:2px 8px;font-size:11px">Info</button>';
+  html += '</div>';
+  html += '<span class="muted" style="font-size:11px;margin-left:6px">' + filtered.length + ' entries</span>';
+  html += '<label class="row" style="gap:6px;font-size:12px;color:var(--text2);margin-left:auto"><input type="checkbox" id="autoscrollcb" ' + (autoScroll?"checked":"") + ' onchange="autoScroll=this.checked"> Auto-scroll</label>';
   html += '</div><div class="loglist" id="logsbox">';
   html += renderAllLogLines();
   html += '</div></div></div>';
   el("view").innerHTML = html;
-  // Track the last rendered timestamp so appendNewLogLines only adds truly new entries
   lastLogTimestamp = logsData.length > 0 ? (logsData[logsData.length - 1].timestamp || 0) : 0;
   var box = el("logsbox");
   if (box && autoScroll) box.scrollTop = box.scrollHeight;
 }
 
 function renderAllLogLines() {
-  if (!logsData.length) return '<div class="empty">No log entries yet.</div>';
-  return logsData.map(function(l) { return logLine(l); }).join("");
+  var filtered = getFilteredLogs();
+  if (!filtered.length) return '<div class="empty">No log entries matching filter.</div>';
+  return filtered.map(function(l) { return logLine(l); }).join("");
 }
 
 function logLine(l) {
@@ -926,10 +1575,13 @@ function appendNewLogLines() {
     lastLogTimestamp = 0;
     return;
   }
-  // Detect new entries by timestamp (works even with rolling server-side buffer)
-  var newLines = logsData.filter(function(l) { return (l.timestamp || 0) > lastLogTimestamp; });
+  var newLines = logsData.filter(function(l) {
+    if ((l.timestamp || 0) <= lastLogTimestamp) return false;
+    if (logLevelFilter !== "ALL" && l.level !== logLevelFilter) return false;
+    return true;
+  });
+  lastLogTimestamp = logsData[logsData.length - 1].timestamp || lastLogTimestamp;
   if (!newLines.length) return;
-  // Remove empty placeholder if present
   var empty = box.querySelector(".empty");
   if (empty) empty.remove();
   var frag = document.createDocumentFragment();
@@ -940,7 +1592,6 @@ function appendNewLogLines() {
     frag.appendChild(d);
   });
   box.appendChild(frag);
-  lastLogTimestamp = newLines[newLines.length - 1].timestamp || lastLogTimestamp;
   if (autoScroll) box.scrollTop = box.scrollHeight;
 }
 
@@ -962,37 +1613,36 @@ function copyLogs() {
 }
 
 // ── About tab ────────────────────────────────────────────────────────────────
-
 function renderAbout() {
   var u = summary.update;
   var html = '<div class="grid cols2">';
-  html += '<div class="card"><h2>&#8505; About</h2><div class="hint">CNCVerse Bridge \u2014 run CloudStream extensions on Stremio and every Stremio-compatible client.</div>';
+  html += '<div class="card"><h2>' + svgInfo + ' System Information</h2><div class="hint">CNCVerse Bridge runtime environment and active parameters.</div>';
   html += '<div class="kv">';
   html += '<div class="k">Version</div><div>' + esc(summary.version) + '</div>';
-  html += '<div class="k">Mode</div><div>' + (summary.headless ? "Headless server" : "Desktop") + '</div>';
+  html += '<div class="k">Mode</div><div>' + (summary.headless ? "Headless Server" : "Desktop") + '</div>';
   html += '<div class="k">Platform</div><div>' + esc(summary.platform) + '</div>';
-  html += '<div class="k">Loaded plugins</div><div>' + summary.server.pluginCount + '</div>';
-  html += '<div class="k">Repositories</div><div>' + summary.repos.length + '</div>';
+  html += '<div class="k">Loaded Plugins</div><div>' + summary.server.pluginCount + '</div>';
+  html += '<div class="k">Repositories</div><div>' + (summary.repos ? summary.repos.length : 0) + '</div>';
   html += '</div>';
-  html += '<div class="row" style="margin-top:14px">';
+  html += '<div class="row" style="margin-top:14px;gap:6px">';
   html += '<a class="pill" href="https://github.com/NivinCNC/CNCVerse-Bridge" target="_blank" rel="noreferrer">GitHub</a>';
   html += '<a class="pill" href="https://t.me/cncverse" target="_blank" rel="noreferrer">Telegram</a>';
   html += '<a class="pill" href="https://cncverse.pages.dev" target="_blank" rel="noreferrer">Support</a>';
   html += '</div></div>';
 
-  html += '<div class="card"><h2>&#8635; Updates</h2><div class="hint">OTA update from GitHub releases. Extensions are also checked hourly automatically.</div>';
-  html += '<button class="primary" onclick="checkUpdate()">Check for updates</button>';
+  html += '<div class="card"><h2>' + svgRefresh + ' System Updates</h2><div class="hint">OTA updates from GitHub releases. Extensions update automatically in background.</div>';
+  html += '<button class="primary small" onclick="checkUpdate()">' + svgRefresh + ' Check for Updates</button>';
   if (u && u.tagName) {
-    html += '<div class="banner" style="margin-top:12px">New version: <b>' + esc(u.tagName) + '</b></div>';
+    html += '<div class="banner" style="margin-top:12px">New version available: <b>' + esc(u.tagName) + '</b></div>';
     if (u.body) html += '<div class="muted" style="margin-top:6px;white-space:pre-wrap;max-height:160px;overflow:auto">' + esc(u.body) + '</div>';
     if (u.downloadProgress !== null && u.downloadProgress !== undefined) {
       html += '<div class="progress" style="margin-top:10px"><div style="width:' + Math.round((u.downloadProgress||0)*100) + '%"></div></div>';
-      html += '<div class="muted" style="margin-top:6px">Downloading\u2026 ' + Math.round((u.downloadProgress||0)*100) + '%</div>';
+      html += '<div class="muted" style="margin-top:6px">Downloading... ' + Math.round((u.downloadProgress||0)*100) + '%</div>';
     } else {
-      html += '<div style="margin-top:10px"><button class="primary" onclick="act(\'/update/apply\',{method:\'POST\',body:\'{}\'}, \'Downloading update\u2026\')">Download &amp; Install</button></div>';
+      html += '<div style="margin-top:10px"><button class="primary small" onclick="act(\'/update/apply\',{method:\'POST\',body:\'{}\'}, \'Downloading update...\')">Download &amp; Install</button></div>';
     }
   } else if (u) {
-    html += '<div class="banner" style="margin-top:12px">You are on the latest version.</div>';
+    html += '<div class="banner" style="margin-top:12px">You are running the latest version.</div>';
   }
   html += '</div></div>';
   el("view").innerHTML = html;
@@ -1007,7 +1657,6 @@ function checkUpdate() {
 }
 
 // ── Shared actions ────────────────────────────────────────────────────────────
-
 function act(path, opts, msg) {
   api(path, opts).then(function(r) {
     if (msg) toast(r && r.message ? r.message : msg);
@@ -1034,11 +1683,9 @@ function loadPlugins() {
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
-
 document.querySelectorAll("#tabs button").forEach(function(b) {
   b.addEventListener("click", function() { openTab(b.getAttribute("data-tab")); });
 });
-
 
 poll();
 loadPlugins();
