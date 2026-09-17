@@ -1137,7 +1137,11 @@ function renderExtensions() {
   html += '</div>';
 
   // Plugin catalog
-  html += '<div class="card" style="margin-top:14px"><h2>' + svgPuzzle + ' Extension Catalog</h2><div class="hint">Install, update and configure provider extensions.</div>';
+  html += '<div class="card" style="margin-top:14px">';
+  html += '<div class="row" style="align-items:flex-start;margin-bottom:10px">';
+  html += '<div><h2>' + svgPuzzle + ' Extension Catalog</h2><div class="hint" style="margin-bottom:0">Install, update and configure provider extensions.</div></div>';
+  html += '<button class="ghost small" style="margin-left:auto;flex:0 0 auto" onclick="loadPlugins();toast(\'Refreshing extensions...\')">' + svgRefresh + ' Refresh</button>';
+  html += '</div>';
   
   var totalPlugins = plugins ? plugins.length : 0;
   var installedCount = 0;
@@ -1189,7 +1193,28 @@ function renderExtensions() {
     }
   }
   html += '</div>';
+  var focusId = document.activeElement ? document.activeElement.id : null;
+  var cursorStart = -1, cursorEnd = -1;
+  if (focusId) {
+    try {
+      cursorStart = document.activeElement.selectionStart;
+      cursorEnd = document.activeElement.selectionEnd;
+    } catch(e) {}
+  }
+
   el("view").innerHTML = html;
+
+  if (focusId) {
+    var newEl = document.getElementById(focusId);
+    if (newEl) {
+      newEl.focus();
+      try {
+        if (cursorStart !== undefined && cursorStart !== null && cursorStart >= 0) {
+          newEl.setSelectionRange(cursorStart, cursorEnd);
+        }
+      } catch(e) {}
+    }
+  }
 }
 
 function renderPluginCard(p) {
@@ -1628,7 +1653,9 @@ function renderAbout() {
   html += '<a class="pill" href="https://github.com/NivinCNC/CNCVerse-Bridge" target="_blank" rel="noreferrer">GitHub</a>';
   html += '<a class="pill" href="https://t.me/cncverse" target="_blank" rel="noreferrer">Telegram</a>';
   html += '<a class="pill" href="https://cncverse.pages.dev" target="_blank" rel="noreferrer">Support</a>';
-  html += '</div></div>';
+  html += '</div>';
+  html += '<div class="muted" style="margin-top:16px;font-size:12px">Made with <span style="color:#f43f5e">&#10084;&#65039;</span> By <a href="https://t.me/NivinCNC" target="_blank" rel="noreferrer" style="color:var(--text);text-decoration:none;font-weight:600">NivinCNC</a> &bull; UI By <span style="color:var(--text);font-weight:600">sleepycat555</span></div>';
+  html += '</div>';
 
   html += '<div class="card"><h2>' + svgRefresh + ' System Updates</h2><div class="hint">OTA updates from GitHub releases. Extensions update automatically in background.</div>';
   html += '<button class="primary small" onclick="checkUpdate()">' + svgRefresh + ' Check for Updates</button>';
@@ -1697,8 +1724,8 @@ pollTimer = setInterval(poll, 3000);
 // Log poll: every 3s when on logs tab; also keeps logsData fresh in background
 logTimer = setInterval(function() { pollLogs(); }, 3000);
 
-// Plugin refresh: every 5s when on extensions tab (to pick up install states)
-setInterval(function() { if (tab === "extensions") loadPlugins(); }, 5000);
+// Plugin refresh: every 3s when on extensions tab (picks up install state changes)
+setInterval(function() { if (tab === "extensions") loadPlugins(); }, 3000);
 
 // Hourly client-side refresh trigger (belt-and-suspenders alongside server-side check)
 setTimeout(function() {

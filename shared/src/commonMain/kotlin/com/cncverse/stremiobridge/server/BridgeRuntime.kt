@@ -117,6 +117,17 @@ object BridgeRuntime {
     }
 
     /**
+     * Bulk-uninstall a list of plugins (deletes their files) then does a
+     * single [forceReloadPlugins] pass — more efficient than calling
+     * [uninstallPlugin] in a loop.
+     */
+    suspend fun uninstallPlugins(internalNames: List<String>) {
+        if (internalNames.isEmpty()) return
+        internalNames.forEach { PluginInstaller.uninstallPlugin(it, cacheDir) }
+        forceReloadPlugins()
+    }
+
+    /**
      * Adds a repository and auto-installs every extension it publishes.
      *
      * @param disableNewPluginsByDefault keep the freshly installed extensions
@@ -129,7 +140,7 @@ object BridgeRuntime {
         url: String,
         saveGlobally: Boolean = true,
         autoInstallAll: Boolean = true,
-        disableNewPluginsByDefault: Boolean = false,
+        disableNewPluginsByDefault: Boolean = true,
     ): RepoEntry? {
         val entry = RepoManager.addRepo(url, saveGlobally = saveGlobally) ?: return null
         if (entry.error != null) return entry
@@ -138,7 +149,7 @@ object BridgeRuntime {
             ServerState.info(
                 "Repo '" + entry.name.ifBlank { entry.url } + "': " + installed +
                     " extension(s) available locally" +
-                    (if (disableNewPluginsByDefault) " (disabled by default — opt in via profiles)" else "")
+                    (if (disableNewPluginsByDefault) " (disabled by default — opt in via profiles or admin)" else "")
             )
         }
         return entry
@@ -149,7 +160,7 @@ object BridgeRuntime {
      * and hot-reloads the plugin set once at the end. Returns how many
      * extensions were newly installed.
      */
-    suspend fun installAllFromRepo(repoUrl: String, disableNewPluginsByDefault: Boolean = false): Int {
+    suspend fun installAllFromRepo(repoUrl: String, disableNewPluginsByDefault: Boolean = true): Int {
         val before = RepoState.installedPlugins.value.map { it.internalName }.toSet()
         val toInstall = RepoState.availablePlugins.value.filter {
             it.repoEntry.url == repoUrl && it.plugin.internalName !in before
@@ -169,6 +180,15 @@ object BridgeRuntime {
             }
             ServerState.info("Loading $ok new extension(s)…")
             forceReloadPlugins()
+            if (disableNewPluginsByDefault) {
+                val newlyInstalledNames = RepoState.installedPlugins.value
+                    .filter { it.repoUrl == repoUrl && it.internalName !in before }
+                    .map { it.internalName }.toSet()
+                StremioServer.loadedApis.filter { it.pluginInternalName in newlyInstalledNames || it.internalName in newlyInstalledNames }.forEach { api ->
+                    StremioServer.setPluginDisabled(api.internalName, disabled = true)
+                    StremioServer.setPluginDisabled(api.pluginInternalName, disabled = true)
+                }
+            }
         }
         return ok
     }

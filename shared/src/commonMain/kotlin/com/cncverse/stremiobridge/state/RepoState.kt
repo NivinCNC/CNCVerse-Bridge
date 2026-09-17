@@ -79,8 +79,10 @@ object RepoState {
 
     fun removeRepo(url: String) {
         _repos.value = _repos.value.filter { it.url != url }
-        // Remove plugins from removed repo
         _availablePlugins.value = _availablePlugins.value.filter { it.repoEntry.url != url }
+        // Also remove the installed-plugin records for this repo so the plugin
+        // loader won't re-register them on the next forceReloadPlugins() call.
+        _installedPlugins.value = _installedPlugins.value.filter { it.repoUrl != url }
     }
 
     fun mergeAvailablePlugins(plugins: List<AvailablePlugin>, repoUrl: String) {

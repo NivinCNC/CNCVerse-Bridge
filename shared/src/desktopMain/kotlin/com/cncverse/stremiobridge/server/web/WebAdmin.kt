@@ -207,7 +207,7 @@ object WebAdmin {
                 if (url.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing url"))
                 val saveGlobally = body.saveGlobally ?: true
                 scope().launch {
-                    val entry = BridgeRuntime.addRepo(url, saveGlobally = saveGlobally, autoInstallAll = true)
+                    val entry = BridgeRuntime.addRepo(url, saveGlobally = saveGlobally, autoInstallAll = true, disableNewPluginsByDefault = true)
                     if (!saveGlobally) localOnlyRepos.add(url)
                     when {
                         entry == null -> ServerState.warn("Repo already installed: $url")
@@ -224,9 +224,34 @@ object WebAdmin {
                 val url = body.url?.trim().orEmpty()
                 if (url.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing url"))
                 localOnlyRepos.remove(url)
+                // Collect plugin names BEFORE removing so we can clean up disabledPlugins + profiles
+                val pluginsToRemove = com.cncverse.stremiobridge.state.RepoState.installedPlugins.value
+                    .filter { it.repoUrl == url }
+                    .map { it.internalName }
                 RepoManager.removeRepo(url)
+                // Strip ghost "Global off" entries from disabledPlugins
+                pluginsToRemove.forEach { name ->
+                    StremioServer.disabledPlugins.remove(name)
+                }
+                StremioServer.saveDisabledPlugins()
+                // Also remove from every profile's disabled / enabledOverrides so stale
+                // extension selections don't linger in user profile data after repo deletion.
+                // Profiles store names in nameSlug form — collect both variants to be safe.
+                val profileCleanupIds = pluginsToRemove.toMutableSet()
+                StremioServer.loadedApis.forEach { api ->
+                    if (pluginsToRemove.any { it == api.pluginInternalName || it == api.internalName }) {
+                        profileCleanupIds += StremioServer.publicNameSlug(api.name)
+                    }
+                }
+                StremioServer.cleanRemovedPluginsFromProfiles(profileCleanupIds)
+                // Uninstall plugin files from disk + reload — uses bulk helper to do
+                // a single reload pass rather than one per plugin.
+                scope().launch(kotlinx.coroutines.Dispatchers.IO) {
+                    BridgeRuntime.uninstallPlugins(pluginsToRemove)
+                }
                 call.respond(AdminActionResult(true, "Repo removed"))
             }
+
 
             // Promote a local-only repo to globally saved
             post("/repos/promote-global") {
@@ -236,7 +261,7 @@ object WebAdmin {
                 if (url.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing url"))
                 localOnlyRepos.remove(url)
                 // Re-add through manager with global persistence (+ auto-install)
-                scope().launch { BridgeRuntime.addRepo(url, saveGlobally = true, autoInstallAll = true) }
+                scope().launch { BridgeRuntime.addRepo(url, saveGlobally = true, autoInstallAll = true, disableNewPluginsByDefault = true) }
                 call.respond(AdminActionResult(true, "Repo saved globally"))
             }
 
@@ -279,8 +304,8 @@ object WebAdmin {
                 val repoUrl = body.repoUrl?.trim().orEmpty()
                 if (repoUrl.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing repoUrl"))
                 scope().launch {
-                    val installed = BridgeRuntime.installAllFromRepo(repoUrl)
-                    ServerState.info("Install-all finished for $repoUrl: $installed new extension(s)")
+                    val installed = BridgeRuntime.installAllFromRepo(repoUrl, disableNewPluginsByDefault = true)
+                    ServerState.info("Install-all finished for $repoUrl: $installed new extension(s) (disabled by default)")
                 }
                 call.respond(AdminActionResult(true, "Installing all extensions from repo…"))
             }

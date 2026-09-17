@@ -24,6 +24,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import java.io.File
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
+import io.ktor.client.request.header
 import io.ktor.client.statement.bodyAsText
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -223,6 +224,29 @@ object StremioServer {
         return nowEnabled
     }
 
+    /**
+     * Removes a set of plugin IDs from every profile's disabled / enabledOverrides
+     * sets so that deleted-repo extensions don't linger in user profile data.
+     *
+     * [pluginIds] should contain every identifier variant for the removed plugins
+     * (both nameSlug form and raw CS3 internalName) so the cleanup is thorough.
+     */
+    internal fun cleanRemovedPluginsFromProfiles(pluginIds: Set<String>) {
+        if (pluginIds.isEmpty() || profiles.isEmpty()) return
+        var changed = false
+        val keys = profiles.keys.toList()
+        for (pid in keys) {
+            val rec = profiles[pid] ?: continue
+            val newDisabled = rec.disabled - pluginIds
+            val newOverrides = rec.enabledOverrides - pluginIds
+            if (newDisabled != rec.disabled || newOverrides != rec.enabledOverrides) {
+                profiles[pid] = rec.copy(disabled = newDisabled, enabledOverrides = newOverrides)
+                changed = true
+            }
+        }
+        if (changed) saveProfiles()
+    }
+
     /** Serialises a profile for the user-facing JSON API. */
     private fun profileJson(profileId: String, nowEnabled: Boolean? = null): String {
         val rec = profiles[profileId]
@@ -250,7 +274,7 @@ object StremioServer {
         }
     }
 
-    private fun saveDisabledPlugins() {
+    internal fun saveDisabledPlugins() {
         val file = disabledPluginsFile ?: return
         try {
             val json = serverJson.encodeToString(disabledPlugins)
@@ -411,6 +435,21 @@ object StremioServer {
             get("/") {
                 call.respondText(buildIndexHtml(), ContentType.Text.Html)
             }
+            get("/configure") {
+                call.respondText(buildIndexHtml(), ContentType.Text.Html)
+            }
+
+            // Stats proxy for community donation goal
+            get("/api/community-stats") {
+                try {
+                    val res = httpClient.get("https://cncverse.pages.dev/api/stats") {
+                        header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                    }
+                    call.respondText(res.bodyAsText(), ContentType.Application.Json)
+                } catch (e: Exception) {
+                    call.respondText("{}", ContentType.Application.Json, HttpStatusCode.BadGateway)
+                }
+            }
 
             // ── User profile API (no auth — served from main server for all users) ──
 
@@ -468,7 +507,15 @@ object StremioServer {
                     val repoName = knownRepo?.name?.replace("\"", "\\\"") ?: ""
                     val iconUrl = plugin?.iconUrl?.replace("\"", "\\\"") ?: ""
                     val enabled = !isGloballyDisabled(api)
-                    val typesJson = api.supportedTypes.distinct().joinToString(",") { "\"" + it + "\"" }
+                    // Prefer repo-declared tvTypes (from the plugin metadata JSON) over
+                    // api.supportedTypes at runtime, since runtime types can be buggy
+                    // (e.g. all returning "Others" due to a CS3 issue). The repo manifest
+                    // always has the correct declared types — this is the "direct TVtype".
+                    val typesJson = if (!plugin?.tvTypes.isNullOrEmpty()) {
+                        plugin!!.tvTypes.distinct().joinToString(",") { "\"${it.replace("\"", "\\\"")}\"" }
+                    } else {
+                        api.supportedTypes.distinct().joinToString(",") { "\"" + it + "\"" }
+                    }
                     sb.append("{\"internalName\":\"$id\",\"name\":\"$name\",\"enabled\":$enabled,\"repoUrl\":\"$repoUrl\",\"repoName\":\"$repoName\",\"iconUrl\":\"$iconUrl\",\"types\":[$typesJson]}")
                 }
                 sb.append("]")
@@ -496,50 +543,11 @@ object StremioServer {
                 call.respondText(sb.toString(), ContentType.Application.Json)
             }
 
-            // User-initiated repo install: any visitor can add a repo that is
-            // not installed yet. It is saved globally and every extension it
-            // offers is downloaded automatically, but all of them start
-            // globally disabled — users opt in from their profile.
+            // User-initiated repo install is disabled — repos must be managed by the admin.
             post("/api/repos/add") {
-                val body = try { call.receive<Map<String, String>>() } catch (e: Exception) { emptyMap() }
-                val rawUrl = body["url"]?.trim().orEmpty()
-                if (rawUrl.isEmpty()) {
-                    return@post call.respondText(
-                        "{\"ok\":false,\"message\":\"Missing url\"}",
-                        ContentType.Application.Json, HttpStatusCode.BadRequest
-                    )
-                }
-                val resolved = com.cncverse.stremiobridge.repo.PluginRepository.resolveShortCode(rawUrl)
-                if (com.cncverse.stremiobridge.state.RepoState.repos.value.any { it.url == resolved }) {
-                    return@post call.respondText(
-                        "{\"ok\":false,\"message\":\"That repository is already installed\"}",
-                        ContentType.Application.Json, HttpStatusCode.Conflict
-                    )
-                }
-                val scope = BridgeRuntime.appScope
-                    ?: return@post call.respondText(
-                        "{\"ok\":false,\"message\":\"Bridge runtime is not running\"}",
-                        ContentType.Application.Json, HttpStatusCode.ServiceUnavailable
-                    )
-                scope.launch(Dispatchers.IO) {
-                    val entry = BridgeRuntime.addRepo(
-                        resolved,
-                        saveGlobally = true,
-                        autoInstallAll = true,
-                        disableNewPluginsByDefault = true,
-                    )
-                    when {
-                        entry == null -> ServerState.warn("Repo already installed: $resolved")
-                        entry.error != null -> ServerState.warn("Repo add failed: ${entry.error}")
-                        else -> ServerState.info(
-                            "Repo '${entry.name.ifBlank { entry.url }}' installed globally — " +
-                                "extensions downloaded, disabled by default"
-                        )
-                    }
-                }
                 call.respondText(
-                    "{\"ok\":true,\"message\":\"Adding repository — its extensions will appear in My Profile once downloaded\"}",
-                    ContentType.Application.Json
+                    "{\"ok\":false,\"message\":\"Contact admin to add repo\"}",
+                    ContentType.Application.Json, HttpStatusCode.Forbidden
                 )
             }
 
@@ -716,6 +724,9 @@ object StremioServer {
         .replace(Regex("[^a-zA-Z0-9]"), "")
         .take(48)
         .ifBlank { "unknown" }
+
+    /** Public alias used by WebAdmin to build profile-cleanup ID sets. */
+    internal fun publicNameSlug(name: String) = nameSlug(name)
 
     /**
      * Normalises raw.githubusercontent.com URLs so that variants with and
@@ -1147,6 +1158,118 @@ body {
   border-radius: 999px;
 }
 
+/* Community Donation Goal Bar */
+.goal-card {
+  background: var(--surface-card);
+  border: 1.5px solid var(--border);
+  border-radius: 12px;
+  padding: 11px 16px;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
+  width: 100%;
+  box-sizing: border-box;
+  transition: border-color 0.2s ease, box-shadow 0.2s ease;
+}
+.goal-card:hover {
+  border-color: var(--border-focus);
+}
+.goal-donate-btn {
+  background: linear-gradient(135deg, #f43f5e 0%, #a855f7 100%);
+  color: #ffffff !important;
+  font-size: 12.5px;
+  font-weight: 700;
+  padding: 8px 15px;
+  border-radius: 8px;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  box-shadow: 0 2px 8px rgba(244, 63, 94, 0.28);
+  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
+  cursor: pointer;
+  line-height: 1;
+}
+.goal-donate-btn:hover {
+  filter: brightness(1.1);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(244, 63, 94, 0.42);
+}
+.goal-donate-btn:active {
+  transform: translateY(0);
+}
+.goal-body {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.goal-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.goal-text {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.goal-text b {
+  color: var(--text);
+  font-weight: 700;
+}
+.goal-pct {
+  font-size: 13px;
+  font-weight: 700;
+  color: #f43f5e;
+  flex-shrink: 0;
+  letter-spacing: 0.2px;
+}
+.goal-track {
+  width: 100%;
+  height: 8px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  overflow: hidden;
+}
+[data-theme="light"] .goal-track {
+  background: rgba(0, 0, 0, 0.08);
+}
+.goal-fill {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #f43f5e 0%, #ec4899 35%, #a855f7 70%, #6366f1 100%);
+  transition: width 0.8s cubic-bezier(0.16, 1, 0.3, 1);
+}
+@media (max-width: 520px) {
+  .goal-card {
+    padding: 10px 12px;
+    gap: 10px;
+  }
+  .goal-donate-btn {
+    padding: 6px 11px;
+    font-size: 11.5px;
+    gap: 5px;
+  }
+  .goal-text {
+    font-size: 11.5px;
+  }
+  .goal-pct {
+    font-size: 11.5px;
+  }
+  .goal-track {
+    height: 7px;
+  }
+}
+
 /* Mode Selector (2 Clean Cards) */
 .nav-cards {
   display: grid;
@@ -1243,6 +1366,7 @@ body {
   flex-direction: column;
   gap: 1rem;
   width: 100%;
+  min-width: 0;
 }
 .tab-panel.active { display: flex; }
 
@@ -1484,6 +1608,7 @@ body {
   flex-direction: column;
   gap: 8px;
   width: 100%;
+  min-width: 0;
 }
 .customizer-hdr {
   display: flex;
@@ -1516,16 +1641,80 @@ body {
 }
 .btn-reset-action:hover { text-decoration: underline; }
 
+.presets-wrapper {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-width: 0;
+}
+.presets-nav-btn {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  color: var(--text-sub);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  flex-shrink: 0;
+  padding: 0;
+  transition: all 0.15s ease;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.presets-nav-btn:hover {
+  background: var(--surface-active);
+  border-color: var(--accent);
+  color: var(--text);
+  transform: scale(1.08);
+}
+.presets-nav-btn:active {
+  transform: scale(0.96);
+}
+@media (pointer: coarse) {
+  .presets-nav-btn { display: none !important; }
+}
+
 .presets-row {
   display: flex;
   align-items: center;
   gap: 6px;
   overflow-x: auto;
-  padding-bottom: 2px;
-  scrollbar-width: none;
+  overflow-y: hidden;
+  padding-bottom: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
   width: 100%;
+  min-width: 0;
+  scroll-behavior: smooth;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-x pan-y;
+  cursor: grab;
+  user-select: none;
+  -webkit-user-select: none;
 }
-.presets-row::-webkit-scrollbar { display: none; }
+.presets-row.grabbing {
+  cursor: grabbing;
+  scroll-behavior: auto;
+}
+.presets-row::-webkit-scrollbar {
+  height: 4px;
+}
+.presets-row::-webkit-scrollbar-track {
+  background: transparent;
+}
+.presets-row::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+}
+.presets-row::-webkit-scrollbar-thumb:hover {
+  background: var(--text-dim);
+}
+
 .preset-btn {
   font-size: 11.5px;
   font-weight: 500;
@@ -1538,6 +1727,11 @@ body {
   white-space: nowrap;
   flex-shrink: 0;
   transition: all 0.15s ease;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.presets-row.grabbing .preset-btn {
+  cursor: grabbing;
 }
 .preset-btn:hover { color: var(--text); border-color: var(--border-focus); }
 .preset-btn.active {
@@ -1908,6 +2102,55 @@ body {
   color: var(--text-dim);
   font-size: 13px;
 }
+
+/* Page Footer */
+.page-footer {
+  margin-top: 1.5rem;
+  padding: 1.25rem 0.5rem 0;
+  border-top: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+  text-align: center;
+}
+.footer-author-link {
+  color: var(--text);
+  font-weight: 600;
+  text-decoration: none;
+  border-bottom: 1px dashed var(--accent);
+  padding-bottom: 1px;
+  transition: all 0.15s ease;
+}
+.footer-author-link:hover {
+  color: var(--accent);
+  border-bottom-style: solid;
+}
+.footer-credit {
+  color: var(--text-sub);
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  vertical-align: middle;
+  transform: translateY(1.5px);
+}
+.discord-icon {
+  color: #5865f2;
+  display: inline-block;
+  flex-shrink: 0;
+}
+.footer-sep {
+  color: var(--border-focus);
+}
+.heart-icon {
+  display: inline-block;
+  color: #f43f5e;
+  margin: 0 1px;
+}
 </style>
 </head>
 <body>
@@ -1933,6 +2176,23 @@ body {
       </button>
     </div>
   </header>
+
+  <!-- DONATION GOAL BAR -->
+  <div class="goal-card" id="goal-card" title="CNCVerse Community Goal">
+    <div class="goal-body">
+      <div class="goal-top">
+        <div class="goal-text" id="goal-text">&#36;0 raised of &#36;100 goal</div>
+        <div class="goal-pct" id="goal-pct">0%</div>
+      </div>
+      <div class="goal-track">
+        <div class="goal-fill" id="goal-fill" style="width: 0%;"></div>
+      </div>
+    </div>
+    <a class="goal-donate-btn" href="https://cncverse.pages.dev" target="_blank" rel="noopener">
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+      <span>Donate</span>
+    </a>
+  </div>
 
   <!-- 2-CARD MODE SELECTOR -->
   <nav class="nav-cards">
@@ -2087,11 +2347,16 @@ body {
         </div>
       </div>
 
-      <div class="presets-row" id="presets-row">
-        <button class="preset-btn active" onclick="applyFilter('all', this)">All Sources</button>
-        <button class="preset-btn" onclick="applyFilter('movies', this)">Movies &amp; Series</button>
-        <button class="preset-btn" onclick="applyFilter('anime', this)">Anime</button>
-        <button class="preset-btn" onclick="applyFilter('live', this)">Live TV</button>
+      <div class="presets-wrapper">
+        <button class="presets-nav-btn prev" id="presets-prev" onclick="scrollPresets(-1)" aria-label="Previous filters" style="display:none;" type="button">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>
+        </button>
+        <div class="presets-row" id="presets-row">
+          <button class="preset-btn active" data-filter="all" onclick="applyFilter('all', this)">All Sources</button>
+        </div>
+        <button class="presets-nav-btn next" id="presets-next" onclick="scrollPresets(1)" aria-label="Next filters" style="display:none;" type="button">
+          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
+        </button>
       </div>
 
       <input type="text" class="search-input" id="ext-search" placeholder="Search providers by name, repo, or content tag..." oninput="renderCards()">
@@ -2101,6 +2366,13 @@ body {
       <div class="empty">Loading provider sources...</div>
     </div>
   </main>
+
+  <!-- FOOTER -->
+  <footer class="page-footer">
+    <span>Made with <span class="heart-icon">❤️</span> By <a href="https://t.me/NivinCNC" target="_blank" rel="noopener" class="footer-author-link">NivinCNC</a></span>
+    <span class="footer-sep">&bull;</span>
+    <span>UI By <span class="footer-credit"><svg class="discord-icon" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.929 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.894.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>sleepycat555</span></span>
+  </footer>
 </div>
 
 <!-- REPOSITORIES MODAL -->
@@ -2112,12 +2384,11 @@ body {
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
       </button>
     </div>
-    <div class="modal-hint">Enter a repository URL, GitHub shorthand, or shortcode. Every extension the repo offers downloads automatically.</div>
-    <div class="modal-input-row">
-      <input type="text" id="repo-input" class="modal-input" placeholder="Hexated, user/repo, or repo.json URL" onkeydown="if(event.key==='Enter')addRepo()">
+    <div class="modal-hint">Extension repositories active on this bridge. Contact admin to add new repositories.</div>
+    <div class="modal-input-row" onclick="addRepo()" style="cursor:pointer">
+      <input type="text" id="repo-input" class="modal-input" placeholder="Contact admin to add repo" readonly style="cursor:pointer" onclick="addRepo()">
       <button class="btn-primary" id="repo-add-btn" onclick="addRepo()">Add</button>
     </div>
-    <div style="font-size:11px;color:var(--text-dim)">Shortcuts: <code>Hexated</code> &middot; <code>!pymd</code> &middot; <code>user/repo</code> &middot; <code>user/repo/branch</code></div>
     <div class="repos-list" id="repos-list">
       <div class="empty" style="padding:16px">Loading repositories...</div>
     </div>
@@ -2183,6 +2454,9 @@ function switchTab(tab) {
   if (tab === "customize") {
     var searchInput = document.getElementById("ext-search");
     if (searchInput) searchInput.focus();
+    setTimeout(function() {
+      updatePresetsNav();
+    }, 20);
   }
 }
 
@@ -2212,6 +2486,7 @@ function loadExts() {
     .then(function(data){
       exts = data || [];
       updateMetrics();
+      renderFilterChips();
       renderCards();
     })
     .catch(function(){});
@@ -2265,12 +2540,214 @@ function updateMetrics() {
   if (customBadge) customBadge.textContent = customCount + " of " + exts.length + " Sources Active";
 }
 
+function getExtTypes(e) {
+  var result = [];
+  var rawList = e.types || [];
+  for (var i = 0; i < rawList.length; i++) {
+    var raw = rawList[i];
+    if (!raw) continue;
+    var parts = String(raw).split(",");
+    for (var j = 0; j < parts.length; j++) {
+      var t = parts[j].trim();
+      if (t && t !== "All" && result.indexOf(t) < 0) {
+        result.push(t);
+      }
+    }
+  }
+  if (result.length === 0) {
+    result.push("Others");
+  }
+  return result;
+}
+
+function getAvailableTypes() {
+  var set = new Set();
+  for (var i = 0; i < exts.length; i++) {
+    var types = getExtTypes(exts[i]);
+    for (var j = 0; j < types.length; j++) {
+      set.add(types[j]);
+    }
+  }
+  return set;
+}
+
+var PREFERRED_ORDER = [
+  "Movie", "TvSeries", "Anime", "AnimeMovie", "Live", "AsianDrama",
+  "Cartoon", "Documentary", "OVA", "Torrent", "Music", "Audio", "NSFW", "Others"
+];
+
+var TYPE_LABELS = {
+  "Movie": "Movies",
+  "TvSeries": "Series",
+  "Anime": "Anime",
+  "AnimeMovie": "Anime Movie",
+  "Live": "Live TV",
+  "AsianDrama": "Asian Drama",
+  "Cartoon": "Cartoons",
+  "Documentary": "Documentary",
+  "OVA": "OVA",
+  "Torrent": "Torrents",
+  "Music": "Music",
+  "Audio": "Audio",
+  "NSFW": "NSFW",
+  "Others": "Others"
+};
+
+function renderFilterChips() {
+  var row = document.getElementById("presets-row");
+  if (!row) return;
+
+  var available = getAvailableTypes();
+  if (currentFilter !== "all" && !available.has(currentFilter)) {
+    currentFilter = "all";
+  }
+
+  var ordered = [];
+  for (var k = 0; k < PREFERRED_ORDER.length; k++) {
+    var pt = PREFERRED_ORDER[k];
+    if (available.has(pt)) {
+      ordered.push(pt);
+      available.delete(pt);
+    }
+  }
+  var remaining = Array.from(available).sort();
+  for (var r = 0; r < remaining.length; r++) {
+    ordered.push(remaining[r]);
+  }
+
+  var html = '<button class="preset-btn' + (currentFilter === "all" ? " active" : "") + '" data-filter="all" onclick="applyFilter(\'all\', this)">All Sources</button>';
+
+  for (var i = 0; i < ordered.length; i++) {
+    var t = ordered[i];
+    var label = TYPE_LABELS[t] || t;
+    var isActive = (currentFilter === t);
+    html += '<button class="preset-btn' + (isActive ? " active" : "") + '" data-filter="' + esc(t) + '" onclick="applyFilter(\'' + esc(t) + '\', this)">' + esc(label) + '</button>';
+  }
+
+  if (row.innerHTML !== html) {
+    var prevScroll = row.scrollLeft;
+    row.innerHTML = html;
+    row.scrollLeft = prevScroll;
+  }
+  initPresetsDrag();
+  updatePresetsNav();
+}
+
 function applyFilter(f, btn) {
   currentFilter = f;
   var btns = document.querySelectorAll(".preset-btn");
+  var activeBtn = null;
   for (var i = 0; i < btns.length; i++) btns[i].classList.remove("active");
-  if (btn) btn.classList.add("active");
+  if (btn) {
+    btn.classList.add("active");
+    activeBtn = btn;
+  } else {
+    for (var j = 0; j < btns.length; j++) {
+      if (btns[j].getAttribute("data-filter") === f) {
+        btns[j].classList.add("active");
+        activeBtn = btns[j];
+      }
+    }
+  }
+  if (activeBtn && activeBtn.scrollIntoView) {
+    activeBtn.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+  }
+  updatePresetsNav();
   renderCards();
+}
+
+function scrollPresets(dir) {
+  var row = document.getElementById("presets-row");
+  if (!row) return;
+  row.scrollBy({ left: dir * 220, behavior: "smooth" });
+  setTimeout(updatePresetsNav, 320);
+}
+
+function updatePresetsNav() {
+  var row = document.getElementById("presets-row");
+  var prev = document.getElementById("presets-prev");
+  var next = document.getElementById("presets-next");
+  if (!row || !prev || !next) return;
+  if (row.clientWidth === 0) return;
+  var maxScroll = row.scrollWidth - row.clientWidth;
+  if (maxScroll <= 2) {
+    prev.style.display = "none";
+    next.style.display = "none";
+    return;
+  }
+  prev.style.display = (row.scrollLeft > 4) ? "flex" : "none";
+  next.style.display = (row.scrollLeft < maxScroll - 4) ? "flex" : "none";
+}
+
+function initPresetsDrag() {
+  var row = document.getElementById("presets-row");
+  if (!row || row._dragInited) return;
+  row._dragInited = true;
+
+  var isDown = false;
+  var startX = 0;
+  var scrollLeft = 0;
+  var hasMoved = false;
+
+  row.addEventListener("mousedown", function(e) {
+    if (e.button !== 0) return;
+    isDown = true;
+    hasMoved = false;
+    startX = e.pageX - row.offsetLeft;
+    scrollLeft = row.scrollLeft;
+    row.classList.add("grabbing");
+  });
+
+  window.addEventListener("mouseup", function() {
+    if (isDown) {
+      isDown = false;
+      row.classList.remove("grabbing");
+      setTimeout(function() { hasMoved = false; }, 60);
+    }
+  });
+
+  window.addEventListener("mousemove", function(e) {
+    if (!isDown) return;
+    var x = e.pageX - row.offsetLeft;
+    var walk = (x - startX);
+    if (Math.abs(walk) > 4) {
+      hasMoved = true;
+    }
+    if (hasMoved) {
+      e.preventDefault();
+      row.scrollLeft = scrollLeft - walk;
+      updatePresetsNav();
+    }
+  });
+
+  row.addEventListener("dragstart", function(e) {
+    e.preventDefault();
+  });
+
+  row.addEventListener("click", function(e) {
+    if (hasMoved) {
+      e.preventDefault();
+      e.stopPropagation();
+      hasMoved = false;
+    }
+  }, true);
+
+  row.addEventListener("wheel", function(e) {
+    if (e.deltaY !== 0) {
+      var maxScroll = row.scrollWidth - row.clientWidth;
+      if (maxScroll > 0) {
+        var canScroll = (e.deltaY > 0 && row.scrollLeft < maxScroll - 1) || (e.deltaY < 0 && row.scrollLeft > 1);
+        if (canScroll) {
+          e.preventDefault();
+          row.scrollLeft += (e.deltaY * 0.9);
+          updatePresetsNav();
+        }
+      }
+    }
+  }, { passive: false });
+
+  row.addEventListener("scroll", updatePresetsNav);
+  window.addEventListener("resize", updatePresetsNav);
 }
 
 function renderCards() {
@@ -2289,8 +2766,8 @@ function renderCards() {
           ? '<img class="p-icon-img" src="' + esc(e.iconUrl) + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" alt=""><div class="p-avatar" style="display:none">' + esc(initial) + '</div>'
           : '<div class="p-avatar">' + esc(initial) + '</div>';
 
-        var typeBadges = (e.types || []).map(function(t){
-          return '<span class="p-type-tag">' + esc(t) + '</span>';
+        var typeBadges = getExtTypes(e).map(function(t){
+          return '<span class="p-type-tag">' + esc(TYPE_LABELS[t] || t) + '</span>';
         }).join("");
 
         return '<div class="overview-source-card" onclick="switchTab(\'customize\')">' +
@@ -2319,12 +2796,9 @@ function renderCards() {
         var matchDesc = (e.description || "").toLowerCase().indexOf(q) >= 0;
         if (!matchName && !matchRepo && !matchDesc) return false;
       }
-      if (currentFilter === "movies") {
-        return (e.types || []).some(function(t){ return /movie|series|tv/i.test(t); });
-      } else if (currentFilter === "anime") {
-        return (e.types || []).some(function(t){ return /anime/i.test(t); }) || /anime/i.test(e.name);
-      } else if (currentFilter === "live") {
-        return (e.types || []).some(function(t){ return /live|stream|iptv/i.test(t); }) || /live|iptv|tv/i.test(e.name);
+      if (currentFilter !== "all") {
+        var types = getExtTypes(e);
+        if (types.indexOf(currentFilter) < 0) return false;
       }
       return true;
     });
@@ -2342,8 +2816,8 @@ function renderCards() {
 
         var chkHtml = '<div class="chk"><svg class="chk-svg" width="10" height="8" viewBox="0 0 10 8" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4.2L3.5 6.7L9 1.2"/></svg></div>';
 
-        var typeBadges = (e.types || []).map(function(t){
-          return '<span class="p-type-tag">' + esc(t) + '</span>';
+        var typeBadges = getExtTypes(e).map(function(t){
+          return '<span class="p-type-tag">' + esc(TYPE_LABELS[t] || t) + '</span>';
         }).join("");
 
         var goffBadge = !e.enabled ? '<span class="p-tag-goff">Global Off</span>' : '';
@@ -2524,34 +2998,7 @@ function normalizeRepoUrl(raw) {
 }
 
 function addRepo() {
-  var input = document.getElementById("repo-input");
-  var url = normalizeRepoUrl(input ? input.value : "");
-  if (!url) { toast("Please enter a valid repository URL"); return; }
-
-  var btn = document.getElementById("repo-add-btn");
-  if (btn) { btn.disabled = true; btn.textContent = "Adding..."; }
-
-  fetch("/api/repos/add", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ url: url })
-  }).then(function(r){ return r.json(); })
-    .then(function(res){
-      toast(res.message || "Adding repository...");
-      if (input) input.value = "";
-      loadRepos();
-      loadExts();
-      var count = 0;
-      var interval = setInterval(function(){
-        loadRepos();
-        loadExts();
-        if (++count > 10) clearInterval(interval);
-      }, 3000);
-    })
-    .catch(function(err){ toast("Error: " + err.message); })
-    .finally(function(){
-      if (btn) { btn.disabled = false; btn.textContent = "Add"; }
-    });
+  toast("Contact admin to add repo");
 }
 
 function esc(s) {
@@ -2567,11 +3014,62 @@ function toast(msg) {
   el._t = setTimeout(function(){ el.classList.remove("show"); }, 2400);
 }
 
+function loadStats() {
+  function applyStats(data) {
+    if (!data) return;
+    var target = typeof data.targetGoalUsd === "number" ? data.targetGoalUsd : 100;
+    var total = typeof data.totalUsd === "number" ? data.totalUsd : 0;
+    var pct = typeof data.percent === "number" ? data.percent : Math.round((total / (target || 1)) * 100);
+    if (pct < 0) pct = 0;
+
+    var curSym = String.fromCharCode(36);
+    var raisedText = curSym + (total % 1 === 0 ? total.toFixed(0) : total.toFixed(2));
+    var targetText = curSym + (target % 1 === 0 ? target.toFixed(0) : target.toFixed(2));
+
+    var textEl = document.getElementById("goal-text");
+    if (textEl) {
+      textEl.innerHTML = "<b>" + esc(raisedText) + "</b> raised of <b>" + esc(targetText) + "</b> goal";
+    }
+    var pctEl = document.getElementById("goal-pct");
+    if (pctEl) {
+      pctEl.textContent = pct + "%";
+    }
+    var fillEl = document.getElementById("goal-fill");
+    if (fillEl) {
+      fillEl.style.width = Math.min(100, Math.max(0, pct)) + "%";
+    }
+    var card = document.getElementById("goal-card");
+    if (card && data.month) {
+      var note = data.month + " Goal";
+      if (data.supporterCount) note += " · " + data.supporterCount + " supporters";
+      card.setAttribute("title", note);
+    }
+  }
+
+  fetch("https://cncverse.pages.dev/api/stats")
+    .then(function(r) {
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      return r.json();
+    })
+    .then(function(data) {
+      applyStats(data);
+    })
+    .catch(function() {
+      fetch("/api/community-stats")
+        .then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+        .then(function(data) { applyStats(data); })
+        .catch(function() {});
+    });
+}
+
+initPresetsDrag();
 updateUrls();
 loadExts();
 loadRepos();
 loadProfile();
+loadStats();
 setInterval(function(){ loadExts(); loadRepos(); }, 15000);
+setInterval(function(){ loadStats(); }, 60000);
 </script>
 </body>
 </html>"""
