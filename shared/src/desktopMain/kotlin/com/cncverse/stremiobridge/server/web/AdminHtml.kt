@@ -241,7 +241,7 @@ select:focus{border-color:var(--violet)}
 <div class="modal-overlay" id="add-repo-modal" onclick="if(event.target===this)closeAddRepoModal()">
   <div class="modal-box" style="max-width:480px">
     <div class="modal-title">➕ Add Repository<button class="modal-close" onclick="closeAddRepoModal()" title="Close">&times;</button></div>
-    <div class="hint" style="margin-bottom:14px">Enter a full URL, GitHub shorthand, or cutt.ly shortcode.</div>
+    <div class="hint" style="margin-bottom:14px">Enter a full URL, GitHub shorthand, or cutt.ly shortcode. Every extension the repo offers is downloaded automatically.</div>
     <input type="text" id="add-repo-input" placeholder="https://raw.githubusercontent.com/…/repo.json" style="width:100%;box-sizing:border-box;margin-bottom:6px" onkeydown="if(event.key===\'Enter\')submitAddRepo()">
     <div class="muted" style="font-size:11.5px;margin-bottom:14px">Shortcuts: <code>user/repo</code> &middot; <code>user/repo/branch</code> &middot; <code>Hexated</code> (cutt.ly) &middot; <code>!pymd</code> (py.md)</div>
     <div class="row" style="gap:10px">
@@ -468,7 +468,7 @@ function renderExtensions() {
   var html = "";
 
   // ── Repos section ──
-  html += '<div class="card"><h2>&#128230; Repositories</h2><div class="hint">CloudStream extension repos. All repos added here are saved globally.</div>';
+  html += '<div class="card"><h2>&#128230; Repositories</h2><div class="hint">CloudStream extension repos. Added repos are saved globally and all their extensions download automatically. Disabling an extension keeps it installed but hides it from the global manifest — users can still add it to their own profile.</div>';
   html += '<div class="row" style="margin-bottom:12px">';
   html += '<button class="primary small" onclick="openAddRepoModal()">&#43; Add repo</button>';
 

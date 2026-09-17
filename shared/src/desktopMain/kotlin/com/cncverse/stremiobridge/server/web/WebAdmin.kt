@@ -207,11 +207,15 @@ object WebAdmin {
                 if (url.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing url"))
                 val saveGlobally = body.saveGlobally ?: true
                 scope().launch {
-                    val entry = RepoManager.addRepo(url, saveGlobally = saveGlobally)
+                    val entry = BridgeRuntime.addRepo(url, saveGlobally = saveGlobally, autoInstallAll = true)
                     if (!saveGlobally) localOnlyRepos.add(url)
-                    if (entry?.error != null) ServerState.warn("Repo add failed: ${entry.error}")
+                    when {
+                        entry == null -> ServerState.warn("Repo already installed: $url")
+                        entry.error != null -> ServerState.warn("Repo add failed: ${entry.error}")
+                        else -> ServerState.info("Repo '${entry.name.ifBlank { entry.url }}' added — downloading all its extensions…")
+                    }
                 }
-                call.respond(AdminActionResult(true, "Adding repo…"))
+                call.respond(AdminActionResult(true, "Adding repo — downloading all extensions…"))
             }
 
             post("/repos/remove") {
@@ -231,8 +235,8 @@ object WebAdmin {
                 val url = body.url?.trim().orEmpty()
                 if (url.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing url"))
                 localOnlyRepos.remove(url)
-                // Re-add through manager with global persistence
-                scope().launch { RepoManager.addRepo(url, saveGlobally = true) }
+                // Re-add through manager with global persistence (+ auto-install)
+                scope().launch { BridgeRuntime.addRepo(url, saveGlobally = true, autoInstallAll = true) }
                 call.respond(AdminActionResult(true, "Repo saved globally"))
             }
 
@@ -268,20 +272,15 @@ object WebAdmin {
                 call.respond(AdminActionResult(true, "Installing…"))
             }
 
-            // Install every extension from a specific repo
+            // Install every extension from a specific repo (single hot-reload at the end)
             post("/plugins/install-all-from-repo") {
                 if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
                 val body = call.receive<AdminActionRequest>()
                 val repoUrl = body.repoUrl?.trim().orEmpty()
                 if (repoUrl.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing repoUrl"))
                 scope().launch {
-                    val toInstall = RepoState.availablePlugins.value.filter { it.repoEntry.url == repoUrl }
-                    ServerState.info("Installing all ${toInstall.size} extension(s) from repo: $repoUrl")
-                    toInstall.forEach { ap ->
-                        if (RepoState.getInstallState(ap.plugin.internalName) !is PluginInstallState.Installed) {
-                            BridgeRuntime.installPlugin(ap)
-                        }
-                    }
+                    val installed = BridgeRuntime.installAllFromRepo(repoUrl)
+                    ServerState.info("Install-all finished for $repoUrl: $installed new extension(s)")
                 }
                 call.respond(AdminActionResult(true, "Installing all extensions from repo…"))
             }
@@ -328,8 +327,11 @@ object WebAdmin {
             get("/profile/{profileId}") {
                 if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
                 val profileId = call.parameters["profileId"] ?: return@get call.respond(AdminActionResult(false, "Missing profileId"))
-                val disabled = StremioServer.getProfileDisabled(profileId)
-                call.respond(AdminProfile(profileId = profileId, disabledExtensions = disabled))
+                call.respond(AdminProfile(
+                    profileId = profileId,
+                    disabledExtensions = StremioServer.getProfileDisabled(profileId),
+                    enabledExtensions = StremioServer.getProfileEnabledOverrides(profileId),
+                ))
             }
 
             // Toggle an extension for the calling profile (does not affect global install).
@@ -338,9 +340,12 @@ object WebAdmin {
                 val profileId = call.parameters["profileId"] ?: return@post call.respond(AdminActionResult(false, "Missing profileId"))
                 val body = call.receive<AdminActionRequest>()
                 val internalName = body.internalName ?: return@post call.respond(AdminActionResult(false, "Missing internalName"))
-                val nowEnabled = StremioServer.toggleProfilePlugin(profileId, internalName)
-                val disabled = StremioServer.getProfileDisabled(profileId)
-                call.respond(AdminProfile(profileId = profileId, disabledExtensions = disabled))
+                StremioServer.toggleProfilePlugin(profileId, internalName)
+                call.respond(AdminProfile(
+                    profileId = profileId,
+                    disabledExtensions = StremioServer.getProfileDisabled(profileId),
+                    enabledExtensions = StremioServer.getProfileEnabledOverrides(profileId),
+                ))
             }
 
             // ── Plugin settings ─────────────────────────────────────────────
@@ -534,7 +539,7 @@ object WebAdmin {
                 tvTypes = inst.tvTypes,
                 language = inst.language,
                 description = inst.description,
-                enabled = StremioServer.disabledPlugins.none { it == inst.internalName },
+                enabled = !StremioServer.isIdGloballyDisabled(inst.internalName),
                 apiRegistered = loaded?.apiRegistered ?: false,
                 hasSettings = loaded?.hasSettings ?: false,
                 updateAvailable = installState is PluginInstallState.UpdateAvailable,

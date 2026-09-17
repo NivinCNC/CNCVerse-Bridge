@@ -48,6 +48,7 @@ fun main(args: Array<String>): Unit = runBlocking {
     val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     BridgeRuntime.cacheDir = CACHE_DIR
     BridgeRuntime.appScope = scope
+    BridgeRuntime.headlessMode = true
     WebAdmin.appScope = scope
     WebAdmin.preferredPort = port
     WebAdmin.headlessMode = true   // web admin is always on in server mode

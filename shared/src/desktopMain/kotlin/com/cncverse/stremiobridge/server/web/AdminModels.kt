@@ -105,13 +105,16 @@ data class AdminAvailablePlugin(
 
 /**
  * A per-browser-session profile: stores which extensions the user has disabled
- * in their personal manifest. Globally installed extensions remain installed;
- * only the manifest they receive omits the disabled ones.
+ * in their personal manifest, plus which globally-disabled extensions they
+ * have explicitly opted into. Globally installed extensions remain installed;
+ * only the manifest they receive differs.
  */
 @Serializable
 data class AdminProfile(
     val profileId: String,
     val disabledExtensions: Set<String> = emptySet(),
+    /** Globally-disabled extensions this profile has explicitly opted into. */
+    val enabledExtensions: Set<String> = emptySet(),
 )
 
 // ─── Plugin settings ──────────────────────────────────────────────────────────

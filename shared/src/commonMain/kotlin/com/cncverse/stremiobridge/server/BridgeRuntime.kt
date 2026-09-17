@@ -5,6 +5,7 @@ import com.cncverse.stremiobridge.repo.PluginInstaller
 import com.cncverse.stremiobridge.repo.RepoManager
 import com.cncverse.stremiobridge.state.AvailablePlugin
 import com.cncverse.stremiobridge.state.PluginInstallState
+import com.cncverse.stremiobridge.state.RepoEntry
 import com.cncverse.stremiobridge.state.RepoState
 import com.cncverse.stremiobridge.state.ServerState
 import com.cncverse.stremiobridge.state.ServerStatus
@@ -20,6 +21,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import java.io.File
 import java.net.Inet4Address
 import java.net.NetworkInterface
 
@@ -34,6 +36,10 @@ object BridgeRuntime {
     /** Cache dir holding installed plugins (must be set by the app entrypoint). */
     @Volatile
     var cacheDir: String = ""
+
+    /** True when running as the UI-less server app (set by the headless entrypoint). */
+    @Volatile
+    var headlessMode: Boolean = false
 
     /** Scope used for background work (server supervision, repo refreshes). */
     @Volatile
@@ -111,6 +117,63 @@ object BridgeRuntime {
     }
 
     /**
+     * Adds a repository and auto-installs every extension it publishes.
+     *
+     * @param disableNewPluginsByDefault keep the freshly installed extensions
+     *   out of the global manifest — users opt in from their profile (used for
+     *   user-initiated installs); pass false for admin installs.
+     * @return the fetched [RepoEntry] (with `.error` set when the fetch
+     *   failed), or null when the URL was already installed.
+     */
+    suspend fun addRepo(
+        url: String,
+        saveGlobally: Boolean = true,
+        autoInstallAll: Boolean = true,
+        disableNewPluginsByDefault: Boolean = false,
+    ): RepoEntry? {
+        val entry = RepoManager.addRepo(url, saveGlobally = saveGlobally) ?: return null
+        if (entry.error != null) return entry
+        if (autoInstallAll) {
+            val installed = installAllFromRepo(entry.url, disableNewPluginsByDefault)
+            ServerState.info(
+                "Repo '" + entry.name.ifBlank { entry.url } + "': " + installed +
+                    " extension(s) available locally" +
+                    (if (disableNewPluginsByDefault) " (disabled by default — opt in via profiles)" else "")
+            )
+        }
+        return entry
+    }
+
+    /**
+     * Installs every extension offered by [repoUrl] that is not installed yet
+     * and hot-reloads the plugin set once at the end. Returns how many
+     * extensions were newly installed.
+     */
+    suspend fun installAllFromRepo(repoUrl: String, disableNewPluginsByDefault: Boolean = false): Int {
+        val before = RepoState.installedPlugins.value.map { it.internalName }.toSet()
+        val toInstall = RepoState.availablePlugins.value.filter {
+            it.repoEntry.url == repoUrl && it.plugin.internalName !in before
+        }
+        if (toInstall.isEmpty()) return 0
+        ServerState.info("Downloading " + toInstall.size + " extension(s) from " + repoUrl)
+        var ok = 0
+        toInstall.forEach { ap ->
+            if (PluginInstaller.installPlugin(ap, cacheDir)) ok++
+        }
+        if (ok > 0) {
+            if (disableNewPluginsByDefault) {
+                RepoState.installedPlugins.value
+                    .filter { it.repoUrl == repoUrl && it.internalName !in before }
+                    .forEach { StremioServer.setPluginDisabled(it.internalName, disabled = true) }
+                ServerState.info("$ok new extension(s) disabled by default (enable per profile or via admin)")
+            }
+            ServerState.info("Loading $ok new extension(s)…")
+            forceReloadPlugins()
+        }
+        return ok
+    }
+
+    /**
      * Mirrors the Android StremioForegroundService.startBridge flow:
      *  1. Load installed plugin registry from disk
      *  2. Refresh repos (background, non-blocking) + auto-update outdated plugins
@@ -138,6 +201,17 @@ object BridgeRuntime {
                     ServerState.info("Auto-updating ${toUpdate.size} plugin(s)…")
                     PluginInstaller.autoUpdateInstalled(cacheDir)
                     forceReloadPlugins()
+                }
+
+                // Fresh headless install (no installed_plugins.json on disk yet):
+                // download everything the configured repos offer so the server
+                // works out of the box — "install a repo, get all its extensions".
+                if (headlessMode && !File(cacheDir, "installed_plugins.json").exists()) {
+                    val repoUrls = RepoState.availablePlugins.value.map { it.repoEntry.url }.distinct()
+                    if (repoUrls.isNotEmpty()) {
+                        ServerState.info("Fresh install — downloading all extensions from ${repoUrls.size} repo(s)…")
+                        repoUrls.forEach { installAllFromRepo(it) }
+                    }
                 }
             }.onFailure { e ->
                 ServerState.warn("Repo refresh error: ${e.message}")
