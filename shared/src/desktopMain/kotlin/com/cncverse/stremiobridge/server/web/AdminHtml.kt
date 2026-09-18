@@ -24,6 +24,9 @@ object AdminHtml {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
 <title>CNCVerse Bridge — Admin Panel</title>
+<link rel="icon" type="image/png" href="/logo.png">
+<link rel="shortcut icon" href="/logo.png">
+<link rel="apple-touch-icon" href="/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -137,6 +140,13 @@ header {
   font-weight: 800; font-size: 11px;
   color: var(--accent); letter-spacing: -0.5px;
   flex: 0 0 32px;
+  overflow: hidden;
+}
+.logo-box-img {
+  width: 24px;
+  height: 24px;
+  object-fit: contain;
+  display: block;
 }
 .hdr-title-wrap { display: flex; flex-direction: column; min-width: 0; }
 .hdr-title {
@@ -815,7 +825,9 @@ main#view {
 <div class="sticky-nav-header">
   <header>
     <div class="hdr-brand">
-      <div class="logo-box">CNC</div>
+      <div class="logo-box">
+        <img src="/logo.png" alt="CNCVerse Logo" class="logo-box-img" onerror="this.style.display='none'; this.parentElement.innerText='CNC';">
+      </div>
       <div class="hdr-title-wrap">
         <div class="hdr-title">CNCVerse Bridge</div>
         <div class="hdr-sub" id="subtitle">Admin Panel</div>

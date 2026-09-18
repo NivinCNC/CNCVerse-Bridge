@@ -30,6 +30,8 @@ import io.ktor.server.engine.embeddedServer
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.request.receive
 import io.ktor.server.response.respond
+import io.ktor.server.response.respondBytes
+import io.ktor.server.response.respondRedirect
 import io.ktor.server.response.respondText
 import io.ktor.server.routing.Route
 import io.ktor.server.routing.get
@@ -112,6 +114,23 @@ object WebAdmin {
     // ─────────────────────────────────────────────────────────────────────────
 
     fun Route.adminRoutes() {
+        get("/logo.png") {
+            val bytes = StremioServer.logoBytes
+            if (bytes != null) {
+                call.respondBytes(bytes, ContentType.Image.PNG)
+            } else {
+                call.respondRedirect("https://raw.githubusercontent.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/refs/heads/builds/cnc.png")
+            }
+        }
+        get("/favicon.ico") {
+            val bytes = StremioServer.logoBytes
+            if (bytes != null) {
+                call.respondBytes(bytes, ContentType.Image.PNG)
+            } else {
+                call.respondRedirect("https://raw.githubusercontent.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/refs/heads/builds/cnc.png")
+            }
+        }
+
         get("/admin") {
             if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
             call.respondText(AdminHtml.page, ContentType.Text.Html)

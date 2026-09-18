@@ -97,6 +97,17 @@ object StremioServer {
      */
     val homePageCatalogCache: MutableMap<String, List<StremioMeta>> = ConcurrentHashMap()
 
+    /**
+     * Cached binary bytes for the official CNCVerse logo / favicon.
+     */
+    val logoBytes: ByteArray? by lazy {
+        runCatching {
+            Thread.currentThread().contextClassLoader?.getResourceAsStream("logo.png")?.readBytes()
+                ?: File("logo.png").takeIf { it.exists() }?.readBytes()
+                ?: File("shared/src/commonMain/resources/logo.png").takeIf { it.exists() }?.readBytes()
+        }.getOrNull()
+    }
+
     private val manifestRefreshScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private var periodicRefreshJob: kotlinx.coroutines.Job? = null
     private val isRefreshing = AtomicBoolean(false)
@@ -465,6 +476,22 @@ object StremioServer {
             }
             get("/configure") {
                 call.respondText(buildIndexHtml(), ContentType.Text.Html)
+            }
+            get("/logo.png") {
+                val bytes = logoBytes
+                if (bytes != null) {
+                    call.respondBytes(bytes, ContentType.Image.PNG)
+                } else {
+                    call.respondRedirect("https://raw.githubusercontent.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/refs/heads/builds/cnc.png")
+                }
+            }
+            get("/favicon.ico") {
+                val bytes = logoBytes
+                if (bytes != null) {
+                    call.respondBytes(bytes, ContentType.Image.PNG)
+                } else {
+                    call.respondRedirect("https://raw.githubusercontent.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/refs/heads/builds/cnc.png")
+                }
             }
 
             // Stats proxy for community donation goal
@@ -1283,6 +1310,9 @@ object StremioServer {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
 <title>CNCVerse Bridge</title>
+<link rel="icon" type="image/png" href="/logo.png">
+<link rel="shortcut icon" href="/logo.png">
+<link rel="apple-touch-icon" href="/logo.png">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -1369,17 +1399,44 @@ body {
   justify-content: space-between;
   padding-bottom: 0.1rem;
 }
+.brand-wrap {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.brand-logo-container {
+  width: 42px;
+  height: 42px;
+  border-radius: 12px;
+  background: rgba(99, 102, 241, 0.12);
+  border: 1px solid rgba(99, 102, 241, 0.25);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.15);
+  overflow: hidden;
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+.brand-logo-container:hover {
+  transform: scale(1.05);
+  box-shadow: 0 6px 20px rgba(99, 102, 241, 0.25);
+}
+.brand-logo {
+  width: 30px;
+  height: 30px;
+  object-fit: contain;
+  display: block;
+}
 .brand-title {
   font-size: 1.55rem;
   font-weight: 800;
   color: var(--text);
   letter-spacing: -0.5px;
-  margin: 0 0 2px;
+  margin: 0;
+  line-height: 1.2;
 }
-@media (max-width: 680px) {
-  .brand-title { font-size: 1.3rem; }
-}
-.brand-sub { font-size: 12.5px; color: var(--text-sub); margin: 0; }
 .hdr-actions {
   display: flex;
   align-items: center;
@@ -1409,6 +1466,39 @@ body {
   color: var(--accent);
   padding: 1px 6px;
   border-radius: 999px;
+}
+@media (max-width: 680px) {
+  .brand-wrap {
+    gap: 8px;
+  }
+  .brand-logo-container {
+    width: 32px;
+    height: 32px;
+    border-radius: 8px;
+  }
+  .brand-logo {
+    width: 22px;
+    height: 22px;
+  }
+  .brand-title {
+    font-size: 1.18rem;
+    white-space: nowrap;
+    margin: 0;
+  }
+  .hdr-actions {
+    gap: 6px;
+  }
+  .btn-hdr {
+    padding: 6px 9px;
+    border-radius: 7px;
+  }
+  .btn-hdr-text {
+    display: none;
+  }
+  .hdr-badge {
+    padding: 1px 5px;
+    font-size: 9px;
+  }
 }
 
 /* Community Donation Goal Bar */
@@ -2411,14 +2501,16 @@ body {
 <div class="container">
   <!-- HEADER -->
   <header class="hdr">
-    <div>
+    <div class="brand-wrap">
+      <div class="brand-logo-container">
+        <img src="/logo.png" alt="CNCVerse Logo" class="brand-logo" onerror="this.src='https://raw.githubusercontent.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/refs/heads/builds/cnc.png'">
+      </div>
       <h1 class="brand-title">CNCVerse Bridge</h1>
-      <p class="brand-sub">Universal CloudStream provider gateway for Stremio &amp; Nuvio</p>
     </div>
     <div class="hdr-actions">
       <button class="btn-hdr" onclick="openReposModal()" title="Extension Repositories">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
-        <span>Repos</span>
+        <span class="btn-hdr-text">Repos</span>
         <span class="hdr-badge" id="hdr-repo-count">0</span>
       </button>
       <a class="btn-hdr" href="https://t.me/cncverse" target="_blank" rel="noopener" title="Telegram Community">
