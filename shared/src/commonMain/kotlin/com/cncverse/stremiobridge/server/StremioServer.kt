@@ -31,6 +31,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import java.net.BindException
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -676,7 +677,7 @@ object StremioServer {
         val id   = parameters["id"]   ?: return respond(HttpStatusCode.BadRequest)
 
         val streams = withContext(Dispatchers.IO) { buildStreams(type, id, profileId) }
-        respond(StremioStreamResponse(streams))
+        respond(StremioStreamResponse(sortStreamsByQuality(streams)))
     }
 
     private suspend fun ApplicationCall.respondSubtitles(profileId: String?) {
@@ -882,29 +883,81 @@ object StremioServer {
     }
 
 
+    // ── Quality sorting ───────────────────────────────────────────────────────
+
+    /**
+     * Extracts a quality rank from a stream's name or title.
+     * Higher rank = better quality. Used to sort streams best-first.
+     */
+    private fun streamQualityRank(stream: StremioStream): Int {
+        val text = "${stream.name.orEmpty()} ${stream.title.orEmpty()}".uppercase()
+        return when {
+            Regex("4K|2160P|UHD").containsMatchIn(text)  -> 5
+            Regex("1080P|FHD").containsMatchIn(text)     -> 4
+            Regex("720P|HD").containsMatchIn(text)       -> 3
+            Regex("480P|SD").containsMatchIn(text)       -> 2
+            Regex("360P|240P").containsMatchIn(text)     -> 1
+            else                                          -> 0
+        }
+    }
+
+    private fun sortStreamsByQuality(streams: List<StremioStream>): List<StremioStream> =
+        streams.sortedByDescending { streamQualityRank(it) }
+        
+    // ── Main stream builder ───────────────────────────────────────────────────
+
+    /**
+     * Deadline-based parallel stream loader.
+     * All providers start concurrently; each appends to a shared list as it
+     * finishes. After [STREAM_DEADLINE_MS] any still-running jobs are
+     * cancelled and whatever has accumulated is returned — so Stremio always
+     * gets a response well within its 60-second addon timeout.
+     */
+    private val STREAM_DEADLINE_MS = 50_000L
+
     private suspend fun buildStreams(type: String, id: String, profileId: String? = null): List<StremioStream> {
         val decoded = StremioIds.decode(id)
         if (decoded != null) {
             val (pluginKey, dataUrl) = decoded
-            val api = loadedApis.find { nameSlug(it.name) == pluginKey }
-                ?: loadedApis.find { it.internalName == pluginKey }
-                ?: return emptyList()
-            if (isPluginBlocked(api, profileId)) return emptyList()
-            return try {
-                api.loadLinks(dataUrl)
-            } catch (e: Throwable) {
-                ServerState.warn("Stream error for ${api.name}: ${e.message}")
-                emptyList()
+            val matchingApis = loadedApis.filter { api ->
+                nameSlug(api.name) == pluginKey || api.internalName == pluginKey
+            }.filter { !isPluginBlocked(it, profileId) }
+
+            if (matchingApis.isEmpty()) return emptyList()
+            ServerState.info("Parallel stream load: ${matchingApis.size} API(s) for key '$pluginKey'")
+
+            val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
+            kotlinx.coroutines.supervisorScope {
+                val jobs = matchingApis.map { api ->
+                    launch {
+                        try {
+                            ServerState.info("[${api.name}] Loading links for $dataUrl")
+                            val links = api.loadLinks(dataUrl)
+                            ServerState.info("[${api.name}] Got ${links.size} stream(s)")
+                            accumulated.addAll(links)
+                        } catch (e: Throwable) {
+                            ServerState.warn("[${api.name}] Stream error: ${e.message}")
+                        }
+                    }
+                }
+                // Wait for all, but honour the 50-second hard deadline
+                withTimeoutOrNull(STREAM_DEADLINE_MS) { jobs.forEach { it.join() } }
+                val remaining = jobs.count { it.isActive }
+                if (remaining > 0) {
+                    ServerState.warn("Deadline reached — cancelling $remaining slow provider(s), returning ${accumulated.size} stream(s)")
+                    jobs.forEach { it.cancel() }
+                }
             }
+            return sortStreamsByQuality(accumulated)
         }
 
         // Handle generic Stremio requests with TMDB/IMDB IDs
         val baseId = id.substringBefore(":")
         val mediaType = if (type == "series") "tv" else "movie"
         val tmdbId = if (baseId.startsWith("tmdb:")) baseId.removePrefix("tmdb:") else baseId
-        
+
         ServerState.info("Generic request: id=$id, type=$type, baseId=$baseId, tmdbId=$tmdbId")
-        
+
         return try {
             val TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
             val isImdbId = tmdbId.startsWith("tt")
@@ -913,11 +966,11 @@ object StremioServer {
             } else {
                 "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=$TMDB_API_KEY"
             }
-            
+
             ServerState.info("Fetching TMDB: $tmdbUrl")
             val responseText = httpClient.get(tmdbUrl).bodyAsText()
             val jsonObject = serverJson.parseToJsonElement(responseText).jsonObject
-            
+
             val mediaObj = if (isImdbId) {
                 val movieResults = jsonObject["movie_results"] as? kotlinx.serialization.json.JsonArray
                 val tvResults = jsonObject["tv_results"] as? kotlinx.serialization.json.JsonArray
@@ -925,88 +978,127 @@ object StremioServer {
             } else {
                 jsonObject
             }
-            
+
             if (mediaObj == null) {
                 ServerState.warn("TMDB resolve failed: no media found for $tmdbId")
                 return emptyList()
             }
 
-            val title = mediaObj["title"]?.jsonPrimitive?.content 
+            val title = mediaObj["title"]?.jsonPrimitive?.content
                 ?: mediaObj["name"]?.jsonPrimitive?.content
-                
+
             if (title == null) {
                 ServerState.warn("TMDB resolve failed: no title found")
                 return emptyList()
             }
-                
-            val year = mediaObj["release_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull() 
+
+            val year = mediaObj["release_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
                 ?: mediaObj["first_air_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
 
             ServerState.info("TMDB resolve success: title='$title', year=$year")
 
-            val allStreams = mutableListOf<StremioStream>()
             val activePlugins = loadedApis.filter { !isPluginBlocked(it, profileId) }
-            ServerState.info("Searching across ${activePlugins.size} plugins...")
-            
-            coroutineScope {
-                activePlugins.map { api ->
-                    async {
-                        try {
-                            ServerState.info("[${api.name}] Searching for '$title'")
-                            val searchResults = api.search(title)
-                            ServerState.info("[${api.name}] Found ${searchResults.size} results")
-                            
-                            val bestMatch = searchResults.find { it.name.equals(title, ignoreCase = true) && (year == null || it.year == null || it.year == year) } 
-                                ?: searchResults.firstOrNull { it.name.contains(title, ignoreCase = true) }
-                                ?: searchResults.firstOrNull()
+            ServerState.info("Searching across ${activePlugins.size} plugin(s)...")
 
-                            if (bestMatch != null) {
-                                ServerState.info("[${api.name}] Best match: '${bestMatch.name}' (url: ${bestMatch.url})")
-                                val mediaInfo = api.load(bestMatch.url)
-                                if (mediaInfo != null) {
-                                    var dataUrlToLoad = mediaInfo.dataUrl
-                                    if (type == "series" && id.contains(":")) {
-                                        val parts = id.split(":")
-                                        val season = parts.getOrNull(1)?.toIntOrNull()
-                                        val episode = parts.getOrNull(2)?.toIntOrNull()
-                                        if (season != null && episode != null) {
-                                            val ep = mediaInfo.episodes?.find { it.season == season && it.episode == episode }
-                                            if (ep != null) {
-                                                dataUrlToLoad = ep.dataUrl
-                                                ServerState.info("[${api.name}] Found episode S${season}E${episode}")
-                                            } else {
-                                                ServerState.warn("[${api.name}] Episode S${season}E${episode} not found in mediaInfo")
-                                                return@async emptyList<StremioStream>()
-                                            }
-                                        }
-                                    }
-                                    ServerState.info("[${api.name}] Loading links for $dataUrlToLoad")
-                                    val links = api.loadLinks(dataUrlToLoad)
-                                    ServerState.info("[${api.name}] Found ${links.size} streams")
-                                    links.map { stream ->
-                                        val newName = "${bestMatch.name}" + (if (!stream.name.isNullOrBlank()) "\n${stream.name}" else "")
-                                        stream.copy(name = newName)
-                                    }
-                                } else {
-                                    ServerState.warn("[${api.name}] MediaInfo load failed for ${bestMatch.url}")
-                                    emptyList()
-                                }
-                            } else {
-                                ServerState.info("[${api.name}] No matching search result")
-                                emptyList()
-                            }
+            val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
+            kotlinx.coroutines.supervisorScope {
+                val jobs = activePlugins.map { api ->
+                    launch {
+                        try {
+                            val streams = buildGenericStreamsForApi(api, type, id, tmdbId, mediaType)
+                            accumulated.addAll(streams)
                         } catch (e: Exception) {
-                            ServerState.warn("Search/load error in ${api.name}: ${e.message}")
-                            emptyList<StremioStream>()
+                            ServerState.warn("[${api.name}] Generic stream error: ${e.message}")
                         }
                     }
-                }.awaitAll().forEach { allStreams.addAll(it) }
+                }
+                withTimeoutOrNull(STREAM_DEADLINE_MS) { jobs.forEach { it.join() } }
+                val remaining = jobs.count { it.isActive }
+                if (remaining > 0) {
+                    ServerState.warn("Deadline reached — cancelling $remaining slow provider(s), returning ${accumulated.size} stream(s)")
+                    jobs.forEach { it.cancel() }
+                }
             }
-            ServerState.info("Returning total ${allStreams.size} streams")
-            allStreams
+            ServerState.info("Returning total ${accumulated.size} streams")
+            sortStreamsByQuality(accumulated)
         } catch (e: Exception) {
             ServerState.warn("TMDB resolve error for $id: ${e.stackTraceToString()}")
             emptyList()
+        }
+    }
+
+    // ── Generic per-provider stream fetch (shared by buildStreams + buildStreamsForApi) ─
+
+    /**
+     * Resolves streams from a single [api] for a generic TMDB/IMDb [id].
+     * Caller is responsible for applying timeout.
+     */
+    private suspend fun buildGenericStreamsForApi(
+        api: MainApiWrapper,
+        type: String,
+        id: String,
+        tmdbId: String,
+        mediaType: String
+    ): List<StremioStream> {
+        val TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
+        val isImdbId = tmdbId.startsWith("tt")
+        val tmdbUrl = if (isImdbId) {
+            "https://api.themoviedb.org/3/find/$tmdbId?api_key=$TMDB_API_KEY&external_source=imdb_id"
+        } else {
+            "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=$TMDB_API_KEY"
+        }
+        val responseText = httpClient.get(tmdbUrl).bodyAsText()
+        val jsonObject   = serverJson.parseToJsonElement(responseText).jsonObject
+        val mediaObj = if (isImdbId) {
+            val movieResults = jsonObject["movie_results"] as? kotlinx.serialization.json.JsonArray
+            val tvResults    = jsonObject["tv_results"]    as? kotlinx.serialization.json.JsonArray
+            (movieResults?.firstOrNull() ?: tvResults?.firstOrNull())?.jsonObject
+        } else {
+            jsonObject
+        } ?: return emptyList()
+        val title = mediaObj["title"]?.jsonPrimitive?.content
+            ?: mediaObj["name"]?.jsonPrimitive?.content
+            ?: return emptyList()
+        val year = mediaObj["release_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
+            ?: mediaObj["first_air_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
+
+        ServerState.info("[${api.name}] Searching for '$title'")
+        val searchResults = api.search(title)
+        ServerState.info("[${api.name}] Found ${searchResults.size} results")
+
+        val bestMatch = searchResults.find {
+            it.name.equals(title, ignoreCase = true) && (year == null || it.year == null || it.year == year)
+        } ?: searchResults.firstOrNull { it.name.contains(title, ignoreCase = true) }
+          ?: searchResults.firstOrNull()
+          ?: return emptyList()
+
+        ServerState.info("[${api.name}] Best match: '${bestMatch.name}' (url: ${bestMatch.url})")
+        val mediaInfo = api.load(bestMatch.url) ?: run {
+            ServerState.warn("[${api.name}] MediaInfo load failed for ${bestMatch.url}")
+            return emptyList()
+        }
+        var dataUrlToLoad = mediaInfo.dataUrl
+        if (type == "series" && id.contains(":")) {
+            val parts   = id.split(":")
+            val season  = parts.getOrNull(1)?.toIntOrNull()
+            val episode = parts.getOrNull(2)?.toIntOrNull()
+            if (season != null && episode != null) {
+                val ep = mediaInfo.episodes?.find { it.season == season && it.episode == episode }
+                if (ep != null) {
+                    dataUrlToLoad = ep.dataUrl
+                    ServerState.info("[${api.name}] Found episode S${season}E${episode}")
+                } else {
+                    ServerState.warn("[${api.name}] Episode S${season}E${episode} not found")
+                    return emptyList()
+                }
+            }
+        }
+        ServerState.info("[${api.name}] Loading links for $dataUrlToLoad")
+        val links = api.loadLinks(dataUrlToLoad)
+        ServerState.info("[${api.name}] Found ${links.size} streams")
+        return links.map { stream ->
+            val newName = bestMatch.name + (if (!stream.name.isNullOrBlank()) "\n${stream.name}" else "")
+            stream.copy(name = newName)
         }
     }
 
