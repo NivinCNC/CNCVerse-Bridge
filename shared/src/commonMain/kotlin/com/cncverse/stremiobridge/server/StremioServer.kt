@@ -32,9 +32,16 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.net.BindException
 import java.net.InetSocketAddress
 import java.net.ServerSocket
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
 
 private val serverJson = Json {
     ignoreUnknownKeys = true
@@ -78,6 +85,22 @@ object StremioServer {
      * Populated by the platform-specific [PluginLoader] after loading.
      */
     val loadedApis: MutableList<MainApiWrapper> = mutableListOf()
+
+    /**
+     * Shared provider catalog cache: provider internalName -> list of StremioCatalogDef.
+     * Reused across all profiles so manifests never block on re-fetching sections.
+     */
+    val providerCatalogCache: MutableMap<String, List<StremioCatalogDef>> = ConcurrentHashMap()
+
+    /**
+     * Cached home page catalog results: "$type:$id:$genre" -> list of StremioMeta.
+     */
+    val homePageCatalogCache: MutableMap<String, List<StremioMeta>> = ConcurrentHashMap()
+
+    private val manifestRefreshScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private var periodicRefreshJob: kotlinx.coroutines.Job? = null
+    private val isRefreshing = AtomicBoolean(false)
+    private const val REFRESH_INTERVAL_MS = 30L * 60L * 1000L // 30 minutes
 
     val disabledPlugins: MutableSet<String> = mutableSetOf()
     private var disabledPluginsFile: File? = null
@@ -355,10 +378,14 @@ object StremioServer {
             com.cncverse.stremiobridge.tunnel.CloudflaredManager.startTunnel(targetPort)
         }
 
+        initFastCatalogs()
+        startPeriodicRefreshJob()
+
         return targetPort
     }
 
     fun stop() {
+        stopPeriodicRefreshJob()
         com.cncverse.stremiobridge.tunnel.CloudflaredManager.stopTunnel()
         engine?.stop(0, 500)
         engine = null
@@ -739,36 +766,180 @@ object StremioServer {
     private fun normalizeGhUrl(url: String): String =
         url.replace("/refs/heads/", "/").replace("/refs/tags/", "/")
 
+    fun defaultCatalogDefsForApi(api: MainApiWrapper): List<StremioCatalogDef> {
+        return api.supportedTypes
+            .map { cs3TvTypeToStremio(it) }
+            .distinct()
+            .map { stremioType ->
+                StremioCatalogDef(
+                    type = stremioType,
+                    id   = "cnc_${nameSlug(api.name)}_$stremioType",
+                    name = "${api.name} ($stremioType)",
+                    extra = listOf(ExtraEntry("search"), ExtraEntry("skip"))
+                )
+            }
+    }
+
+    suspend fun fetchCatalogDefsForApi(api: MainApiWrapper): List<StremioCatalogDef> {
+        val sections = try {
+            withTimeoutOrNull(8_000) {
+                api.getMainPageSections()
+            } ?: emptyList()
+        } catch (e: Throwable) {
+            emptyList()
+        }
+
+        return api.supportedTypes
+            .map { cs3TvTypeToStremio(it) }
+            .distinct()
+            .map { stremioType ->
+                val extra = mutableListOf<ExtraEntry>()
+                if (sections.isNotEmpty() && (sections.size > 1 || sections.first().isNotBlank())) {
+                    extra.add(ExtraEntry(name = "genre", options = sections))
+                }
+                extra.add(ExtraEntry("search"))
+                extra.add(ExtraEntry("skip"))
+
+                StremioCatalogDef(
+                    type = stremioType,
+                    id   = "cnc_${nameSlug(api.name)}_$stremioType",
+                    name = "${api.name} ($stremioType)",
+                    extra = extra
+                )
+            }
+    }
+
+    /**
+     * Initializes fast baseline in-memory catalog definitions for all loaded APIs
+     * if not already present, ensuring cold-start manifest requests return instantly.
+     */
+    fun initFastCatalogs() {
+        val apis = loadedApis.toList()
+        for (api in apis) {
+            if (!providerCatalogCache.containsKey(api.internalName)) {
+                providerCatalogCache[api.internalName] = defaultCatalogDefsForApi(api)
+            }
+        }
+        val currentNames = apis.map { it.internalName }.toSet()
+        providerCatalogCache.keys.retainAll(currentNames)
+    }
+
+    fun startPeriodicRefreshJob() {
+        periodicRefreshJob?.cancel()
+        periodicRefreshJob = manifestRefreshScope.launch {
+            while (isActive) {
+                delay(REFRESH_INTERVAL_MS)
+                try {
+                    ServerState.info("⏰ 30-minute interval reached — starting fresh home page and manifest refresh")
+                    refreshManifestAndHomepages()
+                } catch (e: Throwable) {
+                    ServerState.warn("Periodic refresh failed: ${e.message}")
+                }
+            }
+        }
+    }
+
+    fun stopPeriodicRefreshJob() {
+        periodicRefreshJob?.cancel()
+        periodicRefreshJob = null
+    }
+
+    /**
+     * Non-blocking stale-while-revalidate background refresh:
+     * 1. Clears provider dynamic section caches.
+     * 2. Fetches fresh catalog definitions (sections/genres) with bounded concurrency (Semaphore 5).
+     * 3. Pre-warms home page catalog items into a staging map.
+     * 4. While this runs, all manifest and catalog requests serve the existing (old) cached data.
+     * 5. Atomically publishes the new data to live caches only when everything is fetched.
+     */
+    suspend fun refreshManifestAndHomepages() {
+        if (!isRefreshing.compareAndSet(false, true)) {
+            ServerState.info("Manifest refresh already in progress, skipping duplicate call")
+            return
+        }
+        try {
+            ServerState.info("🔄 Refreshing home pages & provider manifest catalogs in background…")
+            val apis = loadedApis.toList()
+            if (apis.isEmpty()) return
+
+            // 1. Clear dynamic sections cache on providers so fresh sections are fetched
+            apis.forEach { runCatching { it.clearCache() } }
+
+            val newProviderCatalogs = ConcurrentHashMap<String, List<StremioCatalogDef>>()
+            val newHomePageCache = ConcurrentHashMap<String, List<StremioMeta>>()
+
+            // 2. Fetch fresh catalog definitions (sections/genres) with bounded concurrency
+            val sem = Semaphore(5)
+            coroutineScope {
+                apis.map { api ->
+                    async(Dispatchers.IO) {
+                        sem.withPermit {
+                            val defs = try {
+                                fetchCatalogDefsForApi(api)
+                            } catch (e: Throwable) {
+                                providerCatalogCache[api.internalName] ?: defaultCatalogDefsForApi(api)
+                            }
+                            newProviderCatalogs[api.internalName] = defs
+                        }
+                    }
+                }.awaitAll()
+            }
+
+            // 3. Pre-warm home page catalogs into newHomePageCache
+            val catalogsToPrewarm = newProviderCatalogs.values.flatten().distinctBy { it.id }
+            ServerState.info("🔥 Pre-warming ${catalogsToPrewarm.size} fresh home page(s)…")
+            coroutineScope {
+                catalogsToPrewarm.map { cat ->
+                    async(Dispatchers.IO) {
+                        sem.withPermit {
+                            runCatching {
+                                val metas = withTimeoutOrNull(15_000) {
+                                    fetchCatalogItemsDirect(cat.type, cat.id, null, 0, null)
+                                }
+                                if (!metas.isNullOrEmpty()) {
+                                    newHomePageCache["${cat.type}:${cat.id}:null"] = metas
+                                    ServerState.info("🔥 Pre-warmed: ${cat.name}")
+                                }
+                            }.onFailure { e ->
+                                ServerState.warn("🔥 Pre-warm failed for ${cat.name}: ${e.message?.take(80)}")
+                            }
+                        }
+                    }
+                }.awaitAll()
+            }
+
+            // 4. ATOMIC UPDATE: Stale data was served during the entire fetch above.
+            // Now that EVERYTHING is fetched, publish the new data to the live caches!
+            providerCatalogCache.putAll(newProviderCatalogs)
+            providerCatalogCache.keys.retainAll(apis.map { it.internalName }.toSet())
+            homePageCatalogCache.putAll(newHomePageCache)
+
+            ServerState.info("✅ Fresh home page & manifest refresh complete (${newProviderCatalogs.size} providers, ${newHomePageCache.size} home pages)")
+        } catch (e: Throwable) {
+            ServerState.warn("Manifest refresh error: ${e.message}")
+        } finally {
+            isRefreshing.set(false)
+        }
+    }
+
+    /**
+     * Pre-warms every plugin's home page by refreshing manifests and home pages in the background.
+     */
+    suspend fun preWarmHomepages() {
+        refreshManifestAndHomepages()
+    }
+
     /**
      * Builds the Stremio manifest.
-     * @param profileId If non-null, also excludes extensions the profile has disabled.
+     * Serves instantly from [providerCatalogCache], reusing provider definitions across all profiles.
+     * @param profileId If non-null, excludes extensions the profile has disabled.
      */
     suspend fun buildManifest(profileId: String? = null): StremioManifest {
         val activeApis = loadedApis.filter { !isPluginBlocked(it, profileId) }
-        val types = listOf("movie","series", "other", "tv")
+        val types = listOf("movie", "series", "other", "tv")
 
         val catalogs = activeApis.flatMap { api ->
-            api.supportedTypes
-                .map { cs3TvTypeToStremio(it) }
-                .distinct()
-                .flatMap { stremioType ->
-                    val extra = mutableListOf<ExtraEntry>()
-                    val sections = api.getMainPageSections()
-                    if (sections.isNotEmpty() && (sections.size > 1 || sections.first().isNotBlank())) {
-                        extra.add(ExtraEntry(name = "genre", options = sections))
-                    }
-                    extra.add(ExtraEntry("search"))
-                    extra.add(ExtraEntry("skip"))
-
-                    listOf(
-                        StremioCatalogDef(
-                            type = stremioType,
-                            id   = "cnc_${nameSlug(api.name)}_$stremioType",
-                            name = "${api.name} ($stremioType)",
-                            extra = extra
-                        )
-                    )
-                }
+            providerCatalogCache[api.internalName] ?: defaultCatalogDefsForApi(api)
         }.distinctBy { it.id }
             .ifEmpty {
                 listOf(StremioCatalogDef("movie", "cnc_all_movie", "CNCVerse (Movie)"))
@@ -795,16 +966,13 @@ object StremioServer {
 
     // ── Catalog builder ───────────────────────────────────────────────────────
 
-    private suspend fun buildCatalog(
-        type: String, id: String, search: String?, skip: Int, genre: String?, profileId: String? = null
+    private suspend fun fetchCatalogItemsDirect(
+        type: String, id: String, search: String?, skip: Int, genre: String?
     ): List<StremioMeta> {
         val prefix = "cnc_"
         if (!id.startsWith(prefix)) return emptyList()
         val rest = id.removePrefix(prefix)
-        
-        // Catalog id format: "cnc_{nameSlug(api.name)}_{type}"
-        // Find the API by matching the same slug derived from its display name.
-        // Also falls back to internalName-based lookup for any old-format IDs still in circulation.
+
         val nameSlugFromId = rest.removeSuffix("_$type")
         val api = loadedApis.find { nameSlug(it.name) == nameSlugFromId }
             ?: loadedApis.find { it.internalName == nameSlugFromId }          // old-format compat
@@ -812,14 +980,11 @@ object StremioServer {
             ?: loadedApis.firstOrNull()
             ?: return emptyList()
 
-        if (isPluginBlocked(api, profileId)) return emptyList()
-
         val sectionName = genre
 
         return try {
             if (!search.isNullOrBlank()) {
                 val results = api.search(search)
-                // If plugin supports multiple types, filter strictly; otherwise return all
                 val filtered = if (api.supportedTypes.size > 1) {
                     results.filter { r -> cs3TvTypeToStremio(r.type) == type }
                         .ifEmpty { results }
@@ -827,7 +992,6 @@ object StremioServer {
                 filtered.map { it.toStremiMeta(nameSlug(api.name), type) }
             } else {
                 val results = api.getMainPage(page = (skip / 20) + 1, type = type, sectionName = sectionName)
-                // If plugin supports multiple types, filter strictly; otherwise return all
                 val filtered = if (api.supportedTypes.size > 1) {
                     results.filter { r -> cs3TvTypeToStremio(r.type) == type }
                         .ifEmpty { results }
@@ -840,29 +1004,36 @@ object StremioServer {
         }
     }
 
-    /**
-     * Pre-warms every plugin's home page by calling [buildCatalog] (→ [getMainPage])
-     * for each catalog defined in the manifest.  Called once after server startup and
-     * then every 30 minutes after the extension refresh, so Stremio users always see
-     * instant home pages with fresh content.
-     */
-    suspend fun preWarmHomepages() {
-        val catalogs = buildManifest().catalogs
-        if (catalogs.isEmpty()) return
-        ServerState.info("🔥 Pre-warming ${catalogs.size} home page(s)…")
-        coroutineScope {
-            catalogs.map { cat ->
-                async(Dispatchers.IO) {
-                    runCatching {
-                        buildCatalog(cat.type, cat.id, null, 0, null)
-                        ServerState.info("🔥 Pre-warmed: ${cat.name}")
-                    }.onFailure { e ->
-                        ServerState.warn("🔥 Pre-warm failed for ${cat.name}: ${e.message?.take(80)}")
-                    }
-                }
-            }.awaitAll()
+    private suspend fun buildCatalog(
+        type: String, id: String, search: String?, skip: Int, genre: String?, profileId: String? = null
+    ): List<StremioMeta> {
+        val prefix = "cnc_"
+        if (!id.startsWith(prefix)) return emptyList()
+        val rest = id.removePrefix(prefix)
+        val nameSlugFromId = rest.removeSuffix("_$type")
+        val api = loadedApis.find { nameSlug(it.name) == nameSlugFromId }
+            ?: loadedApis.find { it.internalName == nameSlugFromId }
+            ?: loadedApis.find { rest.startsWith(it.internalName + "_") }
+            ?: loadedApis.firstOrNull()
+            ?: return emptyList()
+
+        if (isPluginBlocked(api, profileId)) return emptyList()
+
+        val isHomePage = search.isNullOrBlank() && skip == 0
+        val cacheKey = "$type:$id:$genre"
+
+        if (isHomePage) {
+            val cached = homePageCatalogCache[cacheKey]
+            if (!cached.isNullOrEmpty()) {
+                return cached
+            }
         }
-        ServerState.info("🔥 Pre-warm complete (${catalogs.size} catalog(s))")
+
+        val metas = fetchCatalogItemsDirect(type, id, search, skip, genre)
+        if (isHomePage && metas.isNotEmpty()) {
+            homePageCatalogCache[cacheKey] = metas
+        }
+        return metas
     }
 
 
@@ -908,12 +1079,14 @@ object StremioServer {
 
     /**
      * Deadline-based parallel stream loader.
-     * All providers start concurrently; each appends to a shared list as it
+     * All providers start concurrently on [streamSearchScope]; each appends to a shared list as it
      * finishes. After [STREAM_DEADLINE_MS] any still-running jobs are
-     * cancelled and whatever has accumulated is returned — so Stremio always
+     * cancelled and whatever has accumulated is returned — ensuring Stremio always
      * gets a response well within its 60-second addon timeout.
      */
-    private val STREAM_DEADLINE_MS = 50_000L
+    private val STREAM_DEADLINE_MS = 45_000L
+    private val PROVIDER_TIMEOUT_MS = 25_000L
+    private val streamSearchScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
     private suspend fun buildStreams(type: String, id: String, profileId: String? = null): List<StremioStream> {
         val decoded = StremioIds.decode(id)
@@ -927,9 +1100,9 @@ object StremioServer {
             ServerState.info("Parallel stream load: ${matchingApis.size} API(s) for key '$pluginKey'")
 
             val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
-            kotlinx.coroutines.supervisorScope {
-                val jobs = matchingApis.map { api ->
-                    launch {
+            val jobs = matchingApis.map { api ->
+                streamSearchScope.launch {
+                    withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
                         try {
                             ServerState.info("[${api.name}] Loading links for $dataUrl")
                             val links = api.loadLinks(dataUrl)
@@ -940,13 +1113,16 @@ object StremioServer {
                         }
                     }
                 }
-                // Wait for all, but honour the 50-second hard deadline
-                withTimeoutOrNull(STREAM_DEADLINE_MS) { jobs.forEach { it.join() } }
-                val remaining = jobs.count { it.isActive }
-                if (remaining > 0) {
-                    ServerState.warn("Deadline reached — cancelling $remaining slow provider(s), returning ${accumulated.size} stream(s)")
-                    jobs.forEach { it.cancel() }
-                }
+            }
+
+            val deadline = System.currentTimeMillis() + STREAM_DEADLINE_MS
+            while (System.currentTimeMillis() < deadline && jobs.any { it.isActive }) {
+                delay(200)
+            }
+            val remaining = jobs.count { it.isActive }
+            if (remaining > 0) {
+                ServerState.warn("Deadline reached ($STREAM_DEADLINE_MS ms) — returning ${accumulated.size} stream(s), cancelling $remaining slow provider(s)")
+                jobs.forEach { it.cancel() }
             }
             return sortStreamsByQuality(accumulated)
         }
@@ -1000,24 +1176,31 @@ object StremioServer {
             val activePlugins = loadedApis.filter { !isPluginBlocked(it, profileId) }
             ServerState.info("Searching across ${activePlugins.size} plugin(s)...")
 
+            val sem = Semaphore(20)
             val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
-            kotlinx.coroutines.supervisorScope {
-                val jobs = activePlugins.map { api ->
-                    launch {
-                        try {
-                            val streams = buildGenericStreamsForApi(api, type, id, tmdbId, mediaType)
-                            accumulated.addAll(streams)
-                        } catch (e: Exception) {
-                            ServerState.warn("[${api.name}] Generic stream error: ${e.message}")
+            val jobs = activePlugins.map { api ->
+                streamSearchScope.launch {
+                    sem.withPermit {
+                        withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
+                            try {
+                                val streams = buildGenericStreamsForApi(api, type, id, title, year)
+                                accumulated.addAll(streams)
+                            } catch (e: Throwable) {
+                                ServerState.warn("[${api.name}] Generic stream error: ${e.message}")
+                            }
                         }
                     }
                 }
-                withTimeoutOrNull(STREAM_DEADLINE_MS) { jobs.forEach { it.join() } }
-                val remaining = jobs.count { it.isActive }
-                if (remaining > 0) {
-                    ServerState.warn("Deadline reached — cancelling $remaining slow provider(s), returning ${accumulated.size} stream(s)")
-                    jobs.forEach { it.cancel() }
-                }
+            }
+
+            val deadline = System.currentTimeMillis() + STREAM_DEADLINE_MS
+            while (System.currentTimeMillis() < deadline && jobs.any { it.isActive }) {
+                delay(200)
+            }
+            val remaining = jobs.count { it.isActive }
+            if (remaining > 0) {
+                ServerState.warn("Deadline reached ($STREAM_DEADLINE_MS ms) — returning ${accumulated.size} stream(s), cancelling $remaining slow provider(s)")
+                jobs.forEach { it.cancel() }
             }
             ServerState.info("Returning total ${accumulated.size} streams")
             sortStreamsByQuality(accumulated)
@@ -1030,38 +1213,16 @@ object StremioServer {
     // ── Generic per-provider stream fetch (shared by buildStreams + buildStreamsForApi) ─
 
     /**
-     * Resolves streams from a single [api] for a generic TMDB/IMDb [id].
-     * Caller is responsible for applying timeout.
+     * Resolves streams from a single [api] for a generic title/year.
+     * Reuses already-resolved title & year to avoid 95 redundant TMDB requests.
      */
     private suspend fun buildGenericStreamsForApi(
         api: MainApiWrapper,
         type: String,
         id: String,
-        tmdbId: String,
-        mediaType: String
+        title: String,
+        year: Int?
     ): List<StremioStream> {
-        val TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
-        val isImdbId = tmdbId.startsWith("tt")
-        val tmdbUrl = if (isImdbId) {
-            "https://api.themoviedb.org/3/find/$tmdbId?api_key=$TMDB_API_KEY&external_source=imdb_id"
-        } else {
-            "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=$TMDB_API_KEY"
-        }
-        val responseText = httpClient.get(tmdbUrl).bodyAsText()
-        val jsonObject   = serverJson.parseToJsonElement(responseText).jsonObject
-        val mediaObj = if (isImdbId) {
-            val movieResults = jsonObject["movie_results"] as? kotlinx.serialization.json.JsonArray
-            val tvResults    = jsonObject["tv_results"]    as? kotlinx.serialization.json.JsonArray
-            (movieResults?.firstOrNull() ?: tvResults?.firstOrNull())?.jsonObject
-        } else {
-            jsonObject
-        } ?: return emptyList()
-        val title = mediaObj["title"]?.jsonPrimitive?.content
-            ?: mediaObj["name"]?.jsonPrimitive?.content
-            ?: return emptyList()
-        val year = mediaObj["release_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
-            ?: mediaObj["first_air_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
-
         ServerState.info("[${api.name}] Searching for '$title'")
         val searchResults = api.search(title)
         ServerState.info("[${api.name}] Found ${searchResults.size} results")
@@ -3195,6 +3356,7 @@ interface MainApiWrapper {
     val pluginInternalName: String get() = internalName
     val supportedTypes: List<String>
     suspend fun getMainPageSections(): List<String>
+    fun clearCache() {}
 
     suspend fun search(query: String): List<SearchResult>
     suspend fun getMainPage(page: Int, type: String, sectionName: String? = null): List<SearchResult>

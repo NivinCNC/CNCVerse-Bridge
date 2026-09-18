@@ -860,6 +860,10 @@ private class DirectMainApiWrapper(
     }
     
     private var dynamicSectionsCache: List<String>? = null
+ 
+    override fun clearCache() {
+        dynamicSectionsCache = null
+    }
 
     override suspend fun getMainPageSections(): List<String> {
         if (dynamicSectionsCache != null) return dynamicSectionsCache!!

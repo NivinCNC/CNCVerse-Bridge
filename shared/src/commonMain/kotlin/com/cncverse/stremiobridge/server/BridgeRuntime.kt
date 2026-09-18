@@ -98,6 +98,7 @@ object BridgeRuntime {
         installed.forEach { RepoState.setInstallState(it.internalName, PluginInstallState.Installed) }
         val cs3Files = PluginInstaller.getInstalledFiles(cacheDir)
         GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
+        StremioServer.initFastCatalogs()
     }
 
     /** Install a plugin and hot-reload it into the running server. */
