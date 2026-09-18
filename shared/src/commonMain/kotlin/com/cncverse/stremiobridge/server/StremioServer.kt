@@ -32,9 +32,6 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.cancelAndJoin
-import kotlinx.coroutines.asCoroutineDispatcher
 import java.net.BindException
 import java.net.InetSocketAddress
 import java.net.ServerSocket
@@ -911,22 +908,12 @@ object StremioServer {
 
     /**
      * Deadline-based parallel stream loader.
-     * All providers start concurrently on a dedicated fixed thread-pool that is
-     * completely isolated from Ktor's CIO dispatcher — so even 95 slow plugins
-     * can never starve the HTTP accept loop.
-     * • Each provider is killed individually after [PROVIDER_TIMEOUT_MS].
-     * • Any providers still running after [STREAM_DEADLINE_MS] are force-cancelled
-     *   and whatever has accumulated so far is returned, ensuring Stremio always
-     *   gets a response well within its 60-second addon timeout.
+     * All providers start concurrently; each appends to a shared list as it
+     * finishes. After [STREAM_DEADLINE_MS] any still-running jobs are
+     * cancelled and whatever has accumulated is returned — so Stremio always
+     * gets a response well within its 60-second addon timeout.
      */
-    private val STREAM_DEADLINE_MS  = 50_000L
-    private val PROVIDER_TIMEOUT_MS = 25_000L
-    // Dedicated fixed-thread pool for plugin I/O — completely separate from Ktor's
-    // CIO/IO threads so HTTP accept/dispatch is never starved by slow providers.
-    private val streamDispatcher = java.util.concurrent.Executors
-        .newFixedThreadPool(30) { r ->
-            Thread(r, "stream-loader").also { it.isDaemon = true }
-        }.asCoroutineDispatcher()
+    private val STREAM_DEADLINE_MS = 50_000L
 
     private suspend fun buildStreams(type: String, id: String, profileId: String? = null): List<StremioStream> {
         val decoded = StremioIds.decode(id)
@@ -942,26 +929,22 @@ object StremioServer {
             val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
             kotlinx.coroutines.supervisorScope {
                 val jobs = matchingApis.map { api ->
-                    // Each provider runs on the dedicated stream thread-pool (not Ktor's threads)
-                    launch(streamDispatcher) {
-                        // Per-provider hard kill: releases the thread back to the pool early
-                        withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
-                            try {
-                                ServerState.info("[${api.name}] Loading links for $dataUrl")
-                                val links = api.loadLinks(dataUrl)
-                                ServerState.info("[${api.name}] Got ${links.size} stream(s)")
-                                accumulated.addAll(links)
-                            } catch (e: Throwable) {
-                                ServerState.warn("[${api.name}] Stream error: ${e.message}")
-                            }
-                        } ?: ServerState.warn("[${api.name}] Timed out after ${PROVIDER_TIMEOUT_MS}ms — skipped")
+                    launch {
+                        try {
+                            ServerState.info("[${api.name}] Loading links for $dataUrl")
+                            val links = api.loadLinks(dataUrl)
+                            ServerState.info("[${api.name}] Got ${links.size} stream(s)")
+                            accumulated.addAll(links)
+                        } catch (e: Throwable) {
+                            ServerState.warn("[${api.name}] Stream error: ${e.message}")
+                        }
                     }
                 }
-                // Global backstop: cancel anything still alive past the 50s deadline
+                // Wait for all, but honour the 50-second hard deadline
                 withTimeoutOrNull(STREAM_DEADLINE_MS) { jobs.forEach { it.join() } }
                 val remaining = jobs.count { it.isActive }
                 if (remaining > 0) {
-                    ServerState.warn("Global deadline — force-cancelling $remaining provider(s), returning ${accumulated.size} stream(s)")
+                    ServerState.warn("Deadline reached — cancelling $remaining slow provider(s), returning ${accumulated.size} stream(s)")
                     jobs.forEach { it.cancel() }
                 }
             }
@@ -1020,21 +1003,19 @@ object StremioServer {
             val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
             kotlinx.coroutines.supervisorScope {
                 val jobs = activePlugins.map { api ->
-                    launch(streamDispatcher) {
-                        withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
-                            try {
-                                val streams = buildGenericStreamsForApi(api, type, id, tmdbId, mediaType)
-                                accumulated.addAll(streams)
-                            } catch (e: Exception) {
-                                ServerState.warn("[${api.name}] Generic stream error: ${e.message}")
-                            }
-                        } ?: ServerState.warn("[${api.name}] Timed out after ${PROVIDER_TIMEOUT_MS}ms — skipped")
+                    launch {
+                        try {
+                            val streams = buildGenericStreamsForApi(api, type, id, tmdbId, mediaType)
+                            accumulated.addAll(streams)
+                        } catch (e: Exception) {
+                            ServerState.warn("[${api.name}] Generic stream error: ${e.message}")
+                        }
                     }
                 }
                 withTimeoutOrNull(STREAM_DEADLINE_MS) { jobs.forEach { it.join() } }
                 val remaining = jobs.count { it.isActive }
                 if (remaining > 0) {
-                    ServerState.warn("Global deadline — force-cancelling $remaining provider(s), returning ${accumulated.size} stream(s)")
+                    ServerState.warn("Deadline reached — cancelling $remaining slow provider(s), returning ${accumulated.size} stream(s)")
                     jobs.forEach { it.cancel() }
                 }
             }
