@@ -1039,7 +1039,7 @@ object StremioServer {
         metas.map { meta ->
             async(Dispatchers.IO) {
                 try {
-                    val searchUrl = "https://api.tmdb.org/3/search/$mediaType?api_key=$TMDB_API_KEY&query=${meta.name.encodeURLQueryComponent()}"
+                    val searchUrl = "https://api.themoviedb.org/3/search/$mediaType?api_key=$TMDB_API_KEY&query=${meta.name.encodeURLQueryComponent()}"
                     val responseText = httpClient.get(searchUrl).bodyAsText()
                     val jsonObject = serverJson.parseToJsonElement(responseText).jsonObject
                     val results = jsonObject["results"] as? kotlinx.serialization.json.JsonArray
@@ -1211,9 +1211,9 @@ object StremioServer {
         return try {
             val isImdbId = tmdbId.startsWith("tt")
             val tmdbUrl = if (isImdbId) {
-                "https://api.tmdb.org/3/find/$tmdbId?api_key=$TMDB_API_KEY&external_source=imdb_id"
+                "https://api.themoviedb.org/3/find/$tmdbId?api_key=$TMDB_API_KEY&external_source=imdb_id"
             } else {
-                "https://api.tmdb.org/3/$mediaType/$tmdbId?api_key=$TMDB_API_KEY"
+                "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=$TMDB_API_KEY"
             }
 
             ServerState.info("Fetching TMDB: $tmdbUrl")
