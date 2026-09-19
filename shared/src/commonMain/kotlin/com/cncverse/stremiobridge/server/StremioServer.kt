@@ -1010,7 +1010,7 @@ object StremioServer {
         val sectionName = genre
 
         return try {
-            if (!search.isNullOrBlank()) {
+            val metas = if (!search.isNullOrBlank()) {
                 val results = api.search(search)
                 val filtered = if (api.supportedTypes.size > 1) {
                     results.filter { r -> cs3TvTypeToStremio(r.type) == type }
@@ -1025,10 +1025,49 @@ object StremioServer {
                 } else results
                 filtered.map { it.toStremiMeta(nameSlug(api.name), type) }
             }
+            enrichCatalogMetas(metas, type)
         } catch (e: Throwable) {
             ServerState.warn("Catalog error for ${api.name}: ${e.message}")
             emptyList()
         }
+    }
+
+    private val TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
+
+    private suspend fun enrichCatalogMetas(metas: List<StremioMeta>, type: String): List<StremioMeta> = coroutineScope {
+        val mediaType = if (type == "series") "tv" else "movie"
+        metas.map { meta ->
+            async(Dispatchers.IO) {
+                try {
+                    val searchUrl = "https://api.themoviedb.org/3/search/$mediaType?api_key=$TMDB_API_KEY&query=${meta.name.encodeURLQueryComponent()}"
+                    val responseText = httpClient.get(searchUrl).bodyAsText()
+                    val jsonObject = serverJson.parseToJsonElement(responseText).jsonObject
+                    val results = jsonObject["results"] as? kotlinx.serialization.json.JsonArray
+                    val bestMatch = results?.firstOrNull()?.jsonObject
+                    if (bestMatch != null) {
+                        val description = bestMatch["overview"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() } ?: meta.description
+                        val posterPath = bestMatch["poster_path"]?.jsonPrimitive?.content
+                        val backdropPath = bestMatch["backdrop_path"]?.jsonPrimitive?.content
+                        val rating = bestMatch["vote_average"]?.jsonPrimitive?.content
+                        val poster = if (posterPath != null) "https://image.tmdb.org/t/p/w500$posterPath" else meta.poster
+                        val background = if (backdropPath != null) "https://image.tmdb.org/t/p/original$backdropPath" else meta.background
+                        val yearStr = bestMatch["release_date"]?.jsonPrimitive?.content?.substringBefore("-")
+                            ?: bestMatch["first_air_date"]?.jsonPrimitive?.content?.substringBefore("-")
+                        val tmdbYear = yearStr?.toIntOrNull() ?: meta.year
+
+                        meta.copy(
+                            description = description,
+                            poster = poster,
+                            background = background,
+                            imdbRating = rating?.takeIf { it.toDoubleOrNull() != 0.0 },
+                            year = tmdbYear
+                        )
+                    } else meta
+                } catch (e: Exception) {
+                    meta
+                }
+            }
+        }.awaitAll()
     }
 
     private suspend fun buildCatalog(
@@ -1083,18 +1122,24 @@ object StremioServer {
 
     // ── Quality sorting ───────────────────────────────────────────────────────
 
-    /**
-     * Extracts a quality rank from a stream's name or title.
-     * Higher rank = better quality. Used to sort streams best-first.
-     */
     private fun streamQualityRank(stream: StremioStream): Int {
         val text = "${stream.name.orEmpty()} ${stream.title.orEmpty()}".uppercase()
+        val resMatch = Regex("(2160|1080|720|480|360)P").find(text)
+        if (resMatch != null) {
+            return when (resMatch.groupValues[1]) {
+                "2160" -> 5
+                "1080" -> 4
+                "720" -> 3
+                "480" -> 2
+                "360" -> 1
+                else -> 0
+            }
+        }
         return when {
-            Regex("4K|2160P|UHD").containsMatchIn(text)  -> 5
-            Regex("1080P|FHD").containsMatchIn(text)     -> 4
-            Regex("720P|HD").containsMatchIn(text)       -> 3
-            Regex("480P|SD").containsMatchIn(text)       -> 2
-            Regex("360P|240P").containsMatchIn(text)     -> 1
+            Regex("\\b(4K|UHD)\\b").containsMatchIn(text)  -> 5
+            Regex("\\b(FHD)\\b").containsMatchIn(text)     -> 4
+            Regex("\\b(HD)\\b").containsMatchIn(text)       -> 3
+            Regex("\\b(SD)\\b").containsMatchIn(text)       -> 2
             else                                          -> 0
         }
     }
@@ -1155,14 +1200,15 @@ object StremioServer {
         }
 
         // Handle generic Stremio requests with TMDB/IMDB IDs
-        val baseId = id.substringBefore(":")
+        val idParts = id.split(":")
+        val isTmdb = idParts.first() == "tmdb"
+        val baseId = if (isTmdb) idParts.getOrNull(1) ?: id else idParts.first()
         val mediaType = if (type == "series") "tv" else "movie"
-        val tmdbId = if (baseId.startsWith("tmdb:")) baseId.removePrefix("tmdb:") else baseId
+        val tmdbId = baseId
 
         ServerState.info("Generic request: id=$id, type=$type, baseId=$baseId, tmdbId=$tmdbId")
 
         return try {
-            val TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
             val isImdbId = tmdbId.startsWith("tt")
             val tmdbUrl = if (isImdbId) {
                 "https://api.themoviedb.org/3/find/$tmdbId?api_key=$TMDB_API_KEY&external_source=imdb_id"
