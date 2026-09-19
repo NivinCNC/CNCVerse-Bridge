@@ -19,6 +19,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.io.File
@@ -50,14 +51,18 @@ private val serverJson = Json {
 }
 
 private val httpClient by lazy {
+    try {
+        System.setProperty("java.net.preferIPv4Stack", "true")
+        System.setProperty("java.net.preferIPv6Addresses", "false")
+    } catch (_: Throwable) {}
     HttpClient(io.ktor.client.engine.cio.CIO) {
         install(io.ktor.client.plugins.contentnegotiation.ContentNegotiation) {
             json(serverJson)
         }
         try {
             install(io.ktor.client.plugins.HttpTimeout) {
-                requestTimeoutMillis = 30_000
-                connectTimeoutMillis = 15_000
+                requestTimeoutMillis = 15_000
+                connectTimeoutMillis = 5_000
                 socketTimeoutMillis = 15_000
             }
         } catch (e: Throwable) {}
@@ -1033,16 +1038,118 @@ object StremioServer {
     }
 
     private val TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
+    private val TMDB_HOSTS = listOf(
+        "https://api.tmdb.org/3",
+        "https://api.themoviedb.org/3"
+    )
+
+    private val catalogMetaEnrichCache = ConcurrentHashMap<String, StremioMeta>()
+    private val genericMediaCache = ConcurrentHashMap<String, Pair<String, Int?>>()
+
+    private suspend fun fetchTmdbJson(endpointPathAndQuery: String): JsonObject? {
+        val cleanPath = endpointPathAndQuery.trimStart('/')
+        val delimiter = if (cleanPath.contains("?")) "&" else "?"
+        for (host in TMDB_HOSTS) {
+            val url = "$host/$cleanPath${delimiter}api_key=$TMDB_API_KEY"
+            try {
+                ServerState.info("Fetching TMDB: $url")
+                val responseText = withTimeoutOrNull(5_000) {
+                    httpClient.get(url).bodyAsText()
+                } ?: run {
+                    ServerState.warn("TMDB timeout on $host, trying fallback...")
+                    null
+                } ?: continue
+                return serverJson.parseToJsonElement(responseText).jsonObject
+            } catch (e: Throwable) {
+                ServerState.warn("TMDB error on $host: ${e.message?.take(80)}, trying fallback...")
+            }
+        }
+        return null
+    }
+
+    private suspend fun resolveGenericMedia(type: String, tmdbId: String): Pair<String, Int?>? {
+        val cacheKey = "$type:$tmdbId"
+        genericMediaCache[cacheKey]?.let { return it }
+
+        val isImdbId = tmdbId.startsWith("tt")
+        val mediaType = if (type == "series") "tv" else "movie"
+
+        // 1. If it's an IMDb ID, try Cinemeta first (extremely fast & resilient)
+        if (isImdbId) {
+            try {
+                val cinemetaType = if (type == "series") "series" else "movie"
+                val cinemetaUrl = "https://v3-cinemeta.strem.io/meta/$cinemetaType/$tmdbId.json"
+                val responseText = withTimeoutOrNull(4_000) {
+                    httpClient.get(cinemetaUrl).bodyAsText()
+                }
+                if (responseText != null) {
+                    val json = serverJson.parseToJsonElement(responseText).jsonObject
+                    val meta = json["meta"]?.jsonObject
+                    val title = meta?.get("name")?.jsonPrimitive?.content
+                    if (!title.isNullOrBlank()) {
+                        val yearStr = meta["year"]?.jsonPrimitive?.content
+                            ?: meta["releaseInfo"]?.jsonPrimitive?.content
+                        val year = yearStr?.take(4)?.toIntOrNull()
+                        val result = Pair(title, year)
+                        genericMediaCache[cacheKey] = result
+                        ServerState.info("Cinemeta resolved $tmdbId -> '$title' ($year)")
+                        return result
+                    }
+                }
+            } catch (e: Throwable) {
+                ServerState.warn("Cinemeta resolve error for $tmdbId: ${e.message?.take(80)}")
+            }
+        }
+
+        // 2. Query TMDB with multi-host fallback (api.tmdb.org -> api.themoviedb.org)
+        val endpoint = if (isImdbId) {
+            "find/$tmdbId?external_source=imdb_id"
+        } else {
+            "$mediaType/$tmdbId"
+        }
+
+        val jsonObject = fetchTmdbJson(endpoint) ?: return null
+
+        val mediaObj = if (isImdbId) {
+            val movieResults = jsonObject["movie_results"] as? kotlinx.serialization.json.JsonArray
+            val tvResults = jsonObject["tv_results"] as? kotlinx.serialization.json.JsonArray
+            (movieResults?.firstOrNull() ?: tvResults?.firstOrNull())?.jsonObject
+        } else {
+            jsonObject
+        } ?: return null
+
+        val title = mediaObj["title"]?.jsonPrimitive?.content
+            ?: mediaObj["name"]?.jsonPrimitive?.content
+            ?: return null
+
+        val year = mediaObj["release_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
+            ?: mediaObj["first_air_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
+
+        val result = Pair(title, year)
+        genericMediaCache[cacheKey] = result
+        ServerState.info("TMDB resolved $tmdbId -> '$title' ($year)")
+        return result
+    }
 
     private suspend fun enrichCatalogMetas(metas: List<StremioMeta>, type: String): List<StremioMeta> = coroutineScope {
         val mediaType = if (type == "series") "tv" else "movie"
         metas.map { meta ->
             async(Dispatchers.IO) {
+                val cacheKey = "$type:${meta.name}"
+                catalogMetaEnrichCache[cacheKey]?.let { cached ->
+                    return@async meta.copy(
+                        description = cached.description ?: meta.description,
+                        poster = cached.poster ?: meta.poster,
+                        background = cached.background ?: meta.background,
+                        imdbRating = cached.imdbRating ?: meta.imdbRating,
+                        year = cached.year ?: meta.year
+                    )
+                }
+
                 try {
-                    val searchUrl = "https://api.themoviedb.org/3/search/$mediaType?api_key=$TMDB_API_KEY&query=${meta.name.encodeURLQueryComponent()}"
-                    val responseText = httpClient.get(searchUrl).bodyAsText()
-                    val jsonObject = serverJson.parseToJsonElement(responseText).jsonObject
-                    val results = jsonObject["results"] as? kotlinx.serialization.json.JsonArray
+                    val endpoint = "search/$mediaType?query=${meta.name.encodeURLQueryComponent()}"
+                    val jsonObject = fetchTmdbJson(endpoint)
+                    val results = jsonObject?.get("results") as? kotlinx.serialization.json.JsonArray
                     val bestMatch = results?.firstOrNull()?.jsonObject
                     if (bestMatch != null) {
                         val description = bestMatch["overview"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() } ?: meta.description
@@ -1055,13 +1162,15 @@ object StremioServer {
                             ?: bestMatch["first_air_date"]?.jsonPrimitive?.content?.substringBefore("-")
                         val tmdbYear = yearStr?.toIntOrNull() ?: meta.year
 
-                        meta.copy(
+                        val enriched = meta.copy(
                             description = description,
                             poster = poster,
                             background = background,
                             imdbRating = rating?.takeIf { it.toDoubleOrNull() != 0.0 },
                             year = tmdbYear
                         )
+                        catalogMetaEnrichCache[cacheKey] = enriched
+                        enriched
                     } else meta
                 } catch (e: Exception) {
                     meta
@@ -1209,42 +1318,13 @@ object StremioServer {
         ServerState.info("Generic request: id=$id, type=$type, baseId=$baseId, tmdbId=$tmdbId")
 
         return try {
-            val isImdbId = tmdbId.startsWith("tt")
-            val tmdbUrl = if (isImdbId) {
-                "https://api.themoviedb.org/3/find/$tmdbId?api_key=$TMDB_API_KEY&external_source=imdb_id"
-            } else {
-                "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=$TMDB_API_KEY"
-            }
-
-            ServerState.info("Fetching TMDB: $tmdbUrl")
-            val responseText = httpClient.get(tmdbUrl).bodyAsText()
-            val jsonObject = serverJson.parseToJsonElement(responseText).jsonObject
-
-            val mediaObj = if (isImdbId) {
-                val movieResults = jsonObject["movie_results"] as? kotlinx.serialization.json.JsonArray
-                val tvResults = jsonObject["tv_results"] as? kotlinx.serialization.json.JsonArray
-                (movieResults?.firstOrNull() ?: tvResults?.firstOrNull())?.jsonObject
-            } else {
-                jsonObject
-            }
-
-            if (mediaObj == null) {
-                ServerState.warn("TMDB resolve failed: no media found for $tmdbId")
+            val resolved = resolveGenericMedia(type, tmdbId)
+            if (resolved == null) {
+                ServerState.warn("Media resolve failed: no title/year found for $id")
                 return emptyList()
             }
-
-            val title = mediaObj["title"]?.jsonPrimitive?.content
-                ?: mediaObj["name"]?.jsonPrimitive?.content
-
-            if (title == null) {
-                ServerState.warn("TMDB resolve failed: no title found")
-                return emptyList()
-            }
-
-            val year = mediaObj["release_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
-                ?: mediaObj["first_air_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
-
-            ServerState.info("TMDB resolve success: title='$title', year=$year")
+            val (title, year) = resolved
+            ServerState.info("Media resolve success: title='$title', year=$year")
 
             val activePlugins = loadedApis.filter { !isPluginBlocked(it, profileId) }
             ServerState.info("Searching across ${activePlugins.size} plugin(s)...")
