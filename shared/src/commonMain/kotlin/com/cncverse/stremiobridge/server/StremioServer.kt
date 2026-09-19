@@ -1010,7 +1010,7 @@ object StremioServer {
         val sectionName = genre
 
         return try {
-            val metas = if (!search.isNullOrBlank()) {
+            if (!search.isNullOrBlank()) {
                 val results = api.search(search)
                 val filtered = if (api.supportedTypes.size > 1) {
                     results.filter { r -> cs3TvTypeToStremio(r.type) == type }
@@ -1025,7 +1025,6 @@ object StremioServer {
                 } else results
                 filtered.map { it.toStremiMeta(nameSlug(api.name), type) }
             }
-            enrichCatalogMetas(metas, type)
         } catch (e: Throwable) {
             ServerState.warn("Catalog error for ${api.name}: ${e.message}")
             emptyList()
@@ -1033,43 +1032,6 @@ object StremioServer {
     }
 
     private val TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
-
-    private suspend fun enrichCatalogMetas(metas: List<StremioMeta>, type: String): List<StremioMeta> = coroutineScope {
-        val mediaType = if (type == "series") "tv" else "movie"
-        metas.map { meta ->
-            async(Dispatchers.IO) {
-                try {
-                    val searchUrl = "https://api.themoviedb.org/3/search/$mediaType?api_key=$TMDB_API_KEY&query=${meta.name.encodeURLQueryComponent()}"
-                    val responseText = httpClient.get(searchUrl).bodyAsText()
-                    val jsonObject = serverJson.parseToJsonElement(responseText).jsonObject
-                    val results = jsonObject["results"] as? kotlinx.serialization.json.JsonArray
-                    val bestMatch = results?.firstOrNull()?.jsonObject
-                    if (bestMatch != null) {
-                        val description = bestMatch["overview"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() } ?: meta.description
-                        val posterPath = bestMatch["poster_path"]?.jsonPrimitive?.content
-                        val backdropPath = bestMatch["backdrop_path"]?.jsonPrimitive?.content
-                        val rating = bestMatch["vote_average"]?.jsonPrimitive?.content
-                        val poster = if (posterPath != null) "https://image.tmdb.org/t/p/w500$posterPath" else meta.poster
-                        val background = if (backdropPath != null) "https://image.tmdb.org/t/p/original$backdropPath" else meta.background
-                        val yearStr = bestMatch["release_date"]?.jsonPrimitive?.content?.substringBefore("-")
-                            ?: bestMatch["first_air_date"]?.jsonPrimitive?.content?.substringBefore("-")
-                        val tmdbYear = yearStr?.toIntOrNull() ?: meta.year
-
-                        meta.copy(
-                            description = description,
-                            poster = poster,
-                            background = background,
-                            imdbRating = rating?.takeIf { it.toDoubleOrNull() != 0.0 },
-                            year = tmdbYear
-                        )
-                    } else meta
-                } catch (e: Exception) {
-                    meta
-                }
-            }
-        }.awaitAll()
-    }
-
     private suspend fun buildCatalog(
         type: String, id: String, search: String?, skip: Int, genre: String?, profileId: String? = null
     ): List<StremioMeta> {
