@@ -60,7 +60,6 @@ object DecryptHandler {
             val segmentCacheKey = "${decodedSegmentUrl.substringBefore("?")}_${keyId}"
             val cached = SegmentCache.getSegment(segmentCacheKey)
             if (cached != null) {
-                ServerState.info("DECRYPT: Cache hit for segment")
                 respondBytesOrHead(call, cached, ContentType.parse("video/mp4"), false)
                 return
             }
@@ -78,7 +77,6 @@ object DecryptHandler {
                 } catch (e: Exception) {
                     // If 403 and we have refresh params, try with fresh URLs
                     if (e.message?.contains("403") == true && mpdUrl != null && repId != null && segNum != null) {
-                        ServerState.info("DECRYPT: URL expired, refreshing from MPD")
                         SegmentCache.invalidateMpd(mpdUrl)
                         val freshUrls = getFreshSegmentUrls(mpdUrl, repId, segNum, customHeaders, proxyUrl)
                         if (freshUrls != null) {
@@ -92,8 +90,6 @@ object DecryptHandler {
                         throw e
                     }
                 }
-
-                ServerState.info("DECRYPT: Fetched init=${initContent?.size ?: 0} bytes, segment=${segmentContent.size} bytes")
 
                 // VLC/Stremio FIX: excludeInit=true - segments should NOT include init
                 // Init is served separately via EXT-X-MAP pointing to /init_decrypt
@@ -112,8 +108,6 @@ object DecryptHandler {
                     segmentContent
                 }
 
-                ServerState.info("DECRYPT: Decrypted segment, output=${decrypted.size} bytes (excludeInit=true, init via EXT-X-MAP)")
-
                 // Cache the decrypted segment
                 SegmentCache.putSegment(segmentCacheKey, decrypted)
 
@@ -126,8 +120,6 @@ object DecryptHandler {
                     headers = customHeaders,
                     proxyUrl = proxyUrl
                 )
-
-                ServerState.info("DECRYPT_RESPONSE: Sending ${decrypted.size} bytes as video/mp4")
 
                 respondBytesOrHead(call, decrypted, ContentType.parse("video/mp4"), false)
             }
@@ -162,20 +154,13 @@ object DecryptHandler {
                 ?: return call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing 'url' parameter"))
 
             val decodedInitUrl = URLDecoder.decode(initUrl, "UTF-8")
-            ServerState.info("INIT_DECRYPT: url=${decodedInitUrl.take(100)}")
 
-            // DEBUG: skip cache to test with original init
-            val useOriginalInit = false // DEBUG FLAG - set to false for production
-
-            // Check cleaned init cache (skip if testing with original)
+            // Check cleaned init cache
             val cacheKey = "cleaned_${decodedInitUrl.substringBefore("?")}"
-            if (!useOriginalInit) {
-                val cachedCleanedInit = SegmentCache.getCleanedInit(cacheKey)
-                if (cachedCleanedInit != null) {
-                    ServerState.info("INIT_DECRYPT: Cache hit")
-                    respondBytesOrHead(call, cachedCleanedInit, ContentType.parse("video/mp4"), true)
-                    return
-                }
+            val cachedCleanedInit = SegmentCache.getCleanedInit(cacheKey)
+            if (cachedCleanedInit != null) {
+                respondBytesOrHead(call, cachedCleanedInit, ContentType.parse("video/mp4"), true)
+                return
             }
 
             val queryParams = call.request.queryParameters.entries()
@@ -197,20 +182,9 @@ object DecryptHandler {
                     fetched
                 }
 
-                ServerState.info("INIT_DECRYPT: Fetched init=${initContent.size} bytes")
-
-                // DEBUG: Try serving original init without cleaning to test VLC
                 // Remove encryption metadata
                 val cleanedInit = InitSegmentCleaner.removeEncryptionMetadata(initContent)
-                ServerState.info("INIT_DECRYPT: Cleaned init=${cleanedInit.size} bytes")
-
-                // Use original or cleaned based on debug flag set above
-                val finalInit = if (useOriginalInit) {
-                    ServerState.warn("INIT_DECRYPT: DEBUG - Using ORIGINAL init (${initContent.size} bytes)")
-                    initContent
-                } else {
-                    cleanedInit
-                }
+                val finalInit = cleanedInit
 
                 SegmentCache.putCleanedInit(cacheKey, finalInit)
 

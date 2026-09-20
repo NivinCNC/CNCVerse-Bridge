@@ -32,9 +32,6 @@ fun Application.installMpdProxyRoutes() {
 }
 
 private suspend fun handleMpdProxy(call: ApplicationCall, converter: MpdConverter) {
-    val allParams = call.request.queryParameters.entries().joinToString(", ") { "${it.key}=${it.value.firstOrNull()?.take(40)}" }
-    ServerState.info("MPD_PROXY_REQ [] params: $allParams")
-
     try {
         val destinationUrl = call.parameters["d"] ?: call.parameters["url"]
             ?: return call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing 'd' or 'url' parameter"))
@@ -47,11 +44,8 @@ private suspend fun handleMpdProxy(call: ApplicationCall, converter: MpdConverte
         val clearKey = call.request.queryParameters["clearkey"]
             ?: buildClearKey(call.request.queryParameters["key_id"], call.request.queryParameters["key"])
 
-        ServerState.info("MPD_PROXY: url=${decodedUrl.take(120)}, repId=$repId, clearKey=${clearKey?.take(20)}")
-
         val queryParams = call.request.queryParameters.entries().associate { it.key to it.value.firstOrNull().orEmpty() }
         val customHeaders = HttpClientManager.extractHeadersFromParams(queryParams)
-        ServerState.info("MPD_PROXY_HEADERS extracted=${customHeaders.keys.joinToString()} (from ${queryParams.keys.filter { it.startsWith("h_") }.joinToString()})")
 
         val mpdContent = SegmentCache.getMpd(decodedUrl) ?: withContext(Dispatchers.IO) {
             HttpClientManager.getString(url = decodedUrl, headers = customHeaders, proxyUrl = null)
@@ -67,17 +61,10 @@ private suspend fun handleMpdProxy(call: ApplicationCall, converter: MpdConverte
             "&h_${URLEncoder.encode(key, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
         }
 
-        // Log the final proxy URL so it can be tested with VLC
-        val encodedMpdUrlForLog = URLEncoder.encode(decodedUrl, "UTF-8")
-        val vlcTestUrl = "$proxyBase/proxy/mpd/manifest.m3u8?d=$encodedMpdUrlForLog${if (!clearKey.isNullOrBlank()) "&clearkey=$clearKey" else ""}$headerParams"
-        ServerState.info("[VLC TEST URL] $vlcTestUrl")
-
         val hlsContent = if (repId != null) {
             converter.convertMediaPlaylist(mpdContent, repId, proxyBase, decodedUrl, headerParams, clearKey)
-                .also { ServerState.info("MPD_PROXY: Generated media playlist for rep_id=$repId, lines=${it.lines().size}") }
         } else {
             converter.convertMasterPlaylist(mpdContent, proxyBase, decodedUrl, headerParams, clearKey)
-                .also { ServerState.info("MPD_PROXY: Generated master playlist, lines=${it.lines().size}") }
         }
 
         if (call.request.httpMethod == HttpMethod.Head) {

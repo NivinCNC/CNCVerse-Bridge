@@ -393,9 +393,6 @@ class MpdConverter {
         val defaultInitUrl = segments.firstOrNull()?.initUrl
             ?: getInitializationUrl(lastSegmentTemplate, lastTargetRep!!, lastParentAdaptationSet, repId, baseUrl)
 
-        // DEBUG: log multi-period info
-        ServerState.info("MpdConverter: repId=$repId, periods=${periodCounter}, totalSegs=${allSegments.size}, windowedSegs=${segments.size}, liveWindow=${liveWindowSeconds}s, initUrl=${defaultInitUrl?.take(80) ?: "NULL"}, mediaSequence=${mediaSequence}")
-
         val sb = StringBuilder()
         sb.appendLine("#EXTM3U")
         sb.appendLine("#EXT-X-VERSION:$HLS_VERSION")

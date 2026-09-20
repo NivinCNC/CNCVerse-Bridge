@@ -30,27 +30,6 @@ object HttpClientManager {
         maxRequestsPerHost = 64   // CDN usa stesso host - serve alto parallelismo
     }
 
-    // Network-level debug interceptor – runs AFTER OkHttp adds Host/Connection/Accept-Encoding
-    // so we see the EXACT bytes going over the wire. Remove once the CDN 403 is resolved.
-    private val networkDebugInterceptor = Interceptor { chain ->
-        val req = chain.request()
-        ServerState.info("NET_REQ: ${req.method} ${req.url.toString().take(120)}")
-        req.headers.forEach { (name, value) ->
-            // Mask Cookie/Auth values after first 40 chars for log brevity
-            val display = if (name.equals("Cookie", ignoreCase = true) ||
-                               name.equals("Authorization", ignoreCase = true))
-                value.take(40) + "…" else value
-            ServerState.info("NET_HDR: $name: $display")
-        }
-        val response = chain.proceed(req)
-        if (!response.isSuccessful) {
-            // Peek the error body without consuming it
-            val body = response.peekBody(512).string()
-            ServerState.warn("NET_ERR ${response.code}: body=${body.take(200)}")
-        }
-        response
-    }
-
     // Client di base ottimizzato per streaming veloce con AdaptiveHostDns e FastFallback
     private val baseClient: OkHttpClient = OkHttpClient.Builder()
         .dns(com.cncverse.stremiobridge.network.AdaptiveHostDns)
@@ -64,7 +43,6 @@ object HttpClientManager {
         .followRedirects(true)
         .followSslRedirects(true)
         .retryOnConnectionFailure(true)
-        .addNetworkInterceptor(networkDebugInterceptor)  // ← wire-level logging
         .build()
 
     /**

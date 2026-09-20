@@ -142,12 +142,9 @@ class CloudflareKiller : Interceptor {
         val apex = getApexDomain(host)
         val isStatic = isStaticAsset(request.url)
 
-        ServerState.info("[CF-DBG] intercept → $host isStatic=$isStatic bypassEnabled=$cfBypassEnabled failedHosts=$failedHosts")
-
         // Serve from SettledPageCache if available
         val cachedPage = SettledPageCache.get(request.url.toString())
         if (cachedPage != null) {
-            ServerState.info("[CF-DBG] Serving from SettledPageCache for ${request.url}")
             val bodyBytes = cachedPage.html.toByteArray(Charsets.UTF_8)
             val mediaType = "text/html; charset=utf-8".toMediaTypeOrNull()
             return Response.Builder()
@@ -169,7 +166,7 @@ class CloudflareKiller : Interceptor {
         if (failedHosts.contains(host) ||
             (!SystemBrowserCdpBypass.hasActiveProxy(apex) && failedHosts.contains(apex))
         ) {
-            ServerState.warn("[CF-DBG] SKIP: $host is in failedHosts — clearing and retrying fresh")
+            ServerState.warn("[CF] SKIP: $host is in failedHosts — retrying fresh")
             // Clear the stale failure so the next request can attempt again
             failedHosts.remove(host)
             failedHosts.remove(apex)
@@ -191,7 +188,6 @@ class CloudflareKiller : Interceptor {
 
         val currentCookies = getSavedCookies(host)
         val currentUa = getSavedUserAgent(host)
-        ServerState.info("[CF-DBG] savedCookies for $host: ${currentCookies.keys}")
         if (currentCookies.isNotEmpty()) {
             usedSavedCookie = true
             response = proceed(chain, request, currentCookies, currentUa)
@@ -202,7 +198,6 @@ class CloudflareKiller : Interceptor {
         val serverHeader = response.header("Server") ?: ""
         val cfMitigated = response.header("cf-mitigated") ?: ""
         val isCloudflareServer = CLOUDFLARE_SERVERS.any { serverHeader.contains(it, ignoreCase = true) }
-        ServerState.info("[CF-DBG] response HTTP ${response.code} Server='$serverHeader' cf-mitigated='$cfMitigated' isStatic=$isStatic isCfServer=$isCloudflareServer")
 
         val isCloudflareChallenge = !isStatic && response.code in ERROR_CODES && isCloudflareServer && run {
             if (cfMitigated.equals("challenge", ignoreCase = true)) return@run true
@@ -215,8 +210,6 @@ class CloudflareKiller : Interceptor {
                 bodyPreview.contains("_cf_chl_opt") ||
                 bodyPreview.contains("turnstile", ignoreCase = true)
         }
-
-        ServerState.info("[CF-DBG] isCloudflareChallenge=$isCloudflareChallenge for $host")
 
         if (isCloudflareChallenge) {
             ServerState.warn("[CF] Cloudflare challenge detected for $host (HTTP ${response.code})")
@@ -238,13 +231,10 @@ class CloudflareKiller : Interceptor {
                 return response
             }
 
-            ServerState.info("[CF-DBG] failedHosts check: host=$host inFailed=${failedHosts.contains(host)} apex=$apex inFailed=${failedHosts.contains(apex)}")
-
             if (!failedHosts.contains(host) && !failedHosts.contains(apex)) {
                 val solved = synchronized(CloudflareKiller::class.java) {
                     val existing = getSavedCookies(host)
                     if (existing.isNotEmpty()) {
-                        ServerState.info("[CF-DBG] Already have cookies for $host (${existing.keys}) — skipping browser launch")
                         return@synchronized true
                     }
                     ServerState.info("[CF] Attempting FlareSolverr for $host (url=${request.url})…")
@@ -284,9 +274,7 @@ class CloudflareKiller : Interceptor {
                     }
                 }
 
-                ServerState.info("[CF-DBG] launchManualClearance returned solved=$solved")
                 val solvedCookies = getSavedCookies(host)
-                ServerState.info("[CF-DBG] solvedCookies for $host: ${solvedCookies.keys}")
 
                 if (solved && solvedCookies.isNotEmpty()) {
                     val cfClearance = solvedCookies["cf_clearance"]
@@ -310,7 +298,6 @@ class CloudflareKiller : Interceptor {
                     }
 
                     val retryResponse = proceed(chain, request, solvedCookies, getSavedUserAgent(host))
-                    ServerState.info("[CF-DBG] retry response HTTP ${retryResponse.code}")
                     if (retryResponse.code !in ERROR_CODES) {
                         if (!FlareSolverrBypass.isEnabled) SystemBrowserCdpBypass.closePendingSession()
                         // OkHttp succeeded — flareSolverrBound stays as cookie-clearing guard.

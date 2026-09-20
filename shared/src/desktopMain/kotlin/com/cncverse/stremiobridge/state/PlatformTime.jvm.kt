@@ -21,6 +21,9 @@ private val logFile: File by lazy {
 actual fun platformLog(level: LogLevel, message: String) {
     println("[${level.name}] $message")
     runCatching {
+        if (logFile.exists() && logFile.length() > 50 * 1024 * 1024L) {
+            logFile.writeText("") // Truncate completely when reaching 50MB
+        }
         logFile.parentFile?.mkdirs()
         PrintWriter(FileOutputStream(logFile, true)).use { writer ->
             val ts = LocalDateTime.now().format(DateTimeFormatter.ofPattern("HH:mm:ss"))
