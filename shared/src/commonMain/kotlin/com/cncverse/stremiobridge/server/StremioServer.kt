@@ -1010,7 +1010,7 @@ object StremioServer {
         val sectionName = genre
 
         return try {
-            if (!search.isNullOrBlank()) {
+            val metas = if (!search.isNullOrBlank()) {
                 val results = api.search(search)
                 val filtered = if (api.supportedTypes.size > 1) {
                     results.filter { r -> cs3TvTypeToStremio(r.type) == type }
@@ -1025,6 +1025,7 @@ object StremioServer {
                 } else results
                 filtered.map { it.toStremiMeta(nameSlug(api.name), type) }
             }
+            enrichCatalogMetas(metas, type)
         } catch (e: Throwable) {
             ServerState.warn("Catalog error for ${api.name}: ${e.message}")
             emptyList()
@@ -1032,6 +1033,48 @@ object StremioServer {
     }
 
     private val TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
+    private suspend fun buildCatalog(
+        type: String, id: String, search: String?, skip: Int, genre: String?, profileId: String? = null
+    ): List<StremioMeta> {
+        val prefix = "cnc_"
+        if (!id.startsWith(prefix)) return emptyList()
+        val rest = id.removePrefix(prefix)
+        val nameSlugFromId = rest.removeSuffix("_$type")
+        val api = loadedApis.find { nameSlug(it.name) == nameSlugFromId }
+            ?: loadedApis.find { it.internalName == nameSlugFromId }
+            ?: loadedApis.find { rest.startsWith(it.internalName + "_") }
+            ?: loadedApis.firstOrNull()
+            ?: return emptyList()
+
+    private suspend fun enrichCatalogMetas(metas: List<StremioMeta>, type: String): List<StremioMeta> = coroutineScope {
+        val mediaType = if (type == "series") "series" else "movie"
+        metas.map { meta ->
+            async(Dispatchers.IO) {
+                try {
+                    val searchUrl = "https://v3-cinemeta.strem.io/catalog/$mediaType/top/search=${io.ktor.http.encodeURLQueryComponent(meta.name)}.json"
+                    val responseText = httpClient.get(searchUrl).bodyAsText()
+                    val jsonObject = serverJson.parseToJsonElement(responseText).jsonObject
+                    val results = jsonObject["metas"] as? kotlinx.serialization.json.JsonArray
+                    val bestMatch = results?.firstOrNull()?.jsonObject
+                    if (bestMatch != null) {
+                        val poster = bestMatch["poster"]?.jsonPrimitive?.content ?: meta.poster
+                        val background = bestMatch["background"]?.jsonPrimitive?.content ?: meta.background
+                        val yearStr = bestMatch["releaseInfo"]?.jsonPrimitive?.content?.take(4)
+                        val cinemetaYear = yearStr?.toIntOrNull() ?: meta.year
+
+                        meta.copy(
+                            poster = poster,
+                            background = background,
+                            year = cinemetaYear
+                        )
+                    } else meta
+                } catch (e: Exception) {
+                    meta
+                }
+            }
+        }.awaitAll()
+    }
+
     private suspend fun buildCatalog(
         type: String, id: String, search: String?, skip: Int, genre: String?, profileId: String? = null
     ): List<StremioMeta> {
@@ -1172,41 +1215,37 @@ object StremioServer {
 
         return try {
             val isImdbId = tmdbId.startsWith("tt")
-            val tmdbUrl = if (isImdbId) {
-                "https://api.themoviedb.org/3/find/$tmdbId?api_key=$TMDB_API_KEY&external_source=imdb_id"
+            val title: String?
+            val year: Int?
+
+            if (isImdbId) {
+                val cinemetaUrl = "https://v3-cinemeta.strem.io/meta/$mediaType/$tmdbId.json"
+                ServerState.info("Fetching Cinemeta: $cinemetaUrl")
+                val responseText = httpClient.get(cinemetaUrl).bodyAsText()
+                val jsonObject = serverJson.parseToJsonElement(responseText).jsonObject
+                val metaObj = jsonObject["meta"]?.jsonObject
+
+                title = metaObj?.get("name")?.jsonPrimitive?.content
+                year = metaObj?.get("year")?.jsonPrimitive?.content?.toIntOrNull()
+                    ?: metaObj?.get("releaseInfo")?.jsonPrimitive?.content?.take(4)?.toIntOrNull()
             } else {
-                "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=$TMDB_API_KEY"
+                val tmdbUrl = "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=$TMDB_API_KEY"
+                ServerState.info("Fetching TMDB: $tmdbUrl")
+                val responseText = httpClient.get(tmdbUrl).bodyAsText()
+                val mediaObj = serverJson.parseToJsonElement(responseText).jsonObject
+
+                title = mediaObj["title"]?.jsonPrimitive?.content
+                    ?: mediaObj["name"]?.jsonPrimitive?.content
+                year = mediaObj["release_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
+                    ?: mediaObj["first_air_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
             }
-
-            ServerState.info("Fetching TMDB: $tmdbUrl")
-            val responseText = httpClient.get(tmdbUrl).bodyAsText()
-            val jsonObject = serverJson.parseToJsonElement(responseText).jsonObject
-
-            val mediaObj = if (isImdbId) {
-                val movieResults = jsonObject["movie_results"] as? kotlinx.serialization.json.JsonArray
-                val tvResults = jsonObject["tv_results"] as? kotlinx.serialization.json.JsonArray
-                (movieResults?.firstOrNull() ?: tvResults?.firstOrNull())?.jsonObject
-            } else {
-                jsonObject
-            }
-
-            if (mediaObj == null) {
-                ServerState.warn("TMDB resolve failed: no media found for $tmdbId")
-                return emptyList()
-            }
-
-            val title = mediaObj["title"]?.jsonPrimitive?.content
-                ?: mediaObj["name"]?.jsonPrimitive?.content
 
             if (title == null) {
-                ServerState.warn("TMDB resolve failed: no title found")
+                ServerState.warn("Meta resolve failed for $tmdbId")
                 return emptyList()
             }
 
-            val year = mediaObj["release_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
-                ?: mediaObj["first_air_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
-
-            ServerState.info("TMDB resolve success: title='$title', year=$year")
+            ServerState.info("Meta resolve success: title='$title', year=$year")
 
             val activePlugins = loadedApis.filter { !isPluginBlocked(it, profileId) }
             ServerState.info("Searching across ${activePlugins.size} plugin(s)...")
