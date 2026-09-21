@@ -848,7 +848,7 @@ private class DirectMainApiWrapper(
     private val plugin: SitePlugin
 ) : MainApiWrapper {
     override val name: String get() = api.name
-    override val internalName: String get() = plugin.internalName + "_" + api.name.replace(Regex("[^A-Za-z0-9]"), "")
+    override val internalName: String get() = plugin.internalName + "_" + StremioServer.publicNameSlug(api.name)
     override val supportedTypes: List<String> get() {
         val hasLive = api.supportedTypes.any { it.name.equals("Live", ignoreCase = true) }
         val isOnlyLive = api.supportedTypes.size == 1 && hasLive

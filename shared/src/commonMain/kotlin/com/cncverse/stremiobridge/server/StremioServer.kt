@@ -531,7 +531,7 @@ object StremioServer {
     /** True when [id] (canonical name / slug) maps to a globally disabled extension. */
     fun isIdGloballyDisabled(id: String): Boolean {
         if (disabledPlugins.contains(id)) return true
-        val api = loadedApis.find { canonicalIds(it).contains(id) } ?: return false
+        val api = loadedApis.find { profileMatchIds(it).contains(id) } ?: return false
         return isGloballyDisabled(api)
     }
 
@@ -648,7 +648,7 @@ object StremioServer {
                 loadedApis.forEachIndexed { i, api ->
                     if (i > 0) sb.append(",")
                     val name = api.name.replace("\"", "\\\"")
-                    val id = nameSlug(api.name).replace("\"", "\\\"")
+                    val id = (unambiguousSlug(api) ?: api.internalName).replace("\"", "\\\"")
                     val plugin = installed.find { it.internalName == api.pluginInternalName || it.internalName == api.internalName }
                     val rawRepoUrl = plugin?.repoUrl ?: ""
                     // Canonicalize: prefer the URL as stored in the known repos list so that
@@ -842,6 +842,18 @@ object StremioServer {
     }
 
     /**
+     * Identifiers that can match this API in a profile record.
+     * Includes canonical IDs (always unique per plugin/API) and the display-name slug
+     * ONLY if unambiguous (unique across all loaded extensions), preventing cross-repo
+     * collisions when two repos ship an extension with the same name.
+     */
+    private fun profileMatchIds(api: MainApiWrapper): List<String> {
+        val ids = mutableListOf(api.internalName, api.pluginInternalName)
+        unambiguousSlug(api)?.let { ids.add(it) }
+        return ids.distinct()
+    }
+
+    /**
      * True when the extension must be hidden from the requesting manifest.
      * Global manifest: hidden when the admin disabled it. Profile manifests:
      * globally-enabled extensions follow the profile's disabled set, while
@@ -851,13 +863,13 @@ object StremioServer {
     private fun isPluginBlocked(api: MainApiWrapper, profileId: String?): Boolean {
         val globallyDisabled = isGloballyDisabled(api)
         if (profileId == null) return globallyDisabled
-        val rec = profiles[profileId]
-        val ids = canonicalIds(api)
+        val rec = profiles[profileId] ?: return globallyDisabled
+        val ids = profileMatchIds(api)
         return if (globallyDisabled) {
-            ids.none { rec?.enabledOverrides?.contains(it) == true } ||
-                ids.any { rec?.disabled?.contains(it) == true }
+            ids.none { rec.enabledOverrides.contains(it) } ||
+                ids.any { rec.disabled.contains(it) }
         } else {
-            ids.any { rec?.disabled?.contains(it) == true }
+            ids.any { rec.disabled.contains(it) }
         }
     }
 
@@ -891,13 +903,14 @@ object StremioServer {
         url.replace("/refs/heads/", "/").replace("/refs/tags/", "/")
 
     fun defaultCatalogDefsForApi(api: MainApiWrapper): List<StremioCatalogDef> {
+        val slug = unambiguousSlug(api) ?: (nameSlug(api.name) + "_" + nameSlug(api.pluginInternalName))
         return api.supportedTypes
             .map { cs3TvTypeToStremio(it) }
             .distinct()
             .map { stremioType ->
                 StremioCatalogDef(
                     type = stremioType,
-                    id   = "cnc_${nameSlug(api.name)}_$stremioType",
+                    id   = "cnc_${slug}_$stremioType",
                     name = "${api.name} ($stremioType)",
                     extra = listOf(ExtraEntry("search"), ExtraEntry("skip"))
                 )
@@ -912,6 +925,7 @@ object StremioServer {
         } catch (e: Throwable) {
             emptyList()
         }
+        val slug = unambiguousSlug(api) ?: (nameSlug(api.name) + "_" + nameSlug(api.pluginInternalName))
 
         return api.supportedTypes
             .map { cs3TvTypeToStremio(it) }
@@ -926,7 +940,7 @@ object StremioServer {
 
                 StremioCatalogDef(
                     type = stremioType,
-                    id   = "cnc_${nameSlug(api.name)}_$stremioType",
+                    id   = "cnc_${slug}_$stremioType",
                     name = "${api.name} ($stremioType)",
                     extra = extra
                 )
@@ -1098,7 +1112,8 @@ object StremioServer {
         val rest = id.removePrefix(prefix)
 
         val nameSlugFromId = rest.removeSuffix("_$type")
-        val api = loadedApis.find { nameSlug(it.name) == nameSlugFromId }
+        val api = loadedApis.find { (unambiguousSlug(it) ?: (nameSlug(it.name) + "_" + nameSlug(it.pluginInternalName))) == nameSlugFromId }
+            ?: loadedApis.find { nameSlug(it.name) == nameSlugFromId }
             ?: loadedApis.find { it.internalName == nameSlugFromId }          // old-format compat
             ?: loadedApis.find { rest.startsWith(it.internalName + "_") }    // prefix fallback
             ?: loadedApis.firstOrNull()
@@ -1136,7 +1151,8 @@ object StremioServer {
         if (!id.startsWith(prefix)) return emptyList()
         val rest = id.removePrefix(prefix)
         val nameSlugFromId = rest.removeSuffix("_$type")
-        val api = loadedApis.find { nameSlug(it.name) == nameSlugFromId }
+        val api = loadedApis.find { (unambiguousSlug(it) ?: (nameSlug(it.name) + "_" + nameSlug(it.pluginInternalName))) == nameSlugFromId }
+            ?: loadedApis.find { nameSlug(it.name) == nameSlugFromId }
             ?: loadedApis.find { it.internalName == nameSlugFromId }
             ?: loadedApis.find { rest.startsWith(it.internalName + "_") }
             ?: loadedApis.firstOrNull()
@@ -1166,7 +1182,8 @@ object StremioServer {
 
     private suspend fun buildMeta(type: String, id: String, profileId: String? = null): StremioMeta? {
         val (pluginKey, dataUrl) = StremioIds.decode(id) ?: return null
-        val api = loadedApis.find { nameSlug(it.name) == pluginKey }
+        val api = loadedApis.find { (unambiguousSlug(it) ?: (nameSlug(it.name) + "_" + nameSlug(it.pluginInternalName))) == pluginKey }
+            ?: loadedApis.find { nameSlug(it.name) == pluginKey }
             ?: loadedApis.find { it.internalName == pluginKey }
             ?: return null
         if (isPluginBlocked(api, profileId)) return null
@@ -1224,7 +1241,8 @@ object StremioServer {
         if (decoded != null) {
             val (pluginKey, dataUrl) = decoded
             val matchingApis = loadedApis.filter { api ->
-                nameSlug(api.name) == pluginKey || api.internalName == pluginKey
+                val slug = unambiguousSlug(api) ?: (nameSlug(api.name) + "_" + nameSlug(api.pluginInternalName))
+                slug == pluginKey || nameSlug(api.name) == pluginKey || api.internalName == pluginKey
             }.filter { !isPluginBlocked(it, profileId) }
 
             if (matchingApis.isEmpty()) return emptyList()
