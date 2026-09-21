@@ -190,6 +190,8 @@ object BridgeRuntime {
                     StremioServer.setPluginDisabled(api.pluginInternalName, disabled = true)
                 }
             }
+            // Normalize the disabled set to remove any alias duplicates just created
+            StremioServer.cleanupDisabledPlugins()
         }
         return ok
     }
@@ -253,6 +255,10 @@ object BridgeRuntime {
             ServerState.warn("Timed out waiting for plugin load — starting server with whatever is available")
         }
         val loadedInfos = ServerState.globalLoadedPlugins.value
+
+        // Strip any stale alias entries from disabledPlugins so that the admin toggle
+        // UI can reliably enable extensions (ghost entries from legacy saves are removed).
+        StremioServer.cleanupDisabledPlugins()
 
         val ipAddress = getLocalIpAddress() ?: "127.0.0.1"
         CloudflaredManager.deviceIp = ipAddress

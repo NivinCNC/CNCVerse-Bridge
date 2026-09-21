@@ -1,6 +1,7 @@
 package com.cncverse.stremiobridge.server
 
 import com.cncverse.stremiobridge.model.*
+import com.cncverse.stremiobridge.state.RepoState
 import com.cncverse.stremiobridge.state.ServerState
 import com.cncverse.stremiobridge.state.currentTimeMillis
 import io.ktor.http.*
@@ -404,40 +405,136 @@ object StremioServer {
     }
 
     /**
+     * Canonical identifiers for a loaded extension: the per-API internalName and the
+     * backing plugin's internalName. These are always unique per plugin file and are
+     * the primary keys used for the disabled set.
+     *
+     * NOTE: We deliberately exclude nameSlug(api.name) here. Display names are NOT
+     * unique — two repos can ship a plugin with the same display name (e.g. "Netflix"),
+     * and using the slug would cause disabling one to silently disable the other.
+     * Slug matching is handled separately as a legacy-only, uniqueness-guarded fallback.
+     */
+    private fun canonicalIds(api: MainApiWrapper): List<String> =
+        listOf(api.internalName, api.pluginInternalName).distinct()
+
+    /**
+     * Returns the display-name slug for [api] **only if** no other currently loaded
+     * API shares the same slug. When two plugins have the same display name (cross-repo
+     * duplicates) the slug is ambiguous and must NOT be used to identify either one.
+     */
+    private fun unambiguousSlug(api: MainApiWrapper): String? {
+        val slug = nameSlug(api.name)
+        val sharers = loadedApis.count { nameSlug(it.name) == slug }
+        return if (sharers == 1) slug else null
+    }
+
+    /**
+     * Returns all alias keys in [disabledPlugins] that belong exclusively to the
+     * extension identified by [internalName]. Slugs are only included when they are
+     * unambiguous (unique to this plugin) — this prevents enabling plugin A from
+     * accidentally removing a shared slug that plugin B still needs.
+     */
+    private fun allAliasesInDisabled(internalName: String): Set<String> {
+        val result = mutableSetOf(internalName)
+        // Collect canonical IDs from the matching loaded API(s)
+        val matchingApis = loadedApis.filter { canonicalIds(it).contains(internalName) }
+        matchingApis.flatMapTo(result) { canonicalIds(it) }
+        // Add unambiguous slug(s) so legacy slug entries are cleaned up on enable
+        matchingApis.forEach { api ->
+            unambiguousSlug(api)?.let { slug ->
+                result += slug
+                result += api.name          // exact display name variant
+            }
+        }
+        // Also cover display name from installed plugin metadata (pre-load legacy)
+        RepoState.installedPlugins.value
+            .find { it.internalName == internalName }
+            ?.let { inst ->
+                result += inst.internalName
+                if (inst.displayName.isNotBlank()) {
+                    val dn = inst.displayName
+                    val slug = nameSlug(dn)
+                    // Only include display name / slug if no OTHER installed plugin shares it
+                    val slugSharers = RepoState.installedPlugins.value.count { nameSlug(it.displayName) == slug }
+                    if (slugSharers == 1) {
+                        result += dn
+                        result += slug
+                    }
+                }
+            }
+        return result
+    }
+
+    /**
      * Toggles a plugin's enabled state and persists it. Returns the new enabled state.
+     *
+     * When **enabling**, removes ALL alias entries that exclusively belong to this
+     * plugin (canonical IDs + unambiguous slug) so legacy ghost entries are cleared
+     * without touching sibling plugins that share the same display name.
      */
     fun togglePluginDisabled(internalName: String): Boolean {
-        val enabled = if (disabledPlugins.contains(internalName)) {
-            disabledPlugins.remove(internalName)
+        val isCurrentlyDisabled = disabledPlugins.contains(internalName) ||
+            loadedApis.any { api -> canonicalIds(api).contains(internalName) && isGloballyDisabled(api) }
+        return if (isCurrentlyDisabled) {
+            allAliasesInDisabled(internalName).forEach { disabledPlugins.remove(it) }
+            saveDisabledPlugins()
             true
         } else {
             disabledPlugins.add(internalName)
+            saveDisabledPlugins()
             false
         }
-        saveDisabledPlugins()
-        return enabled
     }
 
     /** Sets a plugin's global enabled state and persists it. */
     fun setPluginDisabled(internalName: String, disabled: Boolean = true) {
-        if (disabled) disabledPlugins.add(internalName) else disabledPlugins.remove(internalName)
+        if (disabled) {
+            disabledPlugins.add(internalName)
+        } else {
+            allAliasesInDisabled(internalName).forEach { disabledPlugins.remove(it) }
+        }
         saveDisabledPlugins()
     }
 
-    /** All identifiers a loaded extension answers to (display slug, per-API name, plugin name). */
-    private fun apiIds(api: MainApiWrapper): List<String> =
-        listOf(nameSlug(api.name), api.internalName, api.pluginInternalName).distinct()
+    /**
+     * Removes stale/alias entries from [disabledPlugins], keeping only canonical
+     * [InstalledPlugin.internalName] values. Run at startup and after bulk installs.
+     */
+    fun cleanupDisabledPlugins() {
+        val installed = RepoState.installedPlugins.value
+        if (installed.isEmpty()) return
+        val canonicalNames = installed.map { it.internalName }.toSet()
+        val before = disabledPlugins.size
+        val stale = disabledPlugins.filter { it !in canonicalNames }.toSet()
+        if (stale.isNotEmpty()) {
+            stale.forEach { disabledPlugins.remove(it) }
+            saveDisabledPlugins()
+            ServerState.info("Disabled-plugins cleanup: removed ${stale.size} stale alias entries ($before → ${disabledPlugins.size})")
+        }
+    }
 
-    /** True when the admin has globally disabled this extension. */
-    fun isGloballyDisabled(api: MainApiWrapper): Boolean =
-        apiIds(api).any { disabledPlugins.contains(it) }
+    /**
+     * True when the admin has globally disabled this extension.
+     *
+     * Checks canonical IDs first (internalName, pluginInternalName — always unique).
+     * Falls back to slug matching only when the slug is unambiguous (i.e. no other
+     * loaded plugin shares the same display name), preventing cross-repo collisions.
+     */
+    fun isGloballyDisabled(api: MainApiWrapper): Boolean {
+        // Primary check: canonical unique IDs
+        if (canonicalIds(api).any { disabledPlugins.contains(it) }) return true
+        // Legacy fallback: slug, but only if it's unambiguous
+        val slug = unambiguousSlug(api) ?: return false
+        return disabledPlugins.contains(slug) || disabledPlugins.contains(api.name)
+    }
 
-    /** True when [id] (slug / per-API name / plugin name) maps to a globally disabled extension. */
+    /** True when [id] (canonical name / slug) maps to a globally disabled extension. */
     fun isIdGloballyDisabled(id: String): Boolean {
         if (disabledPlugins.contains(id)) return true
-        val api = loadedApis.find { apiIds(it).contains(id) } ?: return false
+        val api = loadedApis.find { canonicalIds(it).contains(id) } ?: return false
         return isGloballyDisabled(api)
     }
+
 
     private fun Application.setupPlugins() {
         install(ContentNegotiation) { json(serverJson) }
@@ -755,7 +852,7 @@ object StremioServer {
         val globallyDisabled = isGloballyDisabled(api)
         if (profileId == null) return globallyDisabled
         val rec = profiles[profileId]
-        val ids = apiIds(api)
+        val ids = canonicalIds(api)
         return if (globallyDisabled) {
             ids.none { rec?.enabledOverrides?.contains(it) == true } ||
                 ids.any { rec?.disabled?.contains(it) == true }
