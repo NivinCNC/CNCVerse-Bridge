@@ -919,7 +919,7 @@ object StremioServer {
 
     suspend fun fetchCatalogDefsForApi(api: MainApiWrapper): List<StremioCatalogDef> {
         val sections = try {
-            withTimeoutOrNull(8_000) {
+            withTimeoutOrNull(25_000) {
                 api.getMainPageSections()
             } ?: emptyList()
         } catch (e: Throwable) {

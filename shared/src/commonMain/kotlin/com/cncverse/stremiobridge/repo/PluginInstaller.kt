@@ -81,7 +81,12 @@ object PluginInstaller {
 
     /**
      * Auto-updates any installed plugin that has UpdateAvailable state.
-     * Downloads the new version and replaces the cached file.
+     *
+     * For each outdated plugin:
+     *  1. Snapshots its current enabled/disabled state.
+     *  2. Explicitly deletes the old .cs3 file from disk (uninstall).
+     *  3. Downloads and installs the new version.
+     *  4. Restores the previously captured enabled/disabled state.
      */
     suspend fun autoUpdateInstalled(cacheDir: String) {
         val available = RepoState.availablePlugins.value
@@ -91,9 +96,43 @@ object PluginInstaller {
         }
 
         toUpdate.forEach { inst ->
-            val ap = available.find { it.plugin.internalName == inst.internalName && it.repoEntry.url == inst.repoUrl } ?: return@forEach
-            ServerState.info("Auto-updating '${inst.displayName}' to v${ap.plugin.version}…")
-            installPlugin(ap, cacheDir)
+            val ap = available.find {
+                it.plugin.internalName == inst.internalName && it.repoEntry.url == inst.repoUrl
+            } ?: return@forEach
+
+            // 1. Snapshot the current globally-disabled state before touching anything.
+            val wasDisabled = com.cncverse.stremiobridge.server.StremioServer.disabledPlugins
+                .contains(inst.internalName)
+
+            ServerState.info(
+                "Auto-updating '${inst.displayName}' " +
+                    "v${inst.version} → v${ap.plugin.version}…" +
+                    if (wasDisabled) " (was disabled)" else ""
+            )
+
+            // 2. Explicitly remove the old .cs3 file so a stale/corrupt file can
+            //    never survive the update if the download subsequently fails.
+            val oldFile = File(inst.localPath)
+            if (oldFile.exists()) {
+                oldFile.delete()
+                ServerState.info("Deleted old '${inst.displayName}' file: ${oldFile.name}")
+            }
+            RepoState.markUninstalled(inst.internalName)
+
+            // 3. Download and install the new version.
+            val success = installPlugin(ap, cacheDir)
+
+            // 4. Restore the enabled/disabled state the plugin had before the update.
+            if (success) {
+                com.cncverse.stremiobridge.server.StremioServer.setPluginDisabled(
+                    inst.internalName,
+                    disabled = wasDisabled,
+                )
+                ServerState.info(
+                    "'${inst.displayName}' updated successfully — " +
+                        if (wasDisabled) "kept disabled" else "re-enabled"
+                )
+            }
         }
     }
 
