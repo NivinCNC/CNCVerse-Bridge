@@ -62,6 +62,20 @@ object PluginSettingsSchemaRegistry {
                 normalizedPref, key, type, defaultValue, existing.storageKey,
             )
             schemaUpdates.value++
+        } else if (
+            existing.type == "StringSet" &&
+            defaultValue is Set<*> &&
+            existing.defaultValue is Set<*> &&
+            defaultValue != existing.defaultValue
+        ) {
+            // Plugin updated — replace the old provider list with the new one.
+            // Providers removed from the new version disappear from the options UI;
+            // providers added in the new version appear immediately.
+            // The stored preference value on disk is intentionally NOT touched:
+            // providers the user enabled that still exist in the new set remain
+            // enabled; providers dropped from the new set are simply not rendered.
+            pluginMap[key] = existing.copy(defaultValue = defaultValue)
+            schemaUpdates.value++
         }
     }
 

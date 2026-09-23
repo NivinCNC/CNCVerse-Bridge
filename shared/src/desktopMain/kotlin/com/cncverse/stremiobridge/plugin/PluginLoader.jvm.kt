@@ -27,12 +27,17 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import okhttp3.Call
+import okhttp3.EventListener
 import okhttp3.Request
+import okhttp3.Response
 import java.io.File
 import java.io.InputStreamReader
+import java.lang.ref.WeakReference
 import java.lang.reflect.InvocationTargetException
 import java.net.URLClassLoader
 import java.util.Base64
+import java.util.concurrent.ConcurrentHashMap
 import java.util.zip.ZipFile
 
 private val manifestJson = Json { ignoreUnknownKeys = true }
@@ -97,6 +102,8 @@ actual class PluginLoader {
                 .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
                 .readTimeout(35, java.util.concurrent.TimeUnit.SECONDS)
                 .retryOnConnectionFailure(true)
+                .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
+                .eventListenerFactory(LeakSafeEventListener.FACTORY)
                 .build()
             okClientField.set(currentNiceClient, newOk)
             ServerState.info("Configured AdaptiveHostDns + CloudflareKiller on app.client (global)")
@@ -130,6 +137,8 @@ actual class PluginLoader {
                         val patched = existing.newBuilder()
                             .addInterceptor(cfKiller)
                             .dns(AdaptiveHostDns)
+                            .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
+                            .eventListenerFactory(LeakSafeEventListener.FACTORY)
                             .build()
                         runCatching { baseClientField.set(target, patched) }
                         runCatching { baseClientField.set(null, patched) }
@@ -587,6 +596,55 @@ actual class PluginLoader {
         loadedClassLoaders.clear()
         PluginCallContext.classLoaders.clear()
         ServerState.info("All plugins unloaded")
+    }
+}
+
+/**
+ * OkHttp EventListener that auto-closes any [Response] body left open when
+ * a [Call] finishes (normally or with a failure). Plugins call NiceHttp inside
+ * coroutine callbacks and sometimes exit before consuming/closing the body
+ * (e.g. on timeout or early-return), which OkHttp then logs as a leak warning
+ * and leaves the underlying connection checked-out from the pool indefinitely.
+ *
+ * This listener tracks the most-recent response per call (via WeakReference so
+ * the Call itself can be GC'd without a strong reference cycle) and closes it
+ * in [callEnd]/[callFailed] if OkHttp's internal isCanceled/consumed flag is
+ * not already set.
+ */
+private class LeakSafeEventListener : EventListener() {
+
+    // Map from Call to the latest Response received for that call.
+    // ConcurrentHashMap + WeakReference so completed calls are GC-eligible.
+    private val liveResponses = ConcurrentHashMap<Call, WeakReference<Response>>()
+
+    override fun responseHeadersEnd(call: Call, response: Response) {
+        liveResponses[call] = WeakReference(response)
+    }
+
+    override fun callEnd(call: Call) {
+        closeIfLeaked(call)
+    }
+
+    override fun callFailed(call: Call, ioe: java.io.IOException) {
+        closeIfLeaked(call)
+    }
+
+    private fun closeIfLeaked(call: Call) {
+        val ref = liveResponses.remove(call) ?: return
+        val response = ref.get() ?: return
+        try {
+            val body = response.body ?: return
+            // Only close if the body source is not already exhausted.
+            // Calling close() on an already-exhausted body is a no-op in OkHttp.
+            body.close()
+        } catch (_: Throwable) {
+            // Best-effort: ignore errors closing an already-closed body.
+        }
+    }
+
+    companion object {
+        /** Singleton factory — one listener instance per call (stateful, not shared). */
+        val FACTORY: Factory = Factory { LeakSafeEventListener() }
     }
 }
 
