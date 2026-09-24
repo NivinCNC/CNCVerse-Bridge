@@ -32,6 +32,7 @@ fun Application.installMpdProxyRoutes() {
 }
 
 private suspend fun handleMpdProxy(call: ApplicationCall, converter: MpdConverter) {
+    var mpdUrl: String? = null
     try {
         val destinationUrl = call.parameters["d"] ?: call.parameters["url"]
             ?: return call.respond(HttpStatusCode.BadRequest, mapOf("error" to "Missing 'd' or 'url' parameter"))
@@ -40,6 +41,7 @@ private suspend fun handleMpdProxy(call: ApplicationCall, converter: MpdConverte
         // which gets URL-decoded and included in the __hdnea__ HMAC query value, corrupting
         // the signature and causing an immediate HTTP 403 from the CDN.
         val decodedUrl = URLDecoder.decode(destinationUrl, "UTF-8").trimEnd('?', '&')
+        mpdUrl = decodedUrl
         val repId = call.request.queryParameters["rep_id"]
         val clearKey = call.request.queryParameters["clearkey"]
             ?: buildClearKey(call.request.queryParameters["key_id"], call.request.queryParameters["key"])
@@ -86,7 +88,7 @@ private suspend fun handleMpdProxy(call: ApplicationCall, converter: MpdConverte
 
     } catch (e: kotlinx.coroutines.CancellationException) {
     } catch (e: Exception) {
-        ServerState.warn("MPD_PROXY_ERR: ${e.message}")
+        ServerState.warn("MPD_PROXY_ERR: ${e.message} | url=$mpdUrl")
         try { call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "MPD proxy error: ${e.message}")) } catch (_: Exception) {}
     }
 }

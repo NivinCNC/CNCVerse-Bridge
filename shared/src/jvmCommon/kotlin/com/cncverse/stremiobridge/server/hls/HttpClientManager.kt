@@ -7,6 +7,7 @@ import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
 import com.cncverse.stremiobridge.state.ServerState
+import com.cncverse.stremiobridge.network.DomainProxyInterceptor
 
 /**
  * Manager singleton per OkHttp client
@@ -45,15 +46,15 @@ object HttpClientManager {
         .retryOnConnectionFailure(true)
         .build()
 
-    /**
-     * Crea un client con proxy opzionale
-     */
-    fun createClient(proxyUrl: String? = null): OkHttpClient {
-        if (proxyUrl.isNullOrBlank()) {
+    fun createClient(proxyUrl: String? = null, url: String? = null): OkHttpClient {
+        val resolvedProxy = proxyUrl
+            ?: url?.let { DomainProxyInterceptor.ULTRASURF_IN.proxyUrlFor(it) }
+
+        if (resolvedProxy.isNullOrBlank()) {
             return baseClient
         }
         return try {
-            val proxy = parseProxy(proxyUrl)
+            val proxy = parseProxy(resolvedProxy)
             baseClient.newBuilder()
                 .proxy(proxy)
                 .build()
@@ -70,7 +71,7 @@ object HttpClientManager {
         headers: Map<String, String> = emptyMap(),
         proxyUrl: String? = null
     ): String {
-        val client = createClient(proxyUrl)
+        val client = createClient(proxyUrl, url)
         val request = buildRequest(url, headers)
 
         return client.newCall(request).execute().use { response ->
@@ -89,7 +90,7 @@ object HttpClientManager {
         headers: Map<String, String> = emptyMap(),
         proxyUrl: String? = null
     ): ByteArray {
-        val client = createClient(proxyUrl)
+        val client = createClient(proxyUrl, url)
         val request = buildRequest(url, headers)
 
         return client.newCall(request).execute().use { response ->
@@ -108,7 +109,7 @@ object HttpClientManager {
         headers: Map<String, String> = emptyMap(),
         proxyUrl: String? = null
     ): Response {
-        val client = createClient(proxyUrl)
+        val client = createClient(proxyUrl, url)
         val request = buildRequest(url, headers)
 
         val response = client.newCall(request).execute()
@@ -129,7 +130,7 @@ object HttpClientManager {
         contentType: String = "application/x-www-form-urlencoded",
         proxyUrl: String? = null
     ): String {
-        val client = createClient(proxyUrl)
+        val client = createClient(proxyUrl, url)
         val requestBody = body.toRequestBody(contentType.toMediaType())
         val request = buildRequest(url, headers, requestBody)
 
@@ -149,7 +150,7 @@ object HttpClientManager {
         headers: Map<String, String> = emptyMap(),
         proxyUrl: String? = null
     ): Headers {
-        val client = createClient(proxyUrl)
+        val client = createClient(proxyUrl, url)
         val request = buildRequest(url, headers, method = "HEAD")
 
         return client.newCall(request).execute().use { response ->

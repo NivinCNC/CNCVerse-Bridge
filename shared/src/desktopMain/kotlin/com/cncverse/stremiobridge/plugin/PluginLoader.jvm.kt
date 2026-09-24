@@ -82,6 +82,9 @@ actual class PluginLoader {
 
     /** Reconfigures the global NiceHttp `app` client used by plugins with AdaptiveHostDns + CloudflareKiller. */
     private fun configureAppClientNetwork() {
+        java.net.ProxySelector.setDefault(com.cncverse.stremiobridge.network.UltrasurfProxySelector)
+        ServerState.info("Installed UltrasurfProxySelector as JVM default (covers all OkHttpClient instances)")
+
         val cfKiller = com.lagradost.cloudstream3.network.CloudflareKiller()
 
         // ── 1. Patch the global `app` (MainActivityKt.getApp()) ──────────────
@@ -97,6 +100,7 @@ actual class PluginLoader {
 
             val newOk = existingOk.newBuilder()
                 .addInterceptor(cfKiller)
+                .addInterceptor(com.cncverse.stremiobridge.network.DomainProxyInterceptor.ULTRASURF_IN)
                 .dns(AdaptiveHostDns)
                 .fastFallback(true)
                 .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
@@ -106,7 +110,7 @@ actual class PluginLoader {
                 .eventListenerFactory(LeakSafeEventListener.FACTORY)
                 .build()
             okClientField.set(currentNiceClient, newOk)
-            ServerState.info("Configured AdaptiveHostDns + CloudflareKiller on app.client (global)")
+            ServerState.info("Configured AdaptiveHostDns + CloudflareKiller + UltrasurfIN proxy on app.client (global)")
         } catch (t: Throwable) {
             ServerState.warn("Failed to configure global app.client: ${t.message}")
         }
@@ -136,13 +140,14 @@ actual class PluginLoader {
                     if (!alreadyHas) {
                         val patched = existing.newBuilder()
                             .addInterceptor(cfKiller)
+                            .addInterceptor(com.cncverse.stremiobridge.network.DomainProxyInterceptor.ULTRASURF_IN)
                             .dns(AdaptiveHostDns)
                             .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
                             .eventListenerFactory(LeakSafeEventListener.FACTORY)
                             .build()
                         runCatching { baseClientField.set(target, patched) }
                         runCatching { baseClientField.set(null, patched) }
-                        ServerState.info("Configured CloudflareKiller on NiceHttp Requests.baseClient")
+                        ServerState.info("Configured CloudflareKiller + UltrasurfIN proxy on NiceHttp Requests.baseClient")
                     }
                 }
             } else {
@@ -179,9 +184,12 @@ actual class PluginLoader {
                 }?.also { it.isAccessible = true } ?: return@runCatching
                 val existing = okField.get(requests) as? okhttp3.OkHttpClient ?: return@runCatching
                 if (existing.interceptors.none { it is com.lagradost.cloudstream3.network.CloudflareKiller }) {
-                    val patched = existing.newBuilder().addInterceptor(cfKiller).build()
+                    val patched = existing.newBuilder()
+                        .addInterceptor(cfKiller)
+                        .addInterceptor(com.cncverse.stremiobridge.network.DomainProxyInterceptor.ULTRASURF_IN)
+                        .build()
                     okField.set(requests, patched)
-                    ServerState.info("[CF] Patched CloudflareKiller into com.horis.cncverse.UtilsKt.app")
+                    ServerState.info("[CF] Patched CloudflareKiller + UltrasurfIN proxy into com.horis.cncverse.UtilsKt.app")
                 }
             }
 
