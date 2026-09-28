@@ -574,6 +574,11 @@ object StremioServer {
             get("/configure") {
                 call.respondText(buildIndexHtml(), ContentType.Text.Html)
             }
+            // Profile manifest is served from /u/{profileId}/manifest.json, so
+            // Stremio resolves the configure page at /u/{profileId}/configure.
+            get("/u/{profileId}/configure") {
+                call.respondText(buildIndexHtml(), ContentType.Text.Html)
+            }
             get("/logo.png") {
                 val bytes = logoBytes
                 if (bytes != null) {
