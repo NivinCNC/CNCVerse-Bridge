@@ -75,8 +75,6 @@ data class AdminSummary(
     val refreshing: Boolean = false,
     val update: AdminUpdateInfo? = null,
     val tokenRequired: Boolean = false,
-    /** Current FlareSolverr URL; empty string = disabled. */
-    val flareSolverrUrl: String = "",
 )
 
 // ─── Extensions listing ──────────────────────────────────────────────────────

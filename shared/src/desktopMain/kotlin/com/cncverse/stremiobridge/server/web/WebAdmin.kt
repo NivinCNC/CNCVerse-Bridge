@@ -1,7 +1,6 @@
 package com.cncverse.stremiobridge.server.web
 
 import com.cncverse.stremiobridge.Constants
-import com.cncverse.stremiobridge.network.FlareSolverrBypass
 import com.cncverse.stremiobridge.plugin.GlobalPluginManager
 import com.cncverse.stremiobridge.repo.PluginInstaller
 import com.cncverse.stremiobridge.repo.RepoManager
@@ -621,7 +620,6 @@ object WebAdmin {
             refreshing = RepoState.isRefreshing.value,
             update = update,
             tokenRequired = adminToken != null,
-            flareSolverrUrl = FlareSolverrBypass.solverrUrl,
         )
     }
 

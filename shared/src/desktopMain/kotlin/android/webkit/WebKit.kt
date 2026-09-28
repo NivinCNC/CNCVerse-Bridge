@@ -3,9 +3,12 @@ package android.webkit
 import android.content.Context
 import android.view.ViewGroup
 import java.io.InputStream
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.GlobalScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import okhttp3.OkHttpClient
+import okhttp3.Request
 
 /**
  * android.webkit stubs. Desktop has no WebView engine, so these are inert —
@@ -19,41 +22,54 @@ class WebView(context: Context? = null) : ViewGroup() {
     fun setWebChromeClient(client: WebChromeClient?) {}
 
     /**
-     * On desktop, loadUrl triggers FlareSolverr (preferred) or the CDP browser solver
-     * so plugins calling WebView-based CF bypass can get cf_clearance via CookieManager.getCookie().
+     * On desktop, loadUrl performs a plain HTTP GET and stores any cookies
+     * returned in Set-Cookie headers into CookieManager so plugins that poll
+     * getCookie() can find them. No FlareSolverr or CDP involved.
      */
     fun loadUrl(url: String?) {
         if (url.isNullOrBlank()) return
-        com.cncverse.stremiobridge.state.ServerState.info("[WebView-DBG] loadUrl($url) — triggering FlareSolverr solver")
+        com.cncverse.stremiobridge.state.ServerState.info("[WebView-DBG] loadUrl($url) — plain HTTP GET")
         GlobalScope.launch(Dispatchers.IO) {
             try {
-                val fs = com.cncverse.stremiobridge.network.FlareSolverrBypass
-                if (fs.isEnabled) {
-                    val result = fs.solve(url)
-                    if (result != null && result.cookies.isNotEmpty()) {
-                        // Inject cookies into CookieManager so the plugin's getCookie() poll finds them
-                        val cm = android.webkit.CookieManager.getInstance()
-                        result.cookies.forEach { (name, value) ->
-                            cm.setCookie(url, "$name=$value")
-                        }
-                        com.cncverse.stremiobridge.state.ServerState.info(
-                            "[WebView-DBG] FlareSolverr solved — cookies=${result.cookies.keys}"
-                        )
-                    } else {
-                        com.cncverse.stremiobridge.state.ServerState.warn(
-                            "[WebView-DBG] FlareSolverr failed for $url — no cookies returned"
-                        )
+                val client = OkHttpClient.Builder()
+                    .followRedirects(true)
+                    .connectTimeout(15, TimeUnit.SECONDS)
+                    .readTimeout(30, TimeUnit.SECONDS)
+                    .build()
+
+                val request = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36")
+                    .build()
+
+                val response = client.newCall(request).execute()
+                val cm = android.webkit.CookieManager.getInstance()
+
+                // Collect cookies from Set-Cookie response headers
+                val newCookies = mutableMapOf<String, String>()
+                response.headers.values("Set-Cookie").forEach { header ->
+                    val nameValue = header.split(";").firstOrNull()?.trim() ?: return@forEach
+                    val parts = nameValue.split("=", limit = 2)
+                    val name  = parts.getOrNull(0)?.trim() ?: return@forEach
+                    val value = parts.getOrNull(1)?.trim() ?: ""
+                    if (name.isNotBlank()) {
+                        cm.setCookie(url, "$name=$value")
+                        newCookies[name] = value
                     }
+                }
+                response.close()
+
+                if (newCookies.isNotEmpty()) {
+                    com.cncverse.stremiobridge.state.ServerState.info(
+                        "[WebView-DBG] loadUrl saved cookies: ${newCookies.keys}"
+                    )
                 } else {
-                    // CDP fallback when FlareSolverr is disabled
-                    com.cncverse.stremiobridge.state.ServerState.info("[WebView-DBG] loadUrl($url) — triggering CDP solver")
-                    com.cncverse.stremiobridge.network.SystemBrowserCdpBypass.launchManualClearance(
-                        targetUrl = url,
-                        hostName = runCatching { java.net.URI(url).host }.getOrNull(),
+                    com.cncverse.stremiobridge.state.ServerState.info(
+                        "[WebView-DBG] loadUrl($url) — no cookies in response"
                     )
                 }
             } catch (e: Exception) {
-                com.cncverse.stremiobridge.state.ServerState.error("[WebView-DBG] solver failed: ${e.message}")
+                com.cncverse.stremiobridge.state.ServerState.warn("[WebView-DBG] loadUrl failed: ${e.message}")
             }
         }
     }
