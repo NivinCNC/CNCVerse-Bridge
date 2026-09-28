@@ -69,14 +69,101 @@ object PluginInstaller {
         }
     }
 
-    /** Uninstall a plugin: remove the .cs3 file from disk and clear install record. */
+    /** Uninstall a plugin: remove the .cs3 file (and its converted jars) from disk and clear install record. */
     suspend fun uninstallPlugin(internalName: String, cacheDir: String) = withContext(Dispatchers.IO) {
-        val dir = File(cacheDir, "plugins")
-        dir.listFiles { f -> f.nameWithoutExtension == internalName.replace(Regex("[^A-Za-z0-9._-]"), "_").lowercase() }
-            ?.firstOrNull()?.delete()
+        val inst = RepoState.installedPlugins.value.find { it.internalName == internalName }
+            ?: loadInstalledPlugins(cacheDir).find { it.internalName == internalName }
+        deletePluginFiles(cacheDir, internalName, inst?.localPath)
         RepoState.markUninstalled(internalName)
         saveInstalledPlugins(cacheDir)
         ServerState.info("Uninstalled '$internalName'")
+    }
+
+    /** Matches the dex2jar outputs the desktop loader writes next to a .cs3 (`<base>-jvm5.jar`). */
+    private val convertedJarSuffix = Regex("-jvm\\d+\\.jar$")
+
+    private fun sanitizeName(internalName: String) =
+        internalName.replace(Regex("[^A-Za-z0-9._-]"), "_").lowercase()
+
+    /** Base file name shared by a plugin's .cs3, its temp .dex and its converted -jvmN.jar files. */
+    private fun pluginFileBase(fileName: String): String = when {
+        fileName.endsWith(".cs3") -> fileName.removeSuffix(".cs3")
+        fileName.endsWith(".dex") -> fileName.removeSuffix(".dex")
+        convertedJarSuffix.containsMatchIn(fileName) -> fileName.replace(convertedJarSuffix, "")
+        else -> fileName
+    }
+
+    /** Deletes the .cs3 and every derived artifact (.dex, -jvmN.jar) for one plugin. */
+    private fun deletePluginFiles(cacheDir: String, internalName: String, localPath: String?) {
+        val dir = File(cacheDir, "plugins")
+        val bases = buildSet {
+            add(sanitizeName(internalName))
+            localPath?.let { add(File(it).nameWithoutExtension) }
+        }
+        localPath?.let { File(it).delete() }
+        dir.listFiles()?.forEach { f ->
+            if (f.isFile && pluginFileBase(f.name) in bases) f.delete()
+        }
+    }
+
+    /**
+     * Removes every installed plugin that came from [repoUrl]: deletes the
+     * .cs3 + converted jars from disk and persists the updated install list.
+     * Reads the on-disk list too, so records already dropped from memory are
+     * still cleaned up. Returns the removed internal names.
+     */
+    fun removePluginsForRepo(repoUrl: String, cacheDir: String): List<String> {
+        val candidates = (RepoState.installedPlugins.value + loadInstalledPlugins(cacheDir))
+            .filter { it.repoUrl == repoUrl }
+            .distinctBy { it.internalName }
+        candidates.forEach { inst ->
+            deletePluginFiles(cacheDir, inst.internalName, inst.localPath)
+            RepoState.markUninstalled(inst.internalName)
+        }
+        // Persist from the on-disk list minus the removed repo so nothing else is lost
+        val remaining = loadInstalledPlugins(cacheDir).filter { it.repoUrl != repoUrl }
+        RepoState.setInstalledPlugins(RepoState.installedPlugins.value.filter { it.repoUrl != repoUrl })
+        writeInstalled(cacheDir, remaining)
+        if (candidates.isNotEmpty()) {
+            ServerState.info("Removed ${candidates.size} extension(s) from deleted repo $repoUrl")
+        }
+        return candidates.map { it.internalName }
+    }
+
+    /**
+     * Startup cleanup: uninstalls extensions whose repo is no longer in
+     * [repoUrls] and deletes plugin files (.cs3 / -jvmN.jar / .dex) that no
+     * installed record references. Skipped when [repoUrls] is empty so a
+     * failed repo-list load can never wipe every extension.
+     * Returns the internal names that were uninstalled.
+     */
+    fun pruneOrphans(cacheDir: String, repoUrls: Collection<String>): List<String> {
+        if (repoUrls.isEmpty()) return emptyList()
+        val known = repoUrls.toSet()
+        val installed = loadInstalledPlugins(cacheDir)
+        val (keep, orphaned) = installed.partition { it.repoUrl in known }
+        orphaned.forEach { deletePluginFiles(cacheDir, it.internalName, it.localPath) }
+        if (orphaned.isNotEmpty()) {
+            writeInstalled(cacheDir, keep)
+            RepoState.setInstalledPlugins(RepoState.installedPlugins.value.filter { it.repoUrl in known })
+            orphaned.forEach { RepoState.setInstallState(it.internalName, PluginInstallState.NotInstalled) }
+            ServerState.info("Removed ${orphaned.size} extension(s) whose repo was deleted: " +
+                orphaned.joinToString { it.displayName })
+        }
+
+        val referenced = keep.flatMap { listOf(sanitizeName(it.internalName), File(it.localPath).nameWithoutExtension) }.toSet()
+        var strayFiles = 0
+        File(cacheDir, "plugins").listFiles()?.forEach { f ->
+            if (f.isFile && pluginFileBase(f.name) !in referenced && f.delete()) strayFiles++
+        }
+        if (strayFiles > 0) ServerState.info("Deleted $strayFiles orphaned plugin file(s)")
+        return orphaned.map { it.internalName }
+    }
+
+    private fun writeInstalled(cacheDir: String, plugins: List<InstalledPlugin>) {
+        try {
+            installedFile(cacheDir).writeText(installedJson.encodeToString(plugins))
+        } catch (_: Exception) {}
     }
 
     /**

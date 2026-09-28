@@ -129,6 +129,33 @@ object BridgeRuntime {
     }
 
     /**
+     * Removes a repository together with every extension it installed: deletes
+     * their .cs3 / converted jar files, strips them from the global disabled
+     * set and every profile, then hot-reloads once.
+     */
+    suspend fun removeRepo(url: String) {
+        val pluginsToRemove = RepoState.installedPlugins.value
+            .filter { it.repoUrl == url }
+            .map { it.internalName }
+            .toSet()
+        // Profiles may store the display-name slug — collect it while the APIs are still loaded
+        val profileCleanupIds = pluginsToRemove.toMutableSet()
+        StremioServer.loadedApis.forEach { api ->
+            if (api.pluginInternalName in pluginsToRemove || api.internalName in pluginsToRemove) {
+                profileCleanupIds += StremioServer.publicNameSlug(api.name)
+            }
+        }
+
+        val removed = withContext(Dispatchers.IO) { RepoManager.removeRepo(url, cacheDir) }
+        profileCleanupIds += removed
+
+        profileCleanupIds.forEach { StremioServer.disabledPlugins.remove(it) }
+        StremioServer.saveDisabledPlugins()
+        StremioServer.cleanRemovedPluginsFromProfiles(profileCleanupIds)
+        forceReloadPlugins()
+    }
+
+    /**
      * Adds a repository and auto-installs every extension it publishes.
      *
      * @param disableNewPluginsByDefault keep the freshly installed extensions
@@ -205,12 +232,20 @@ object BridgeRuntime {
      */
     suspend fun startBridge(preferredPort: Int = 8080) {
         ServerState.updateStatus(ServerStatus.Starting("Loading plugin registry…"))
+        RepoManager.loadSavedRepos()
+        // Drop extensions whose repo was deleted + stray .cs3/.jar files left by older builds
+        val pruned = withContext(Dispatchers.IO) {
+            runCatching { PluginInstaller.pruneOrphans(cacheDir, RepoState.repos.value.map { it.url }) }
+                .onFailure { ServerState.warn("Orphan cleanup failed: ${it.message}") }
+                .getOrDefault(emptyList())
+        }
+        // Plugins may have been preloaded at app start — drop the pruned ones from memory too
+        if (pruned.isNotEmpty() && GlobalPluginManager.isPluginsLoaded.value) forceReloadPlugins()
+
         val installed = withContext(Dispatchers.IO) { PluginInstaller.loadInstalledPlugins(cacheDir) }
         RepoState.setInstalledPlugins(installed)
         installed.forEach { RepoState.setInstallState(it.internalName, PluginInstallState.Installed) }
         ServerState.info("Found ${installed.size} installed plugin(s)")
-
-        RepoManager.loadSavedRepos()
         ServerState.updateStatus(ServerStatus.Starting("Refreshing repos…"))
 
         // Refresh repos in background (does NOT block server startup)
@@ -301,12 +336,13 @@ object BridgeRuntime {
                         ServerState.info("Auto-updating ${toUpdate.size} plugin(s)…")
                         PluginInstaller.autoUpdateInstalled(cacheDir)
                         forceReloadPlugins()
+                        // Updated plugins need fresh home pages; otherwise StremioServer's
+                        // own 30-min refresh job covers it (no duplicate full pre-warm).
+                        runCatching { StremioServer.preWarmHomepages() }
+                            .onFailure { e -> ServerState.warn("Periodic pre-warm error: ${e.message}") }
                     } else {
                         ServerState.info("Periodic check complete — all plugins up to date")
                     }
-                    // Always pre-warm home pages after refresh
-                    runCatching { StremioServer.preWarmHomepages() }
-                        .onFailure { e -> ServerState.warn("Periodic pre-warm error: ${e.message}") }
                 }.onFailure { e ->
                     ServerState.warn("Periodic update check failed: ${e.message}")
                 }

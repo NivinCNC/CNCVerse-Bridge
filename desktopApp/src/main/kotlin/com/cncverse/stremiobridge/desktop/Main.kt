@@ -215,7 +215,7 @@ fun main() = application {
                 }
             },
             onAddRepo      = { url -> RepoManager.addRepo(url) },
-            onRemoveRepo   = { url -> RepoManager.removeRepo(url) },
+            onRemoveRepo   = { url -> appScope.launch { BridgeRuntime.removeRepo(url) } },
             onRefreshRepos = { RepoManager.refreshAllRepos() },
             windowWidthClass = windowWidthClass,
         )

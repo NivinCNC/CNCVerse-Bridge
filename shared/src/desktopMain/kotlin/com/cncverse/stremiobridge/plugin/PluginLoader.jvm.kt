@@ -65,19 +65,62 @@ actual class PluginLoader {
         plugins: List<SitePlugin>,
         cs3Files: Map<String, File>,
     ): List<LoadedPluginInfo> = withContext(Dispatchers.IO) {
+        // Remember the built-in extractors before any plugin registers its own,
+        // so unloadAll() can restore exactly this set.
+        if (baselineExtractors == null) baselineExtractors = extractorRegistry()?.toList()
         configureAppClientNetwork()
         val loadedList = plugins.mapNotNull { plugin ->
             val cs3File = cs3Files[plugin.internalName] ?: run {
                 ServerState.warn("No .cs3 for '${plugin.name}', skipping")
                 return@mapNotNull plugin.toLoadedPluginInfo(apiRegistered = false)
             }
-            val info = loadSinglePlugin(cs3File, plugin)
-            // Patch plugin-specific classes AFTER the plugin's classloader is active
-            configurePluginNetworkPostLoad()
-            info
+            loadSinglePlugin(cs3File, plugin)
         }
+        // Patch plugin-specific classes once every plugin's classloader is active
+        // (it scans all classloaders, so running it per plugin was O(n²)).
+        configurePluginNetworkPostLoad()
         preWarmPluginHosts()
         loadedList
+    }
+
+    /** Built-in extractors snapshot taken before the first plugin load. */
+    private var baselineExtractors: List<Any>? = null
+
+    /** CloudStream's global extractor registry (utils.ExtractorApiKt.extractorApis). */
+    @Suppress("UNCHECKED_CAST")
+    private fun extractorRegistry(): MutableList<Any>? = runCatching {
+        Class.forName("com.lagradost.cloudstream3.utils.ExtractorApiKt")
+            .getMethod("getExtractorApis")
+            .invoke(null) as? MutableList<Any>
+    }.getOrNull()
+
+    /**
+     * Removes everything plugins registered into CloudStream's process-wide
+     * registries. Without this every reload (install, auto-update, settings
+     * apply) stacked another copy of every provider and extractor on top of
+     * the old ones, leaking the old classloaders and making loadExtractor()
+     * fuzzy-match links against an ever-growing extractor list.
+     */
+    private fun resetCloudstreamRegistries() {
+        runCatching {
+            val providers = getApiHolderProviders()
+            if (registeredApis.isNotEmpty() && providers is MutableList<*>) {
+                val stale = registeredApis.toSet()
+                @Suppress("UNCHECKED_CAST")
+                (providers as MutableList<Any>).removeAll { it in stale }
+            }
+        }.onFailure { ServerState.warn("Could not reset provider registry: ${it.message}") }
+
+        runCatching {
+            val baseline = baselineExtractors ?: return@runCatching
+            val registry = extractorRegistry() ?: return@runCatching
+            if (registry.size != baseline.size) {
+                val before = registry.size
+                registry.clear()
+                registry.addAll(baseline)
+                ServerState.info("Extractor registry reset: $before → ${baseline.size}")
+            }
+        }.onFailure { ServerState.warn("Could not reset extractor registry: ${it.message}") }
     }
 
     /** Reconfigures the global NiceHttp `app` client used by plugins with AdaptiveHostDns + CloudflareKiller. */
@@ -97,6 +140,9 @@ actual class PluginLoader {
             } ?: return
             okClientField.isAccessible = true
             val existingOk = okClientField.get(currentNiceClient) as? okhttp3.OkHttpClient ?: return
+            // Already patched by an earlier load — rebuilding would stack another
+            // copy of each interceptor and orphan the previous connection pool.
+            if (existingOk.interceptors.any { it is com.lagradost.cloudstream3.network.CloudflareKiller }) return
 
             val newOk = existingOk.newBuilder()
                 .addInterceptor(cfKiller)
@@ -598,6 +644,7 @@ actual class PluginLoader {
 
     actual fun unloadAll() {
         StremioServer.loadedApis.clear()
+        resetCloudstreamRegistries()
         registeredApis.clear()
         loadedPlugins.clear()
         loadedClassLoaders.forEach { runCatching { it.close() } }

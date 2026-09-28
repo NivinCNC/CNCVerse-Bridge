@@ -22,6 +22,12 @@ Restart=on-failure
 RestartSec=5
 SuccessExitStatus=143
 
+# CPU priority: under full load the kernel serves sshd, DNS and any local
+# proxy (warp/gost/ultrasurf…) before the bridge's plugin work, so network
+# traffic keeps flowing even when extensions saturate the CPU.
+Nice=5
+CPUWeight=50
+
 # Hardening
 NoNewPrivileges=true
 PrivateTmp=true

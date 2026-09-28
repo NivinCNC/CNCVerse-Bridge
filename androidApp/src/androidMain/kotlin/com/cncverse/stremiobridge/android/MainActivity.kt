@@ -151,7 +151,13 @@ class MainActivity : com.lagradost.cloudstream3.MainActivity() {
                     }
                 },
                 onAddRepo           = { url -> RepoManager.addRepo(url) },
-                onRemoveRepo        = { url -> RepoManager.removeRepo(url) },
+                onRemoveRepo        = { url ->
+                    activityScope.launch(Dispatchers.IO) {
+                        RepoManager.removeRepo(url, cacheDir)
+                        val installed = PluginInstaller.loadInstalledPlugins(cacheDir)
+                        GlobalPluginManager.reloadAllPlugins(installed, PluginInstaller.getInstalledFiles(cacheDir))
+                    }
+                },
                 onRefreshRepos      = { RepoManager.refreshAllRepos() },
                 windowWidthClass    = windowSizeClass.widthSizeClass,
             )

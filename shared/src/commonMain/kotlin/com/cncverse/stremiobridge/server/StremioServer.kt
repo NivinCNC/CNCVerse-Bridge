@@ -66,6 +66,29 @@ private val httpClient by lazy {
 }
 
 /**
+ * Thread-safe list of loaded APIs that bumps [version] on every mutation, so
+ * derived lookups (display-name slug counts) can be cached and invalidated
+ * cheaply. The plugin loader mutates it while request threads iterate it.
+ */
+class LoadedApiList : java.util.concurrent.CopyOnWriteArrayList<MainApiWrapper>() {
+    @Volatile var version: Long = 0L
+        private set
+
+    private fun bump() { version++ }
+
+    override fun add(element: MainApiWrapper): Boolean = super.add(element).also { bump() }
+    override fun add(index: Int, element: MainApiWrapper) { super.add(index, element); bump() }
+    override fun addAll(elements: Collection<MainApiWrapper>): Boolean = super.addAll(elements).also { bump() }
+    override fun addAll(index: Int, elements: Collection<MainApiWrapper>): Boolean = super.addAll(index, elements).also { bump() }
+    override fun set(index: Int, element: MainApiWrapper): MainApiWrapper = super.set(index, element).also { bump() }
+    override fun remove(element: MainApiWrapper): Boolean = super.remove(element).also { bump() }
+    override fun removeAt(index: Int): MainApiWrapper = super.removeAt(index).also { bump() }
+    override fun removeAll(elements: Collection<MainApiWrapper>): Boolean = super.removeAll(elements).also { bump() }
+    override fun retainAll(elements: Collection<MainApiWrapper>): Boolean = super.retainAll(elements).also { bump() }
+    override fun clear() { super.clear(); bump() }
+}
+
+/**
  * Manages the Ktor-based embedded HTTP server exposing the Stremio addon protocol.
  *
  * Routes:
@@ -85,7 +108,22 @@ object StremioServer {
      * Holds live references to loaded [MainApiWrapper] instances.
      * Populated by the platform-specific [PluginLoader] after loading.
      */
-    val loadedApis: MutableList<MainApiWrapper> = mutableListOf()
+    private val NON_ALNUM = Regex("[^a-zA-Z0-9]")
+    private val slugMemo = ConcurrentHashMap<String, String>()
+
+    private val apiList = LoadedApiList()
+    val loadedApis: MutableList<MainApiWrapper> = apiList
+
+    /**
+     * Bounded pool for plugin work (catalog/meta/stream/pre-warm). Extensions
+     * can be CPU-heavy (HTML parsing, extractor fuzzy matching); capping how
+     * many run at once keeps the CPU from being oversubscribed so the HTTP
+     * server, manifest/admin requests and the local proxies stay responsive
+     * even under load. Network waits suspend and do not hold a slot.
+     */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    val pluginDispatcher: kotlinx.coroutines.CoroutineDispatcher =
+        Dispatchers.IO.limitedParallelism((Runtime.getRuntime().availableProcessors() * 4).coerceIn(8, 64))
 
     /**
      * Shared provider catalog cache: provider internalName -> list of StremioCatalogDef.
@@ -109,12 +147,12 @@ object StremioServer {
         }.getOrNull()
     }
 
-    private val manifestRefreshScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val manifestRefreshScope = CoroutineScope(pluginDispatcher + SupervisorJob())
     private var periodicRefreshJob: kotlinx.coroutines.Job? = null
     private val isRefreshing = AtomicBoolean(false)
     private const val REFRESH_INTERVAL_MS = 30L * 60L * 1000L // 30 minutes
 
-    val disabledPlugins: MutableSet<String> = mutableSetOf()
+    val disabledPlugins: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private var disabledPluginsFile: File? = null
 
     /**
@@ -128,7 +166,7 @@ object StremioServer {
      * /u/{profileId}/… according to this record, so a profile manifest URL
      * behaves as a complete standalone Stremio addon.
      */
-    val profiles: MutableMap<String, ProfileRecord> = mutableMapOf()
+    val profiles: MutableMap<String, ProfileRecord> = ConcurrentHashMap()
     private var profilesFile: File? = null
 
     /** Persisted, per-profile preferences and bookkeeping. */
@@ -173,11 +211,33 @@ object StremioServer {
         }
     }
 
+    private val profileSavePending = AtomicBoolean(false)
+
+    /**
+     * Debounced save: profiles.json can be MBs, and manifest fetches from many
+     * profiles would otherwise re-serialize the whole map on every request.
+     * Coalesces all changes within a 5 s window into one write.
+     */
     private fun saveProfiles() {
+        if (profilesFile == null) return
+        if (!profileSavePending.compareAndSet(false, true)) return
+        manifestRefreshScope.launch(Dispatchers.IO) {
+            delay(5_000)
+            profileSavePending.set(false)
+            writeProfilesNow()
+        }
+    }
+
+    private fun writeProfilesNow() {
         val file = profilesFile ?: return
         try {
-            val map: Map<String, ProfileRecord> = profiles
-            file.writeText(serverJson.encodeToString(map))
+            val map: Map<String, ProfileRecord> = HashMap(profiles)
+            val tmp = File(file.parentFile, file.name + ".tmp")
+            tmp.writeText(serverJson.encodeToString(map))
+            if (!tmp.renameTo(file)) {
+                file.writeText(tmp.readText())
+                tmp.delete()
+            }
         } catch (e: Exception) {
             ServerState.warn("Failed to save profiles: ${e.message}")
         }
@@ -398,6 +458,7 @@ object StremioServer {
 
     fun stop() {
         stopPeriodicRefreshJob()
+        if (profileSavePending.getAndSet(false)) writeProfilesNow()
         com.cncverse.stremiobridge.tunnel.CloudflaredManager.stopTunnel()
         engine?.stop(0, 500)
         engine = null
@@ -424,9 +485,27 @@ object StremioServer {
      */
     private fun unambiguousSlug(api: MainApiWrapper): String? {
         val slug = nameSlug(api.name)
-        val sharers = loadedApis.count { nameSlug(it.name) == slug }
-        return if (sharers == 1) slug else null
+        return if ((slugCounts()[slug] ?: 0) == 1) slug else null
     }
+
+    /** slug -> number of loaded APIs sharing it; rebuilt only when [loadedApis] changes. */
+    @Volatile private var slugCountCache: Pair<Long, Map<String, Int>>? = null
+
+    private fun slugCounts(): Map<String, Int> {
+        val version = apiList.version
+        slugCountCache?.let { (v, counts) -> if (v == version) return counts }
+        val counts = HashMap<String, Int>()
+        for (api in apiList) {
+            val slug = nameSlug(api.name)
+            counts[slug] = (counts[slug] ?: 0) + 1
+        }
+        slugCountCache = version to counts
+        return counts
+    }
+
+    /** Catalog/meta/stream key for an API: unambiguous slug, or slug + plugin name. */
+    private fun apiKey(api: MainApiWrapper): String =
+        unambiguousSlug(api) ?: (nameSlug(api.name) + "_" + nameSlug(api.pluginInternalName))
 
     /**
      * Returns all alias keys in [disabledPlugins] that belong exclusively to the
@@ -792,7 +871,7 @@ object StremioServer {
             val search = request.queryParameters["search"]
             val skip = request.queryParameters["skip"]?.toIntOrNull() ?: 0
 
-            val metas = withContext(Dispatchers.IO) { buildCatalog(type, id, search, skip, null, profileId) }
+            val metas = withContext(pluginDispatcher) { buildCatalog(type, id, search, skip, null, profileId) }
             respond(StremioCatalogResponse(metas))
         } else if (pathSegments.size == 3) {
             val id = pathSegments[1]
@@ -809,7 +888,7 @@ object StremioServer {
             val skip = (parsedExtra["skip"] ?: request.queryParameters["skip"])?.toIntOrNull() ?: 0
             val genre = parsedExtra["genre"]
 
-            val metas = withContext(Dispatchers.IO) { buildCatalog(type, id, search, skip, genre, profileId) }
+            val metas = withContext(pluginDispatcher) { buildCatalog(type, id, search, skip, genre, profileId) }
             respond(StremioCatalogResponse(metas))
         } else {
             respond(HttpStatusCode.BadRequest)
@@ -820,7 +899,7 @@ object StremioServer {
         val type = parameters["type"] ?: return respond(HttpStatusCode.BadRequest)
         val id   = parameters["id"]   ?: return respond(HttpStatusCode.BadRequest)
 
-        val meta = withContext(Dispatchers.IO) { buildMeta(type, id, profileId) }
+        val meta = withContext(pluginDispatcher) { buildMeta(type, id, profileId) }
         if (meta != null) {
             respond(StremioMetaResponse(meta))
         } else {
@@ -832,7 +911,7 @@ object StremioServer {
         val type = parameters["type"] ?: return respond(HttpStatusCode.BadRequest)
         val id   = parameters["id"]   ?: return respond(HttpStatusCode.BadRequest)
 
-        val streams = withContext(Dispatchers.IO) { buildStreams(type, id, profileId) }
+        val streams = withContext(pluginDispatcher) { buildStreams(type, id, profileId) }
         respond(StremioStreamResponse(sortStreamsByQuality(streams)))
     }
 
@@ -840,7 +919,7 @@ object StremioServer {
         val type = parameters["type"] ?: return respond(HttpStatusCode.BadRequest)
         val id   = parameters["id"]   ?: return respond(HttpStatusCode.BadRequest)
 
-        val streams = withContext(Dispatchers.IO) { buildStreams(type, id, profileId) }
+        val streams = withContext(pluginDispatcher) { buildStreams(type, id, profileId) }
         val subtitles = streams.flatMap { it.subtitles ?: emptyList() }.distinctBy { it.id }
 
         respond(StremioSubtitleResponse(subtitles))
@@ -887,12 +966,18 @@ object StremioServer {
      * JIO TV+ (IND) → JIOTVPlusIND, giving each variant a unique catalog ID
      * even when two APIs share the same [internalName].
      */
-    private fun nameSlug(name: String): String = name
-        .replace("+", "Plus")
-        .replace("&", "And")
-        .replace(Regex("[^a-zA-Z0-9]"), "")
-        .take(48)
-        .ifBlank { "unknown" }
+    private fun nameSlug(name: String): String {
+        slugMemo[name]?.let { return it }
+        val slug = name
+            .replace("+", "Plus")
+            .replace("&", "And")
+            .replace(NON_ALNUM, "")
+            .take(48)
+            .ifBlank { "unknown" }
+        if (slugMemo.size > 10_000) slugMemo.clear()
+        slugMemo[name] = slug
+        return slug
+    }
 
     /** Public alias used by WebAdmin to build profile-cleanup ID sets. */
     internal fun publicNameSlug(name: String) = nameSlug(name)
@@ -908,7 +993,7 @@ object StremioServer {
         url.replace("/refs/heads/", "/").replace("/refs/tags/", "/")
 
     fun defaultCatalogDefsForApi(api: MainApiWrapper): List<StremioCatalogDef> {
-        val slug = unambiguousSlug(api) ?: (nameSlug(api.name) + "_" + nameSlug(api.pluginInternalName))
+        val slug = apiKey(api)
         return api.supportedTypes
             .map { cs3TvTypeToStremio(it) }
             .distinct()
@@ -930,7 +1015,7 @@ object StremioServer {
         } catch (e: Throwable) {
             emptyList()
         }
-        val slug = unambiguousSlug(api) ?: (nameSlug(api.name) + "_" + nameSlug(api.pluginInternalName))
+        val slug = apiKey(api)
 
         return api.supportedTypes
             .map { cs3TvTypeToStremio(it) }
@@ -1011,11 +1096,12 @@ object StremioServer {
             val newProviderCatalogs = ConcurrentHashMap<String, List<StremioCatalogDef>>()
             val newHomePageCache = ConcurrentHashMap<String, List<StremioMeta>>()
 
-            // 2. Fetch fresh catalog definitions (sections/genres) with bounded concurrency
-            val sem = Semaphore(5)
+            // 2. Fetch fresh catalog definitions (sections/genres) with bounded concurrency.
+            // Kept low: this is background work and must leave room for live requests.
+            val sem = Semaphore(3)
             coroutineScope {
                 apis.map { api ->
-                    async(Dispatchers.IO) {
+                    async(pluginDispatcher) {
                         sem.withPermit {
                             val defs = try {
                                 fetchCatalogDefsForApi(api)
@@ -1033,7 +1119,7 @@ object StremioServer {
             ServerState.info("🔥 Pre-warming ${catalogsToPrewarm.size} fresh home page(s)…")
             coroutineScope {
                 catalogsToPrewarm.map { cat ->
-                    async(Dispatchers.IO) {
+                    async(pluginDispatcher) {
                         sem.withPermit {
                             runCatching {
                                 val metas = withTimeoutOrNull(15_000) {
@@ -1118,7 +1204,7 @@ object StremioServer {
         val rest = id.removePrefix(prefix)
 
         val nameSlugFromId = rest.removeSuffix("_$type")
-        val api = loadedApis.find { (unambiguousSlug(it) ?: (nameSlug(it.name) + "_" + nameSlug(it.pluginInternalName))) == nameSlugFromId }
+        val api = loadedApis.find { apiKey(it) == nameSlugFromId }
             ?: loadedApis.find { nameSlug(it.name) == nameSlugFromId }
             ?: loadedApis.find { it.internalName == nameSlugFromId }          // old-format compat
             ?: loadedApis.find { rest.startsWith(it.internalName + "_") }    // prefix fallback
@@ -1157,7 +1243,7 @@ object StremioServer {
         if (!id.startsWith(prefix)) return emptyList()
         val rest = id.removePrefix(prefix)
         val nameSlugFromId = rest.removeSuffix("_$type")
-        val api = loadedApis.find { (unambiguousSlug(it) ?: (nameSlug(it.name) + "_" + nameSlug(it.pluginInternalName))) == nameSlugFromId }
+        val api = loadedApis.find { apiKey(it) == nameSlugFromId }
             ?: loadedApis.find { nameSlug(it.name) == nameSlugFromId }
             ?: loadedApis.find { it.internalName == nameSlugFromId }
             ?: loadedApis.find { rest.startsWith(it.internalName + "_") }
@@ -1188,7 +1274,7 @@ object StremioServer {
 
     private suspend fun buildMeta(type: String, id: String, profileId: String? = null): StremioMeta? {
         val (pluginKey, dataUrl) = StremioIds.decode(id) ?: return null
-        val api = loadedApis.find { (unambiguousSlug(it) ?: (nameSlug(it.name) + "_" + nameSlug(it.pluginInternalName))) == pluginKey }
+        val api = loadedApis.find { apiKey(it) == pluginKey }
             ?: loadedApis.find { nameSlug(it.name) == pluginKey }
             ?: loadedApis.find { it.internalName == pluginKey }
             ?: return null
@@ -1240,7 +1326,7 @@ object StremioServer {
      */
     private val STREAM_DEADLINE_MS = 45_000L
     private val PROVIDER_TIMEOUT_MS = 25_000L
-    private val streamSearchScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    private val streamSearchScope = CoroutineScope(pluginDispatcher + SupervisorJob())
 
     /**
      * Short-lived TTL cache for [search] and [load] results used in the generic
@@ -1301,7 +1387,7 @@ object StremioServer {
         if (decoded != null) {
             val (pluginKey, dataUrl) = decoded
             val matchingApis = loadedApis.filter { api ->
-                val slug = unambiguousSlug(api) ?: (nameSlug(api.name) + "_" + nameSlug(api.pluginInternalName))
+                val slug = apiKey(api)
                 slug == pluginKey || nameSlug(api.name) == pluginKey || api.internalName == pluginKey
             }.filter { !isPluginBlocked(it, profileId) }
 

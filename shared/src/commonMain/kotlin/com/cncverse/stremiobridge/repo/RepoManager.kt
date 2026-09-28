@@ -68,11 +68,16 @@ object RepoManager {
     }
 
     /**
-     * Removes a repo and its plugins from state. Uninstalled plugins are NOT deleted from disk.
+     * Removes a repo and its plugins from state. When [cacheDir] is given the
+     * repo's installed extensions are also deleted from disk (.cs3 + converted
+     * jars) and removed from installed_plugins.json. Returns the removed
+     * internal names.
      */
-    fun removeRepo(url: String) {
+    fun removeRepo(url: String, cacheDir: String? = null): List<String> {
+        val removed = if (!cacheDir.isNullOrEmpty()) PluginInstaller.removePluginsForRepo(url, cacheDir) else emptyList()
         RepoState.removeRepo(url)
         persistUrls()
+        return removed
     }
 
     private val refreshMutex = Mutex()
