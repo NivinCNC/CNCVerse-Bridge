@@ -3712,7 +3712,6 @@ loadRepos();
 loadProfile();
 loadStats();
 setInterval(function(){ loadExts(); loadRepos(); }, 15000);
-setInterval(function(){ loadStats(); }, 60000);
 </script>
 </body>
 </html>"""
