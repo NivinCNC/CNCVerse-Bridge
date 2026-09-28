@@ -1236,6 +1236,60 @@ object StremioServer {
     private val PROVIDER_TIMEOUT_MS = 25_000L
     private val streamSearchScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    /**
+     * Short-lived TTL cache for [search] and [load] results used in the generic
+     * TMDB stream path. Avoids redundant plugin calls for the same title when
+     * multiple concurrent Stremio requests arrive or a user replays a stream.
+     *
+     * Modeled on CloudStream's APIRepository cache (LRU-style, keyed by
+     * "pluginInternalName::query" or "pluginInternalName::url").
+     */
+    private object SearchLoadCache {
+        private const val TTL_MS = 10 * 60 * 1_000L   // 10 minutes
+        private const val MAX_ENTRIES = 500
+
+        private data class Entry<T>(val value: T, val timestamp: Long = System.currentTimeMillis())
+        /** Wraps a nullable MediaInfo so we can cache a 'null' result (load returned nothing). */
+        private data class CachedLoad(val info: MediaInfo?)
+
+        private val searchCache = ConcurrentHashMap<String, Entry<List<SearchResult>>>()
+        private val loadCache   = ConcurrentHashMap<String, Entry<CachedLoad>>()
+
+        private fun searchKey(apiKey: String, query: String) = "$apiKey::search::$query"
+        private fun loadKey(apiKey: String, url: String)    = "$apiKey::load::$url"
+
+        fun getSearch(apiKey: String, query: String): List<SearchResult>? {
+            val e = searchCache[searchKey(apiKey, query)] ?: return null
+            if (System.currentTimeMillis() - e.timestamp > TTL_MS) { searchCache.remove(searchKey(apiKey, query)); return null }
+            return e.value
+        }
+
+        fun putSearch(apiKey: String, query: String, value: List<SearchResult>) {
+            if (searchCache.size >= MAX_ENTRIES) searchCache.keys.take(50).forEach { searchCache.remove(it) }
+            searchCache[searchKey(apiKey, query)] = Entry(value)
+        }
+
+        /** Returns the cached [CachedLoad] wrapper, or `null` if not cached / expired. */
+        fun getLoad(apiKey: String, url: String): CachedLoad? {
+            val k = loadKey(apiKey, url)
+            val e = loadCache[k] ?: return null
+            if (System.currentTimeMillis() - e.timestamp > TTL_MS) { loadCache.remove(k); return null }
+            return e.value
+        }
+
+        fun putLoad(apiKey: String, url: String, value: MediaInfo?) {
+            if (loadCache.size >= MAX_ENTRIES) loadCache.keys.take(50).forEach { loadCache.remove(it) }
+            loadCache[loadKey(apiKey, url)] = Entry(CachedLoad(value))
+        }
+
+        fun invalidate(apiKey: String) {
+            searchCache.keys.filter { it.startsWith(apiKey) }.forEach { searchCache.remove(it) }
+            loadCache.keys.filter   { it.startsWith(apiKey) }.forEach { loadCache.remove(it) }
+        }
+
+        fun clear() { searchCache.clear(); loadCache.clear() }
+    }
+
     private suspend fun buildStreams(type: String, id: String, profileId: String? = null): List<StremioStream> {
         val decoded = StremioIds.decode(id)
         if (decoded != null) {
@@ -1323,8 +1377,13 @@ object StremioServer {
 
             ServerState.info("TMDB resolve success: title='$title', year=$year")
 
-            val activePlugins = loadedApis.filter { !isPluginBlocked(it, profileId) }
-            ServerState.info("Searching across ${activePlugins.size} plugin(s)...")
+            // Exclude live-TV-only extensions from generic TMDB VOD searches —
+            // they don't carry on-demand movie/series content.
+            val activePlugins = loadedApis.filter { api ->
+                !isPluginBlocked(api, profileId) &&
+                api.supportedTypes.any { it != "tv" }
+            }
+            ServerState.info("Searching across ${activePlugins.size} plugin(s) (live-TV-only excluded)...")
 
             val sem = Semaphore(20)
             val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
@@ -1374,7 +1433,9 @@ object StremioServer {
         year: Int?
     ): List<StremioStream> {
         ServerState.info("[${api.name}] Searching for '$title'")
-        val searchResults = api.search(title)
+        val cacheKey = api.internalName
+        val searchResults = SearchLoadCache.getSearch(cacheKey, title)
+            ?: api.search(title).also { SearchLoadCache.putSearch(cacheKey, title, it) }
         ServerState.info("[${api.name}] Found ${searchResults.size} results")
 
         val bestMatch = searchResults.find {
@@ -1384,7 +1445,16 @@ object StremioServer {
           ?: return emptyList()
 
         ServerState.info("[${api.name}] Best match: '${bestMatch.name}' (url: ${bestMatch.url})")
-        val mediaInfo = api.load(bestMatch.url) ?: run {
+        // load() is the most expensive call — cache it per plugin+url.
+        // getLoad() returns a CachedLoad wrapper (non-null = hit); .info may still be null.
+        val cachedLoad = SearchLoadCache.getLoad(cacheKey, bestMatch.url)
+        val mediaInfo = if (cachedLoad != null) {
+            cachedLoad.info   // respect cached null: plugin had no result
+        } else {
+            val fresh = api.load(bestMatch.url)
+            SearchLoadCache.putLoad(cacheKey, bestMatch.url, fresh)
+            fresh
+        } ?: run {
             ServerState.warn("[${api.name}] MediaInfo load failed for ${bestMatch.url}")
             return emptyList()
         }
