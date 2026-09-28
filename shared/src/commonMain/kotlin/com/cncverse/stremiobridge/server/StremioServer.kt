@@ -1099,6 +1099,7 @@ object StremioServer {
             types       = types,
             resources   = listOf("catalog", "meta", "stream", "subtitles"),
             catalogs    = catalogs,
+            behaviorHints = BehaviorHints(configurable = true),
         )
     }
 
@@ -1250,7 +1251,7 @@ object StremioServer {
 
         private data class Entry<T>(val value: T, val timestamp: Long = System.currentTimeMillis())
         /** Wraps a nullable MediaInfo so we can cache a 'null' result (load returned nothing). */
-        private data class CachedLoad(val info: MediaInfo?)
+        data class CachedLoad(val info: MediaInfo?)
 
         private val searchCache = ConcurrentHashMap<String, Entry<List<SearchResult>>>()
         private val loadCache   = ConcurrentHashMap<String, Entry<CachedLoad>>()
