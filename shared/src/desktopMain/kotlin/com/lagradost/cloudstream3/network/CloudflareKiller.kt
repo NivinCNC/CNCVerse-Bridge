@@ -28,6 +28,8 @@ class CloudflareKiller : Interceptor {
     companion object {
         private val CLOUDFLARE_SERVERS = listOf("cloudflare-nginx", "cloudflare")
         private val CHALLENGE_CODES   = listOf(403, 503)
+        /** Challenge pages are small HTML; never buffer more than this. */
+        private const val MAX_CHALLENGE_PEEK_BYTES = 2L * 1024 * 1024
 
         val savedCookies: MutableMap<String, Map<String, String>> = ConcurrentHashMap()
         val savedUserAgents: MutableMap<String, String>           = ConcurrentHashMap()
@@ -145,18 +147,24 @@ class CloudflareKiller : Interceptor {
         // ── 2. Skip static assets — we never modify them ────────────────────
         if (isStaticAsset(request.url)) return response
 
-        val serverHeader = response.header("Server") ?: ""
-        val isCloudflare = CLOUDFLARE_SERVERS.any { serverHeader.contains(it, ignoreCase = true) }
-        if (!isCloudflare && response.code !in CHALLENGE_CODES) return response
-
-        // ── 3. Peek body to check for challenge markers ──────────────────────
-        val rawBody = try { response.peekBody(Long.MAX_VALUE).string() } catch (_: Exception) { "" }
+        // Only a 403/503 or an explicit cf-mitigated header can be a challenge.
+        // Everything else (notably 200 video/file downloads from Cloudflare
+        // Workers) passes straight through — peeking those buffered whole
+        // multi-hundred-MB files in memory and caused heap OOM crashes.
         val isCfMitigated = response.header("cf-mitigated")
             ?.equals("challenge", ignoreCase = true) == true
-        val looksLikeChallenge = isCfMitigated ||
-            (response.code in CHALLENGE_CODES && isChallengeBody(rawBody))
+        if (!isCfMitigated && response.code !in CHALLENGE_CODES) return response
+
+        val contentType = response.header("content-type")?.lowercase().orEmpty()
+        if (!isCfMitigated && contentType.isNotEmpty() &&
+            !contentType.contains("html") && !contentType.contains("text")) return response
+
+        // ── 3. Peek (bounded) body to check for challenge markers ────────────
+        val rawBody = try { response.peekBody(MAX_CHALLENGE_PEEK_BYTES).string() } catch (_: Exception) { "" }
+        val looksLikeChallenge = isCfMitigated || isChallengeBody(rawBody)
 
         if (!looksLikeChallenge) return response
+        response.close()   // replaced below — release the connection
 
         ServerState.info("[CF] Challenge page detected for $host (HTTP ${response.code}) — stripping & returning 200")
 

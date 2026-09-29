@@ -1,0 +1,7 @@
+[Unit]
+Description=CNCVerse Bridge Server health check (restart when unresponsive)
+After=cncverse-bridge-server.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/cncverse-bridge-server/packaging/cncverse-bridge-healthcheck.sh

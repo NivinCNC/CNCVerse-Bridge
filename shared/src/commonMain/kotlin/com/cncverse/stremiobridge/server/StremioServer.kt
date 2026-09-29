@@ -1080,12 +1080,42 @@ object StremioServer {
      * 4. While this runs, all manifest and catalog requests serve the existing (old) cached data.
      * 5. Atomically publishes the new data to live caches only when everything is fetched.
      */
+    /** Scope of the in-flight background refresh, so a plugin reload can cancel it. */
+    @Volatile private var refreshWork: kotlinx.coroutines.Job? = null
+
+    /**
+     * Cancels an in-flight background refresh. Called before plugins are
+     * unloaded: the refresh holds a snapshot of the old APIs (keeping the old
+     * plugin classloaders alive) and would keep calling unloaded plugins.
+     */
+    fun cancelBackgroundRefresh() {
+        refreshWork?.cancel()
+    }
+
     suspend fun refreshManifestAndHomepages() {
         if (!isRefreshing.compareAndSet(false, true)) {
             ServerState.info("Manifest refresh already in progress, skipping duplicate call")
             return
         }
         try {
+            coroutineScope {
+                refreshWork = coroutineContext[kotlinx.coroutines.Job]
+                refreshManifestAndHomepagesInner()
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // Our own scope was cancelled by a plugin reload — the caller keeps running
+            if (!kotlinx.coroutines.currentCoroutineContext().isActive) throw e
+            ServerState.info("Background refresh cancelled (plugins reloaded)")
+        } catch (e: Throwable) {
+            ServerState.warn("Manifest refresh error: ${e.message}")
+        } finally {
+            refreshWork = null
+            isRefreshing.set(false)
+        }
+    }
+
+    private suspend fun refreshManifestAndHomepagesInner() {
+        run {
             ServerState.info("🔄 Refreshing home pages & provider manifest catalogs in background…")
             val apis = loadedApis.toList()
             if (apis.isEmpty()) return
@@ -1144,10 +1174,6 @@ object StremioServer {
             homePageCatalogCache.putAll(newHomePageCache)
 
             ServerState.info("✅ Fresh home page & manifest refresh complete (${newProviderCatalogs.size} providers, ${newHomePageCache.size} home pages)")
-        } catch (e: Throwable) {
-            ServerState.warn("Manifest refresh error: ${e.message}")
-        } finally {
-            isRefreshing.set(false)
         }
     }
 

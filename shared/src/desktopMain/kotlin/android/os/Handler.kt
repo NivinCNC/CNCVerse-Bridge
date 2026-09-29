@@ -1,7 +1,5 @@
 package android.os
 
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
 
 /**
@@ -66,29 +64,65 @@ class Handler {
     fun handleMessage(msg: Message?) {}
 
     companion object {
+        /**
+         * Cancels every pending task posted by code from [loaders] and refuses
+         * any they post later. Called when plugins are unloaded: self-reposting
+         * runnables (e.g. a plugin's periodic monitor) would otherwise keep the
+         * old plugin classloader — and everything it references — alive forever.
+         */
+        @JvmStatic
+        fun cancelTasksFrom(loaders: Collection<ClassLoader>) = MainExecutor.cancelFrom(loaders)
+
         internal object MainExecutor {
-            private val executor: ScheduledExecutorService =
-                Executors.newSingleThreadScheduledExecutor { r ->
-                    Thread(r, "desktop-main").apply { isDaemon = true }
-                }
-            private val tasks = java.util.Collections.newSetFromMap(
-                java.util.concurrent.ConcurrentHashMap<Runnable, Boolean>()
-            )
+            private val executor = java.util.concurrent.ScheduledThreadPoolExecutor(1) { r ->
+                Thread(r, "desktop-main").apply { isDaemon = true }
+            }.apply { removeOnCancelPolicy = true }
+
+            /** Pending futures per posted runnable, so removeCallbacks can cancel them. */
+            private val tasks = java.util.concurrent.ConcurrentHashMap<Runnable, java.util.concurrent.Future<*>>()
+
+            /** Classloaders of unloaded plugins; their posts are dropped (weak so they can be GC'd). */
+            private val deadLoaders: MutableSet<ClassLoader> =
+                java.util.Collections.synchronizedSet(java.util.Collections.newSetFromMap(java.util.WeakHashMap()))
+
+            private fun isDead(r: Runnable): Boolean {
+                val cl = r.javaClass.classLoader ?: return false
+                return deadLoaders.contains(cl)
+            }
 
             fun execute(r: Runnable) {
-                tasks.add(r)
-                executor.execute { tasks.remove(r); r.run() }
+                if (isDead(r)) return
+                tasks[r] = executor.submit { tasks.remove(r); r.run() }
             }
 
             fun schedule(r: Runnable, delayMs: Long) {
-                tasks.add(r)
-                val wrapped = Runnable { tasks.remove(r); r.run() }
-                executor.schedule(wrapped, delayMs, TimeUnit.MILLISECONDS)
+                if (isDead(r)) return
+                tasks[r] = executor.schedule({ tasks.remove(r); r.run() }, delayMs, TimeUnit.MILLISECONDS)
             }
 
-            fun remove(r: Runnable?) { /* Java executor can't cancel queued tasks cheaply; no-op */ }
+            fun remove(r: Runnable?) {
+                r ?: return
+                tasks.remove(r)?.cancel(false)
+            }
 
-            fun cancelAll() { /* no-op */ }
+            fun cancelAll() {
+                tasks.values.forEach { it.cancel(false) }
+                tasks.clear()
+            }
+
+            fun cancelFrom(loaders: Collection<ClassLoader>) {
+                if (loaders.isEmpty()) return
+                deadLoaders.addAll(loaders)
+                val iter = tasks.entries.iterator()
+                while (iter.hasNext()) {
+                    val (r, future) = iter.next()
+                    if (r.javaClass.classLoader in loaders) {
+                        future.cancel(false)
+                        iter.remove()
+                    }
+                }
+                executor.purge()
+            }
         }
     }
 }

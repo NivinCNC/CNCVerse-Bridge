@@ -21,6 +21,10 @@ object GlobalPluginManager {
             return
         }
 
+        // Stop the background home-page refresh first: it holds the old APIs
+        // (pinning their classloaders) and would keep calling unloaded plugins.
+        com.cncverse.stremiobridge.server.StremioServer.cancelBackgroundRefresh()
+
         // Unload existing
         currentLoader.unloadAll()
         ServerState.updateGlobalLoadedPlugins(emptyList())

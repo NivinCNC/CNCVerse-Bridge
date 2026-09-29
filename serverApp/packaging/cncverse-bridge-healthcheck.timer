@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the CNCVerse Bridge Server health check every minute
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

@@ -102,14 +102,27 @@ actual class PluginLoader {
      * fuzzy-match links against an ever-growing extractor list.
      */
     private fun resetCloudstreamRegistries() {
+        val stale = registeredApis.toSet()
         runCatching {
             val providers = getApiHolderProviders()
-            if (registeredApis.isNotEmpty() && providers is MutableList<*>) {
-                val stale = registeredApis.toSet()
+            if (stale.isNotEmpty() && providers is MutableList<*>) {
                 @Suppress("UNCHECKED_CAST")
                 (providers as MutableList<Any>).removeAll { it in stale }
             }
         }.onFailure { ServerState.warn("Could not reset provider registry: ${it.message}") }
+
+        // registerMainAPI also appends to APIHolder.apis (via addPluginMapping) —
+        // a second static list that otherwise pins every old plugin classloader
+        // (and everything those plugins cached) across reloads → heap OOM.
+        runCatching {
+            if (stale.isEmpty()) return@runCatching
+            val holder = APIHolder::class.java.getField("INSTANCE").get(null)
+            val remove = APIHolder::class.java.getMethod("removePluginMapping", MainAPI::class.java)
+            stale.forEach { api -> if (api is MainAPI) runCatching { remove.invoke(holder, api) } }
+            val apisField = APIHolder::class.java.getDeclaredField("apis").also { it.isAccessible = true }
+            val leftover = (apisField.get(null) as? Iterable<*>)?.count { it in stale } ?: 0
+            if (leftover > 0) ServerState.warn("APIHolder.apis still holds $leftover unloaded provider(s)")
+        }.onFailure { ServerState.warn("Could not reset APIHolder.apis: ${it.message}") }
 
         runCatching {
             val baseline = baselineExtractors ?: return@runCatching
@@ -445,51 +458,22 @@ actual class PluginLoader {
     // ── dex2jar conversion ────────────────────────────────────────────────────
 
     /**
-     * Runs dex2jar while capturing System.out/err. Dex2jarCmd.doMain prints
-     * internal exceptions to stderr and returns normally — in the packaged exe
-     * stderr goes nowhere, so we tee it and surface it in ServerState.
+     * Runs dex2jar and returns any error text it reported. Dex2jarCmd.doMain
+     * swallows internal exceptions, so they're written to an exception file
+     * (-e) and read back. System.out/err are deliberately NOT swapped: doing
+     * that process-wide while request threads print cross-locks the
+     * PrintStreams and has deadlocked the whole server.
      */
     private fun runDex2jarCaptured(dexFile: File, jarFile: File): String {
-        val buffer = java.io.ByteArrayOutputStream()
-        val oldOut = System.out
-        val oldErr = System.err
-        val teeOut = java.io.PrintStream(TeeOutputStream(oldOut, buffer), true)
-        val teeErr = java.io.PrintStream(TeeOutputStream(oldErr, buffer), true)
+        val errFile = File(dexFile.parentFile, dexFile.nameWithoutExtension + "-dex2jar-error.txt")
+        errFile.delete()
         return try {
-            System.setOut(teeOut)
-            System.setErr(teeErr)
-            try {
-                Dex2jarCmd().doMain("-f", dexFile.absolutePath, "-o", jarFile.absolutePath)
-            } catch (e: Throwable) {
-                "exception: ${e::class.java.name}: ${e.message}"
-            }
-            buffer.toString(Charsets.UTF_8.name())
+            Dex2jarCmd().doMain("-f", "-e", errFile.absolutePath, "-o", jarFile.absolutePath, dexFile.absolutePath)
+            if (errFile.exists()) errFile.readText().take(4000) else ""
+        } catch (e: Throwable) {
+            "exception: ${e::class.java.name}: ${e.message}"
         } finally {
-            System.setOut(oldOut)
-            System.setErr(oldErr)
-            teeOut.flush(); teeErr.flush()
-        }
-    }
-
-    /** Copies to a backing stream while buffering everything for later inspection. */
-    private class TeeOutputStream(
-        private val backing: java.io.OutputStream,
-        private val buffer: java.io.ByteArrayOutputStream,
-    ) : java.io.OutputStream() {
-        @Synchronized
-        override fun write(b: Int) {
-            runCatching { backing.write(b) }
-            buffer.write(b)
-        }
-
-        @Synchronized
-        override fun write(b: ByteArray, off: Int, len: Int) {
-            runCatching { backing.write(b, off, len) }
-            buffer.write(b, off, len)
-        }
-
-        override fun flush() {
-            runCatching { backing.flush() }
+            errFile.delete()
         }
     }
 
@@ -642,9 +626,59 @@ actual class PluginLoader {
         }
     }
 
+    /**
+     * CloudStream's global Jackson mapper (MainAPIKt.mapper) caches a
+     * deserializer + JavaType for every plugin data class it parses. Those
+     * caches hold the Class objects, so without a flush every reload keeps the
+     * previous plugin classloaders alive.
+     */
+    private fun flushJacksonCaches() {
+        runCatching {
+            val holder = Class.forName("com.lagradost.cloudstream3.MainAPIKt")
+            val mapper = (runCatching { holder.getMethod("getMapper").invoke(null) }.getOrNull()
+                ?: holder.getDeclaredField("mapper").also { it.isAccessible = true }.get(null))
+                as? com.fasterxml.jackson.databind.ObjectMapper ?: return@runCatching
+            mapper.typeFactory.clearCache()
+            (mapper.serializerProviderInstance as? com.fasterxml.jackson.databind.ser.DefaultSerializerProvider)
+                ?.flushCachedSerializers()
+            (com.fasterxml.jackson.databind.ObjectMapper::class.java.getDeclaredField("_rootDeserializers")
+                .also { it.isAccessible = true }.get(mapper) as? MutableMap<*, *>)?.clear()
+            val cache = com.fasterxml.jackson.databind.DeserializationContext::class.java
+                .getDeclaredField("_cache").also { it.isAccessible = true }
+                .get(mapper.deserializationContext) as? com.fasterxml.jackson.databind.deser.DeserializerCache
+            cache?.flushCachedDeserializers()
+
+            // jackson-module-kotlin keeps its own ReflectionCache (LRU maps of
+            // constructors / KClass / methods) inside its annotation introspectors
+            listOf(mapper.deserializationConfig.annotationIntrospector, mapper.serializationConfig.annotationIntrospector)
+                .flatMap { it?.allIntrospectors() ?: emptyList() }
+                .filter { it.javaClass.name.startsWith("com.fasterxml.jackson.module.kotlin") }
+                .forEach { intro ->
+                    var cls: Class<*>? = intro.javaClass
+                    while (cls != null) {
+                        cls.declaredFields.filter { it.type.simpleName == "ReflectionCache" }.forEach { f ->
+                            f.isAccessible = true
+                            val rc = f.get(intro) ?: return@forEach
+                            rc.javaClass.declaredFields
+                                .filter { com.fasterxml.jackson.databind.util.LRUMap::class.java.isAssignableFrom(it.type) }
+                                .forEach { lf ->
+                                    lf.isAccessible = true
+                                    (lf.get(rc) as? com.fasterxml.jackson.databind.util.LRUMap<*, *>)?.clear()
+                                }
+                        }
+                        cls = cls.superclass
+                    }
+                }
+        }.onFailure { ServerState.warn("Could not flush Jackson caches: ${it.message}") }
+    }
+
     actual fun unloadAll() {
         StremioServer.loadedApis.clear()
         resetCloudstreamRegistries()
+        // Stop self-reposting Handler tasks from the old plugins, then drop Jackson's
+        // per-class caches — both otherwise pin the unloaded classloaders.
+        android.os.Handler.cancelTasksFrom(loadedClassLoaders.toList())
+        flushJacksonCaches()
         registeredApis.clear()
         loadedPlugins.clear()
         loadedClassLoaders.forEach { runCatching { it.close() } }
