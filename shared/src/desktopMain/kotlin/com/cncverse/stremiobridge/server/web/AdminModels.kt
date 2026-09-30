@@ -172,3 +172,36 @@ data class AdminActionResult(
     val ok: Boolean,
     val message: String? = null,
 )
+
+// ─── Stream formatter ────────────────────────────────────────────────────────
+
+@Serializable
+data class AdminFormatterState(
+    val enabled: Boolean,
+    val nameTemplate: String,
+    val descriptionTemplate: String,
+    val presetName: String,
+    val presetDescription: String,
+    val variables: List<String>,
+)
+
+@Serializable
+data class AdminFormatterRequest(
+    val enabled: Boolean = false,
+    val nameTemplate: String = "",
+    val descriptionTemplate: String = "",
+)
+
+@Serializable
+data class AdminFormatterSample(
+    val label: String,
+    val name: String,
+    val description: String,
+)
+
+@Serializable
+data class AdminFormatterPreview(
+    val ok: Boolean,
+    val error: String? = null,
+    val samples: List<AdminFormatterSample> = emptyList(),
+)

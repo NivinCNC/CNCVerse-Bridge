@@ -265,6 +265,30 @@ input[type=text], input[type=password], input[type=number] {
   transition: border-color 0.15s;
 }
 input:focus { border-color: var(--accent); }
+textarea.tpl {
+  font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  background: var(--card2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 10px 12px;
+  outline: none;
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  white-space: pre;
+  overflow-x: auto;
+}
+textarea.tpl:focus { border-color: var(--accent); }
+.fmt-label { font-size: 12px; font-weight: 600; color: var(--muted); margin: 12px 0 6px; display: block; }
+.fmt-sample { background: var(--card2); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+.fmt-sample .fmt-kind { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 6px; }
+.fmt-sample .fmt-name { font-weight: 700; white-space: pre-wrap; word-break: break-word; margin-bottom: 6px; }
+.fmt-sample .fmt-desc { font-size: 12.5px; white-space: pre-wrap; word-break: break-word; color: var(--text); opacity: .85; }
+.fmt-vars { display: flex; flex-wrap: wrap; gap: 6px; }
+.fmt-vars code { cursor: pointer; font-size: 11.5px; padding: 3px 7px; border-radius: 6px; background: var(--card2); border: 1px solid var(--border); }
+.fmt-vars code:hover { border-color: var(--accent); }
+.fmt-err { color: var(--red); background: var(--red-bg); border-radius: 8px; padding: 8px 12px; font-size: 12.5px; white-space: pre-wrap; }
 ::placeholder { color: var(--muted); }
 
 /* Switch control */
@@ -852,6 +876,10 @@ main#view {
     <button data-tab="extensions">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 11V4a1 1 0 0 0-1-1h-7a1 1 0 0 0-1 1v1a2 2 0 0 1-4 0V4a1 1 0 0 0-1-1H2a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h1a2 2 0 0 1 0 4H2a1 1 0 0 0-1 1v7a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1v-1a2 2 0 0 1 4 0v1a1 1 0 0 0 1 1h7a1 1 0 0 0 1-1v-7a1 1 0 0 0-1-1h-1a2 2 0 0 1 0-4h1a1 1 0 0 0 1-1Z"/></svg>
       Extensions
+    </button>
+    <button data-tab="formatter">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
+      Formatter
     </button>
     <button data-tab="logs">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
@@ -1695,6 +1723,110 @@ function checkUpdate() {
   }).catch(function(e) { toast("Update check failed: "+e.message); });
 }
 
+// ── Formatter tab ─────────────────────────────────────────────────────────────
+// Rendered once when the tab opens (not on every poll) so edits are never lost.
+var fmtState = null;
+var fmtPreviewTimer = null;
+
+function renderFormatter() {
+  var view = el("view");
+  view.innerHTML = '<div class="card"><div class="muted" style="text-align:center;padding:20px"><span class="loader"></span> Loading formatter...</div></div>';
+  api("/formatter").then(function(s) {
+    fmtState = s;
+    var html = '<div class="grid cols2">';
+
+    html += '<div class="card"><h2>Stream Formatter</h2>';
+    html += '<div class="hint">Rewrites each stream&#39;s name and description shown in Stremio using a template. Off by default &mdash; streams keep their original text until you enable it.</div>';
+    html += '<div class="row" style="gap:10px;margin:6px 0 4px"><label class="switch"><input type="checkbox" id="fmt-enabled"' + (s.enabled ? ' checked' : '') + '><span class="track"></span></label><span>Apply formatter to streams</span></div>';
+    html += '<label class="fmt-label" for="fmt-name">Name template <span class="muted" style="font-weight:400">(stream title line in Stremio)</span></label>';
+    html += '<textarea class="tpl" id="fmt-name" rows="3" spellcheck="false"></textarea>';
+    html += '<label class="fmt-label" for="fmt-desc">Description template <span class="muted" style="font-weight:400">(blank lines are removed)</span></label>';
+    html += '<textarea class="tpl" id="fmt-desc" rows="9" spellcheck="false"></textarea>';
+    html += '<div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap">';
+    html += '<button class="primary small" onclick="saveFormatter()">Save</button>';
+    html += '<button class="small" onclick="loadFormatterPreset()">Load PenguPlay example</button>';
+    html += '<button class="ghost small" onclick="clearFormatter()">Clear</button>';
+    html += '</div>';
+    html += '<div id="fmt-status" style="margin-top:10px"></div>';
+    html += '</div>';
+
+    html += '<div class="card"><h2>Live Preview</h2><div class="hint">Rendered against sample streams as you type.</div><div id="fmt-preview"></div></div>';
+    html += '</div>';
+
+    html += '<div class="card" style="margin-top:14px"><h2>Variables &amp; Syntax</h2>';
+    html += '<div class="hint">Click a variable to copy it.</div><div class="fmt-vars">';
+    (s.variables || []).forEach(function(v) {
+      html += '<code onclick="copyText(\'{' + esc(v) + '}\')">{' + esc(v) + '}</code>';
+    });
+    html += '</div>';
+    html += '<div class="muted" style="font-size:12.5px;line-height:1.7;margin-top:12px">' +
+      '<b>Modifiers</b> (chain with <code>::</code>): exists, length, join(&#39;sep&#39;), default(&#39;text&#39;), replace(&#39;a&#39;,&#39;b&#39;), upper, lower, title, trim, first, last, truncate(n), bytes (GB), bytes2 (GiB), istrue, isfalse<br>' +
+      '<b>Comparisons</b>: <code>=</code> <code>!=</code> <code>&gt;</code> <code>&gt;=</code> <code>&lt;</code> <code>&lt;=</code> <code>~</code> (contains)<br>' +
+      '<b>Conditions</b>: <code>{stream.resolution::=2160p["4K"||"HD"]}</code> &mdash; branches are templates and can nest; <code>["text"]</code> alone means empty otherwise<br>' +
+      '<b>Lists</b>: stream.specs, stream.languages, stream.subtitles, stream.visualTags, stream.audioTags, stream.seasonEpisode &middot; <b>size</b> is in bytes (use bytes / bytes2)<br>' +
+      'Size, languages and tags are parsed from the extension&#39;s release name, so they are only present when the source names them.' +
+      '</div></div>';
+
+    view.innerHTML = html;
+    el("fmt-name").value = s.nameTemplate || "";
+    el("fmt-desc").value = s.descriptionTemplate || "";
+    el("fmt-name").addEventListener("input", scheduleFormatterPreview);
+    el("fmt-desc").addEventListener("input", scheduleFormatterPreview);
+    previewFormatter();
+  }).catch(function(e) {
+    view.innerHTML = '<div class="card"><div class="fmt-err">Could not load formatter: ' + esc(e.message) + '</div></div>';
+  });
+}
+
+function formatterBody(includeEnabled) {
+  var body = { nameTemplate: el("fmt-name").value, descriptionTemplate: el("fmt-desc").value };
+  if (includeEnabled) body.enabled = el("fmt-enabled").checked;
+  return JSON.stringify(body);
+}
+
+function scheduleFormatterPreview() {
+  clearTimeout(fmtPreviewTimer);
+  fmtPreviewTimer = setTimeout(previewFormatter, 350);
+}
+
+function previewFormatter() {
+  var box = el("fmt-preview");
+  if (!box) return;
+  api("/formatter/preview", { method: "POST", body: formatterBody(false) }).then(function(r) {
+    if (!el("fmt-preview")) return;
+    if (!r.ok) { box.innerHTML = '<div class="fmt-err">' + esc(r.error) + '</div>'; return; }
+    var html = '';
+    (r.samples || []).forEach(function(smp) {
+      html += '<div class="fmt-sample"><div class="fmt-kind">' + esc(smp.label) + '</div>' +
+        '<div class="fmt-name">' + esc(smp.name) + '</div>' +
+        '<div class="fmt-desc">' + esc(smp.description) + '</div></div>';
+    });
+    box.innerHTML = html || '<div class="muted">Both templates are empty &mdash; streams keep their original text.</div>';
+  }).catch(function(e) { box.innerHTML = '<div class="fmt-err">Preview failed: ' + esc(e.message) + '</div>'; });
+}
+
+function saveFormatter() {
+  var status = el("fmt-status");
+  api("/formatter", { method: "POST", body: formatterBody(true) }).then(function(r) {
+    status.innerHTML = r.ok ? '<span class="badge green">' + esc(r.message) + '</span>' : '<div class="fmt-err">' + esc(r.message) + '</div>';
+    if (r.ok) toast(r.message);
+  }).catch(function(e) { status.innerHTML = '<div class="fmt-err">Save failed: ' + esc(e.message) + '</div>'; });
+}
+
+function loadFormatterPreset() {
+  if (!fmtState) return;
+  el("fmt-name").value = fmtState.presetName;
+  el("fmt-desc").value = fmtState.presetDescription;
+  previewFormatter();
+  toast("PenguPlay example loaded — press Save to apply");
+}
+
+function clearFormatter() {
+  el("fmt-name").value = "";
+  el("fmt-desc").value = "";
+  previewFormatter();
+}
+
 // ── Shared actions ────────────────────────────────────────────────────────────
 function act(path, opts, msg) {
   api(path, opts).then(function(r) {
@@ -1711,6 +1843,7 @@ function openTab(t) {
   });
   if (t === "logs") { renderLogs(); pollLogs(); }
   else if (t === "extensions") { renderExtensions(); loadPlugins(); }
+  else if (t === "formatter") renderFormatter();
   else render();
 }
 

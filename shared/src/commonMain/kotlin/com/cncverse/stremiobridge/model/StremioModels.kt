@@ -119,6 +119,29 @@ data class StremioStream(
     @SerialName("behaviorHints") val behaviorHints: StreamBehaviorHints? = null,
     @SerialName("clearkey")      val clearkey: String? = null,
     @SerialName("subtitles")     val subtitles: List<StremioSubtitle>? = null,
+    /** Server-side metadata for the stream formatter — never sent to Stremio. */
+    @kotlinx.serialization.Transient val info: StreamInfo? = null,
+)
+
+/**
+ * What we know about a stream beyond its display strings: the extension that
+ * produced it, the raw CloudStream link fields and the resolved title. Feeds
+ * the stream formatter's template variables.
+ */
+data class StreamInfo(
+    /** Extension (addon) name, e.g. "Netflix". */
+    val addonName: String? = null,
+    /** CloudStream quality value (e.g. 1080), null when unknown. */
+    val quality: Int? = null,
+    /** CloudStream ExtractorLinkType name: M3U8, DASH, VIDEO, TORRENT, MAGNET. */
+    val linkType: String? = null,
+    /** Raw link name from the extension (often a release name). */
+    val linkName: String? = null,
+    /** Extractor/source name (ExtractorLink.source). */
+    val source: String? = null,
+    /** Title/year the stream was resolved for (TMDB for generic requests). */
+    val metadataTitle: String? = null,
+    val metadataYear: Int? = null,
 )
 
 @Serializable

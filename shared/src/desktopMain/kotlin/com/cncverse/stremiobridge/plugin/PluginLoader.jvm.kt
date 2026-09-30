@@ -1214,10 +1214,20 @@ private fun Any.reflectToStreams(pluginName: String, api: MainAPI? = null): List
         // so don't ask Stremio to proxy it again.
         val passProxyHeaders = finalHeaders.isNotEmpty() && url == finalUrl
 
+        val linkType = runCatching { cls.getMethod("getType").invoke(this)?.toString() }.getOrNull()
+        val source = runCatching { cls.getMethod("getSource").invoke(this) as? String }.getOrNull()
+
         listOf(StremioStream(
             name = streamName, title = n, url = finalUrl,
             behaviorHints = if (passProxyHeaders) StreamBehaviorHints(proxyHeaders = ProxyHeaders(finalHeaders)) else null,
-            clearkey = clearkeyHex
+            clearkey = clearkeyHex,
+            info = com.cncverse.stremiobridge.model.StreamInfo(
+                addonName = pluginName,
+                quality = q?.toIntOrNull()?.takeIf { it > 0 },
+                linkType = linkType,
+                linkName = n,
+                source = source,
+            ),
         ))
     } catch (e: Exception) {
         ServerState.warn("reflectToStreams exception plugin=$pluginName class=${this.javaClass.name}: ${e.message}")

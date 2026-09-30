@@ -436,6 +436,7 @@ object StremioServer {
             loadDisabledPlugins()
             profilesFile = File(cacheDir, "profiles.json")
             loadProfiles()
+            com.cncverse.stremiobridge.format.StreamFormatter.init(cacheDir)
         }
         val targetPort = findAvailablePort(port)
         activePort = targetPort
@@ -912,7 +913,11 @@ object StremioServer {
         val id   = parameters["id"]   ?: return respond(HttpStatusCode.BadRequest)
 
         val streams = withContext(pluginDispatcher) { buildStreams(type, id, profileId) }
-        respond(StremioStreamResponse(sortStreamsByQuality(streams)))
+        val formatted = com.cncverse.stremiobridge.format.StreamFormatter.apply(
+            sortStreamsByQuality(streams),
+            com.cncverse.stremiobridge.format.StreamFormatter.contextFromId(type, id),
+        )
+        respond(StremioStreamResponse(formatted))
     }
 
     private suspend fun ApplicationCall.respondSubtitles(profileId: String?) {
@@ -1636,7 +1641,9 @@ object StremioServer {
         ServerState.info("[${api.name}] Found ${links.size} streams")
         return links.map { stream ->
             val newName = bestMatch.name + (if (!stream.name.isNullOrBlank()) "\n${stream.name}" else "")
-            stream.copy(name = newName)
+            val info = (stream.info ?: com.cncverse.stremiobridge.model.StreamInfo(addonName = api.name))
+                .copy(metadataTitle = title, metadataYear = year)
+            stream.copy(name = newName, info = info)
         }
     }
 

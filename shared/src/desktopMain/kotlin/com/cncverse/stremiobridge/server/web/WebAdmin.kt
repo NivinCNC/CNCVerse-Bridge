@@ -1,6 +1,10 @@
 ﻿package com.cncverse.stremiobridge.server.web
 
 import com.cncverse.stremiobridge.Constants
+import com.cncverse.stremiobridge.format.StreamFormatter
+import com.cncverse.stremiobridge.format.StreamFormatterConfig
+import com.cncverse.stremiobridge.format.StreamVariables
+import com.cncverse.stremiobridge.format.TemplateException
 import com.cncverse.stremiobridge.plugin.GlobalPluginManager
 import com.cncverse.stremiobridge.repo.PluginInstaller
 import com.cncverse.stremiobridge.repo.RepoManager
@@ -410,6 +414,51 @@ object WebAdmin {
                     BridgeRuntime.forceReloadPlugins()
                 }
                 call.respond(AdminActionResult(true, "Applying settings…"))
+            }
+
+            // ── Stream formatter ─────────────────────────────────────────────
+
+            get("/formatter") {
+                if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
+                val cfg = StreamFormatter.config
+                call.respond(AdminFormatterState(
+                    enabled = cfg.enabled,
+                    nameTemplate = cfg.nameTemplate,
+                    descriptionTemplate = cfg.descriptionTemplate,
+                    presetName = StreamFormatter.PRESET_NAME,
+                    presetDescription = StreamFormatter.PRESET_DESCRIPTION,
+                    variables = StreamVariables.NAMES,
+                ))
+            }
+
+            post("/formatter") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val body = call.receive<AdminFormatterRequest>()
+                val cfg = StreamFormatterConfig(body.enabled, body.nameTemplate, body.descriptionTemplate)
+                try {
+                    StreamFormatter.save(cfg)
+                    ServerState.info("Stream formatter " + (if (cfg.enabled) "enabled" else "disabled") + " — templates saved")
+                    call.respond(AdminActionResult(true, if (cfg.enabled) "Formatter saved & enabled" else "Formatter saved (disabled)"))
+                } catch (e: TemplateException) {
+                    call.respond(AdminActionResult(false, e.message))
+                }
+            }
+
+            post("/formatter/preview") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val body = call.receive<AdminFormatterRequest>()
+                val cfg = StreamFormatterConfig(true, body.nameTemplate, body.descriptionTemplate)
+                val result = try {
+                    val (nameTpl, descTpl) = StreamFormatter.validate(cfg)
+                    val labels = listOf("4K movie (direct file)", "Series episode (HLS)", "Live channel (minimal data)")
+                    AdminFormatterPreview(ok = true, samples = StreamFormatter.samples().mapIndexed { idx, (stream, ctx) ->
+                        val out = StreamFormatter.format(stream, ctx, nameTpl, descTpl)
+                        AdminFormatterSample(labels.getOrElse(idx) { "Sample" }, out.name.orEmpty(), out.title.orEmpty())
+                    })
+                } catch (e: TemplateException) {
+                    AdminFormatterPreview(ok = false, error = e.message)
+                }
+                call.respond(result)
             }
 
             // ── Logs ────────────────────────────────────────────────────────
