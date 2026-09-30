@@ -7,6 +7,8 @@ import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.decodeFromStream
+import kotlinx.serialization.json.encodeToStream
 import java.io.File
 import java.net.URI
 import java.util.concurrent.ConcurrentHashMap
@@ -33,11 +35,11 @@ data class ProviderCacheOverride(
 data class StreamCacheConfig(
     val enabled: Boolean = true,
     val singleFlightEnabled: Boolean = true,
-    val defaultTtlMinutes: Long = 360L,           // 6 hours default
+    val defaultTtlMinutes: Long = 60L,            // 1 hour: many links carry undetectable short-lived tokens
     val signedSafetyBufferSeconds: Long = 60L,    // 60-second safety buffer for signed URLs
     val minCacheableTtlMinutes: Long = 5L,        // Below 5 min = ephemeral (bypass or short TTL)
-    val maxRamEntries: Int = 10_000,              // Up to 10k items in RAM
-    val diskPersistenceEnabled: Boolean = true,
+    val maxRamEntries: Int = 2_000,               // entries hold whole stream lists — keep RAM bounded
+    val diskPersistenceEnabled: Boolean = false,  // opt-in: stream links rarely outlive a restart anyway
     val providerOverrides: Map<String, ProviderCacheOverride> = emptyMap()
 )
 
@@ -108,6 +110,13 @@ object StreamLinkClassifier {
         "r2.dev", "googleusercontent.com", "workers.dev"
     )
 
+    private val UNIX_SECONDS_RX = Regex("""^1[6-9]\d{8}$|^2\d{9}$""")
+    private val UNIX_MILLIS_RX = Regex("""^1[6-9]\d{11}$|^2\d{12}$""")
+    private val HEX8_RX = Regex("""^[0-9a-fA-F]{8}$""")
+    private val HOST_RX = Regex("https?://([^/:]+)")
+    private val AMZ_DATE_FORMAT = java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd'T'HHmmss'Z'")
+        .withZone(java.time.ZoneOffset.UTC)
+
     private val TOKENIZED_HOST_KEYWORDS = listOf(
         "hubcloud", "gdflix", "fastdl", "streamtape", "doodstream", "dood",
         "filemoon", "streamwish", "vidhide", "mixdrop", "streamhub",
@@ -117,7 +126,7 @@ object StreamLinkClassifier {
     fun classify(
         url: String?,
         customProviderTtlMinutes: Long? = null,
-        defaultTtlMinutes: Long = 360L,
+        defaultTtlMinutes: Long = 60L,
         signedSafetyBufferSeconds: Long = 60L,
         minCacheableTtlMinutes: Long = 5L
     ): LinkClassificationResult {
@@ -150,7 +159,7 @@ object StreamLinkClassifier {
         val host = try {
             URI(trimmed).host?.lowercase() ?: ""
         } catch (_: Throwable) {
-            Regex("https?://([^/:]+)").find(trimmed)?.groupValues?.getOrNull(1)?.lowercase() ?: ""
+            HOST_RX.find(trimmed)?.groupValues?.getOrNull(1)?.lowercase() ?: ""
         }
 
         val now = System.currentTimeMillis()
@@ -160,6 +169,7 @@ object StreamLinkClassifier {
         var detectedExpiryMs: Long? = null
         var matchedParam: String? = null
         var hasAuthToken = false
+        var expiredParam: String? = null // explicit expiry already in the past → link is dead
 
         if (queryStr.isNotBlank()) {
             val pairs = queryStr.split("&")
@@ -182,16 +192,13 @@ object StreamLinkClassifier {
                 val expSec = amzExpires.toLongOrNull()
                 if (expSec != null) {
                     try {
-                        val sdf = java.text.SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'").apply {
-                            timeZone = java.util.TimeZone.getTimeZone("UTC")
-                        }
-                        val dateMs = sdf.parse(amzDate)?.time
-                        if (dateMs != null) {
-                            val expiryEpochMs = dateMs + (expSec * 1000L)
-                            if (expiryEpochMs > now) {
-                                detectedExpiryMs = expiryEpochMs
-                                matchedParam = "X-Amz-Date=$amzDate, X-Amz-Expires=$amzExpires"
-                            }
+                        val dateMs = java.time.Instant.from(AMZ_DATE_FORMAT.parse(amzDate)).toEpochMilli()
+                        val expiryEpochMs = dateMs + (expSec * 1000L)
+                        if (expiryEpochMs > now) {
+                            detectedExpiryMs = expiryEpochMs
+                            matchedParam = "X-Amz-Date=$amzDate, X-Amz-Expires=$amzExpires"
+                        } else {
+                            expiredParam = "X-Amz-Date=$amzDate, X-Amz-Expires=$amzExpires"
                         }
                     } catch (_: Throwable) {}
                 }
@@ -202,29 +209,29 @@ object StreamLinkClassifier {
                 for ((key, value) in queryMap) {
                     if (EXPLICIT_EXPIRY_PARAM_NAMES.contains(key)) {
                         // 1) 10-digit unix timestamp in seconds
-                        if (value.matches(Regex("""^1[6-9]\d{8}$|^2\d{9}$"""))) {
+                        if (value.matches(UNIX_SECONDS_RX)) {
                             val parsed = value.toLongOrNull()
                             if (parsed != null) {
                                 val ms = parsed * 1000L
-                                // Only accept future timestamps as expiry; past timestamps are likely issue/creation times
+                                // These keys strictly mean "expires at", so a past value is a dead link
                                 if (ms > now) {
                                     detectedExpiryMs = ms
                                     matchedParam = "$key=$value"
                                     break
-                                }
+                                } else expiredParam = "$key=$value"
                             }
                         }
                         // 2) 13-digit unix timestamp in milliseconds
-                        if (value.matches(Regex("""^1[6-9]\d{11}$|^2\d{12}$"""))) {
+                        if (value.matches(UNIX_MILLIS_RX)) {
                             val parsed = value.toLongOrNull()
                             if (parsed != null && parsed > now) {
                                 detectedExpiryMs = parsed
                                 matchedParam = "$key=$value"
                                 break
-                            }
+                            } else if (parsed != null) expiredParam = "$key=$value"
                         }
                         // 3) Hex 8-character timestamp
-                        if (value.length == 8 && value.matches(Regex("""^[0-9a-fA-F]{8}$"""))) {
+                        if (value.length == 8 && value.matches(HEX8_RX)) {
                             val parsed = value.toLongOrNull(16)?.times(1000L)
                             if (parsed != null && parsed in (1_600_000_000_000L..2_500_000_000_000L) && parsed > now) {
                                 detectedExpiryMs = parsed
@@ -239,6 +246,18 @@ object StreamLinkClassifier {
 
         val safetyBufferMs = signedSafetyBufferSeconds * 1000L
         val minCacheableMs = minCacheableTtlMinutes * 60_000L
+
+        if (detectedExpiryMs == null && expiredParam != null) {
+            return LinkClassificationResult(
+                url = trimmed,
+                host = host,
+                category = "EXPIRED_SIGNED",
+                isSigned = true,
+                computedTtlMs = 0L,
+                isCacheable = false,
+                reason = "Signed URL already expired ($expiredParam) — never cached"
+            )
+        }
 
         // If an explicit expiration timestamp was detected:
         if (detectedExpiryMs != null) {
@@ -328,14 +347,33 @@ object StreamLinkClassifier {
 
 object StreamCacheManager {
 
-    private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+    /**
+     * Shared fetches run plugin code, so they use the server's bounded plugin
+     * pool (never Dispatchers.Default, which only has one thread per core).
+     * Lazy: StremioServer owns the dispatcher.
+     */
+    private val fetchScope by lazy {
+        CoroutineScope(com.cncverse.stremiobridge.server.StremioServer.pluginDispatcher + SupervisorJob())
+    }
+    /** Housekeeping (purge / disk flush) — cheap, kept off the plugin pool. */
+    private val maintenanceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
     private val memoryCache = ConcurrentHashMap<String, CachedStreamEntry>()
-    private val inFlight = ConcurrentHashMap<String, Deferred<List<StremioStream>>>()
+
+    /** An in-flight shared fetch plus how many requests are currently waiting on it. */
+    private class Flight(val deferred: Deferred<List<StremioStream>>) {
+        val waiters = java.util.concurrent.atomic.AtomicInteger(0)
+    }
+    private val inFlight = ConcurrentHashMap<String, Flight>()
+
+    /** Hard cap for one shared fetch; it is also cancelled once no request is waiting for it. */
+    private const val MAX_FETCH_MS = 60_000L
 
     private val isDirty = AtomicBoolean(false)
-    private var cacheDirFile: File? = null
-    private var configFile: File? = null
-    private var dataFile: File? = null
+    @Volatile private var cacheDirFile: File? = null
+    @Volatile private var configFile: File? = null
+    @Volatile private var dataFile: File? = null
+    private val diskLock = Any()
 
     // High performance atomic telemetry counters
     val hits = AtomicLong(0L)
@@ -344,7 +382,7 @@ object StreamCacheManager {
     val totalEvicted = AtomicLong(0L)
     private val lastPurgeTimestamp = AtomicLong(0L)
 
-    var config: StreamCacheConfig = StreamCacheConfig()
+    @Volatile var config: StreamCacheConfig = StreamCacheConfig()
         private set
 
     private var cleanupJob: Job? = null
@@ -362,7 +400,7 @@ object StreamCacheManager {
 
         // Background periodic purge and flush jobs
         cleanupJob?.cancel()
-        cleanupJob = scope.launch {
+        cleanupJob = maintenanceScope.launch {
             while (isActive) {
                 delay(5 * 60 * 1000L) // Purge expired every 5 minutes
                 purgeExpired()
@@ -370,7 +408,7 @@ object StreamCacheManager {
         }
 
         persistenceJob?.cancel()
-        persistenceJob = scope.launch {
+        persistenceJob = maintenanceScope.launch {
             while (isActive) {
                 delay(30 * 1000L) // Debounced flush every 30 seconds
                 if (isDirty.getAndSet(false) && config.diskPersistenceEnabled) {
@@ -412,8 +450,11 @@ object StreamCacheManager {
         if (!file.exists()) return
 
         try {
-            val json = file.readText()
-            val list = cacheJson.decodeFromString<List<CachedStreamEntry>>(json)
+            // Streamed decode: never materialise the whole file as one String
+            @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+            val list = file.inputStream().buffered().use {
+                cacheJson.decodeFromStream<List<CachedStreamEntry>>(it)
+            }
             val now = System.currentTimeMillis()
             var loaded = 0
             list.forEach { entry ->
@@ -428,17 +469,24 @@ object StreamCacheManager {
         }
     }
 
-    fun saveToDiskNow() {
-        val file = dataFile ?: return
+    /**
+     * Streams the live entries straight to disk (no whole-cache String in
+     * memory), then atomically replaces the file. Serialized so the periodic
+     * flush and shutdown can't write the same temp file concurrently.
+     */
+    @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+    fun saveToDiskNow() = synchronized(diskLock) {
+        val file = dataFile ?: return@synchronized
         try {
             val now = System.currentTimeMillis()
             val active = memoryCache.values.filter { it.expiresAt > now }
             val tmp = File(file.parentFile, "${file.name}.tmp")
-            tmp.writeText(cacheJson.encodeToString(active))
-            if (tmp.exists()) {
-                if (file.exists()) file.delete()
-                tmp.renameTo(file)
-            }
+            tmp.outputStream().buffered().use { cacheJson.encodeToStream(active, it) }
+            java.nio.file.Files.move(
+                tmp.toPath(), file.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+            )
         } catch (e: Throwable) {
             ServerState.warn("Failed to save stream_cache.json: ${e.message}")
         }
@@ -459,9 +507,6 @@ object StreamCacheManager {
             return null
         }
 
-        // Increment entry hit count
-        val updated = entry.copy(hitCount = entry.hitCount + 1)
-        memoryCache[key] = updated
         hits.incrementAndGet()
         return entry.streams
     }
@@ -505,8 +550,17 @@ object StreamCacheManager {
         key: String,
         providerKey: String? = null,
         fetcher: suspend () -> List<StremioStream>
+    ): List<StremioStream> = getOrFetchResult(key, providerKey) { FetchResult(fetcher()) }
+
+    /** A fetch outcome; [cacheable] = false serves the streams without caching them (e.g. partial results). */
+    class FetchResult(val streams: List<StremioStream>, val cacheable: Boolean = true)
+
+    suspend fun getOrFetchResult(
+        key: String,
+        providerKey: String? = null,
+        fetcher: suspend () -> FetchResult
     ): List<StremioStream> {
-        if (!config.enabled) return fetcher()
+        if (!config.enabled) return fetcher().streams
 
         // 1. Fast L1 Memory lookup
         val cached = get(key)
@@ -516,40 +570,46 @@ object StreamCacheManager {
         if (!config.singleFlightEnabled) {
             misses.incrementAndGet()
             val fetched = fetcher()
-            put(key, fetched, providerKey)
-            return fetched
+            if (fetched.cacheable) put(key, fetched.streams, providerKey)
+            return fetched.streams
         }
 
-        // 3. Single-flight request coalescing
+        // 3. Single-flight request coalescing. The shared job is time-limited on
+        //    its own (callers' timeouts only stop *their* wait) and is cancelled
+        //    when the last waiting request goes away, so abandoned scrapes never
+        //    keep running in the background.
         var isLeader = false
-        val deferred = inFlight.compute(key) { _, existing ->
-            if (existing != null && existing.isActive) {
+        val flight = inFlight.compute(key) { _, existing ->
+            if (existing != null && existing.deferred.isActive) {
                 existing
             } else {
                 isLeader = true
-                scope.async {
+                lateinit var self: Flight
+                val deferred = fetchScope.async(start = CoroutineStart.LAZY) {
                     try {
-                        val result = fetcher()
-                        put(key, result, providerKey)
-                        result
+                        val result = withTimeout(MAX_FETCH_MS) { fetcher() }
+                        if (result.cacheable) put(key, result.streams, providerKey)
+                        result.streams
                     } finally {
-                        inFlight.remove(key)
+                        inFlight.remove(key, self) // only our own entry, never a newer leader's
                     }
                 }
+                self = Flight(deferred)
+                self
             }
         }!!
+        flight.waiters.incrementAndGet()
+        flight.deferred.start()
 
-        if (!isLeader) {
-            requestsSaved.incrementAndGet()
-        } else {
-            misses.incrementAndGet()
-        }
+        if (!isLeader) requestsSaved.incrementAndGet() else misses.incrementAndGet()
 
         return try {
-            deferred.await()
-        } catch (e: Throwable) {
-            inFlight.remove(key)
-            throw e
+            flight.deferred.await()
+        } finally {
+            if (flight.waiters.decrementAndGet() == 0 && flight.deferred.isActive) {
+                flight.deferred.cancel()
+                inFlight.remove(key, flight)
+            }
         }
     }
 
@@ -592,12 +652,12 @@ object StreamCacheManager {
             // The user must always be able to click and play what was scraped.
             validList.add(stream)
 
-            if (classification.isCacheable && classification.computedTtlMs > 0L) {
-                minComputedTtlMs = minOf(minComputedTtlMs, classification.computedTtlMs)
-            } else if (classification.computedTtlMs > 0L) {
-                // Ephemeral link: bound the cache so it expires safely
-                minComputedTtlMs = minOf(minComputedTtlMs, classification.computedTtlMs)
+            if (!classification.isCacheable || classification.computedTtlMs <= 0L) {
+                // A signed link that is expired or about to expire: caching this list
+                // would hand users a dead link later — serve it now, but don't cache.
+                return Pair(streams, 0L)
             }
+            minComputedTtlMs = minOf(minComputedTtlMs, classification.computedTtlMs)
         }
 
         val effectiveTtlMs = if (validList.isEmpty()) {

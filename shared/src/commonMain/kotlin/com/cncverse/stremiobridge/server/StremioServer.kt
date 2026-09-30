@@ -202,11 +202,13 @@ object StremioServer {
         val disabledExtensions: List<String> = emptyList(),
         /** Globally-disabled extensions the profile wants in its manifest. */
         val enabledExtensions: List<String> = emptyList(),
-        val disableCatalogs: Boolean = false,
-        val disabledCatalogs: List<String> = emptyList(),
-        val allowedResolutions: List<String> = emptyList(),
-        val excludeCam: Boolean = false,
-        val maxStreamsPerResolution: Int = 0,
+        // Optional: fields a caller omits keep the profile's saved value (the
+        // configure page's bulk extension saves don't send catalog/quality prefs).
+        val disableCatalogs: Boolean? = null,
+        val disabledCatalogs: List<String>? = null,
+        val allowedResolutions: List<String>? = null,
+        val excludeCam: Boolean? = null,
+        val maxStreamsPerResolution: Int? = null,
     )
 
     @Serializable
@@ -394,17 +396,35 @@ object StremioServer {
             try {
                 val json = file.readText()
                 val cfg = serverJson.decodeFromString<com.cncverse.stremiobridge.state.ThemeConfig>(json)
-                ServerState.globalAccentHex = cfg.accentHex
-                ServerState.globalAccentGlow = cfg.accentGlow
-                ServerState.globalAccentHover = cfg.accentHover
-                ServerState.globalBaseTheme = cfg.baseTheme.ifBlank { "slate" }
+                ServerState.globalAccentHex = safeColor(cfg.accentHex, ServerState.globalAccentHex)
+                ServerState.globalAccentGlow = safeColor(cfg.accentGlow, ServerState.globalAccentGlow)
+                ServerState.globalAccentHover = safeColor(cfg.accentHover, ServerState.globalAccentHover)
+                ServerState.globalBaseTheme = safeBaseTheme(cfg.baseTheme)
             } catch (e: Exception) {
                 ServerState.warn("Failed to load theme_config.json: ${e.message}")
             }
         }
     }
 
-    internal fun saveThemeConfig(hex: String, glow: String, hover: String, baseTheme: String = "slate") {
+    // Theme values are interpolated into the admin page's JS and the public
+    // index/configure pages' CSS — only plain colours and known theme names pass.
+    private val HEX_COLOR_RX = Regex("^#[0-9a-fA-F]{3,8}$")
+    private val RGBA_COLOR_RX = Regex("^rgba?\\(\\s*\\d{1,3}\\s*,\\s*\\d{1,3}\\s*,\\s*\\d{1,3}\\s*(,\\s*(0|1|0?\\.\\d+)\\s*)?\\)$")
+    private val BASE_THEMES = setOf("slate", "charcoal", "navy", "forest", "oled", "light")
+
+    private fun safeColor(value: String?, fallback: String): String {
+        val v = value?.trim().orEmpty()
+        return if (HEX_COLOR_RX.matches(v) || RGBA_COLOR_RX.matches(v)) v else fallback
+    }
+
+    private fun safeBaseTheme(value: String?): String =
+        value?.trim()?.lowercase()?.takeIf { it in BASE_THEMES } ?: "slate"
+
+    internal fun saveThemeConfig(rawHex: String, rawGlow: String, rawHover: String, rawBaseTheme: String = "slate") {
+        val hex = safeColor(rawHex, ServerState.globalAccentHex)
+        val glow = safeColor(rawGlow, ServerState.globalAccentGlow)
+        val hover = safeColor(rawHover, ServerState.globalAccentHover)
+        val baseTheme = safeBaseTheme(rawBaseTheme)
         ServerState.globalAccentHex = hex
         ServerState.globalAccentGlow = glow
         ServerState.globalAccentHover = hover
@@ -458,16 +478,28 @@ object StremioServer {
         }
     }
 
-    private fun writeProfilesNow() {
-        val file = profilesFile ?: return
+    private val profilesWriteLock = Any()
+
+    /** (fetchedAt, body) of the last successful /api/community-stats upstream response. */
+    @Volatile private var communityStatsCache: Pair<Long, String>? = null
+
+    /**
+     * Writes profiles.json atomically. Serialized so concurrent writers can't
+     * interleave in the temp file; the rename replaces the file in one step so
+     * a crash mid-write never leaves a truncated profiles.json behind.
+     * Request handlers must use the debounced [saveProfiles], not this.
+     */
+    private fun writeProfilesNow() = synchronized(profilesWriteLock) {
+        val file = profilesFile ?: return@synchronized
         try {
             val map: Map<String, ProfileRecord> = HashMap(profiles)
             val tmp = File(file.parentFile, file.name + ".tmp")
             tmp.writeText(serverJson.encodeToString(map))
-            if (!tmp.renameTo(file)) {
-                file.writeText(tmp.readText())
-                tmp.delete()
-            }
+            java.nio.file.Files.move(
+                tmp.toPath(), file.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+            )
         } catch (e: Exception) {
             ServerState.warn("Failed to save profiles: ${e.message}")
         }
@@ -505,8 +537,8 @@ object StremioServer {
         profileId: String,
         disabled: Set<String>,
         enabledOverrides: Set<String>,
-        disableCatalogs: Boolean = false,
-        disabledCatalogs: Set<String> = emptySet(),
+        disableCatalogs: Boolean? = null,
+        disabledCatalogs: Set<String>? = null,
         allowedResolutions: Set<String>? = null,
         excludeCam: Boolean? = null,
         maxStreamsPerResolution: Int? = null,
@@ -516,8 +548,8 @@ object StremioServer {
         profiles[profileId] = ProfileRecord(
             disabled = disabled,
             enabledOverrides = enabledOverrides,
-            disableCatalogs = disableCatalogs,
-            disabledCatalogs = disabledCatalogs,
+            disableCatalogs = disableCatalogs ?: existing?.disableCatalogs ?: false,
+            disabledCatalogs = disabledCatalogs ?: existing?.disabledCatalogs ?: emptySet(),
             allowedResolutions = allowedResolutions ?: existing?.allowedResolutions ?: emptySet(),
             excludeCam = excludeCam ?: existing?.excludeCam ?: false,
             maxStreamsPerResolution = maxStreamsPerResolution ?: existing?.maxStreamsPerResolution ?: 0,
@@ -716,6 +748,7 @@ object StremioServer {
             loadFooterCredits()
             themeConfigFile = File(cacheDir, "theme_config.json")
             loadThemeConfig()
+            com.cncverse.stremiobridge.format.StreamFormatter.init(cacheDir)
             com.cncverse.stremiobridge.cache.StreamCacheManager.init(cacheDir)
         } else {
             val defaultCache = System.getProperty("user.home") + "/.cncverse_bridge"
@@ -962,12 +995,21 @@ object StremioServer {
 
             // Stats proxy for community donation goal
             get("/api/community-stats") {
+                // Public endpoint: serve a 5-minute cached copy so it can't be used to
+                // hammer the upstream (or this server's bandwidth) with one request per hit.
+                val cached = communityStatsCache
+                if (cached != null && currentTimeMillis() - cached.first < 5 * 60_000L) {
+                    return@get call.respondText(cached.second, ContentType.Application.Json)
+                }
                 try {
                     val res = httpClient.get("https://cncverse.pages.dev/api/stats") {
                         header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
                     }
-                    call.respondText(res.bodyAsText(), ContentType.Application.Json)
+                    val body = res.bodyAsText()
+                    if (res.status.isSuccess()) communityStatsCache = currentTimeMillis() to body
+                    call.respondText(body, ContentType.Application.Json)
                 } catch (e: Exception) {
+                    cached?.let { return@get call.respondText(it.second, ContentType.Application.Json) }
                     call.respondText("{}", ContentType.Application.Json, HttpStatusCode.BadGateway)
                 }
             }
@@ -992,7 +1034,7 @@ object StremioServer {
                 val now = currentTimeMillis()
                 val existing = profiles.getOrPut(profileId) { ProfileRecord(createdAt = now, lastSeen = now) }
                 profiles[profileId] = existing.copy(disableCatalogs = disable, lastSeen = now)
-                writeProfilesNow()
+                saveProfiles()
                 call.respondText(profileJson(profileId), ContentType.Application.Json)
             }
 
@@ -1007,7 +1049,7 @@ object StremioServer {
                 }
                 if (internalName.isBlank()) return@post call.respond(HttpStatusCode.BadRequest)
                 val nowEnabled = toggleProfilePlugin(profileId, internalName)
-                writeProfilesNow()
+                saveProfiles()
                 call.respondText(profileJson(profileId, nowEnabled), ContentType.Application.Json)
             }
 
@@ -1029,12 +1071,12 @@ object StremioServer {
                     disabled = body.disabledExtensions.toSet(),
                     enabledOverrides = body.enabledExtensions.toSet(),
                     disableCatalogs = body.disableCatalogs,
-                    disabledCatalogs = body.disabledCatalogs.toSet(),
-                    allowedResolutions = body.allowedResolutions.toSet(),
+                    disabledCatalogs = body.disabledCatalogs?.toSet(),
+                    allowedResolutions = body.allowedResolutions?.toSet(),
                     excludeCam = body.excludeCam,
                     maxStreamsPerResolution = body.maxStreamsPerResolution,
                 )
-                writeProfilesNow()
+                saveProfiles()
                 call.respondText(profileJson(profileId), ContentType.Application.Json)
             }
 
@@ -1046,7 +1088,7 @@ object StremioServer {
                     serverJson.decodeFromString<ProfileQualityPreferencesRequest>(rawText)
                 } catch (e: Exception) {
                     return@post call.respondText(
-                        "{\"error\":\"invalid quality preferences body: ${e.message}\"}",
+                        "{\"error\":\"invalid quality preferences body\"}",
                         ContentType.Application.Json,
                         HttpStatusCode.BadRequest
                     )
@@ -1057,7 +1099,7 @@ object StremioServer {
                     excludeCam = body.excludeCam,
                     maxStreamsPerResolution = body.maxStreamsPerResolution,
                 )
-                writeProfilesNow()
+                saveProfiles()
                 call.respondText(profileJson(profileId), ContentType.Application.Json)
             }
 
@@ -1076,50 +1118,53 @@ object StremioServer {
                 val cur = existing.disabledCatalogs.toMutableSet()
                 if (cur.contains(internalName)) cur.remove(internalName) else cur.add(internalName)
                 profiles[profileId] = existing.copy(disabledCatalogs = cur, lastSeen = now)
-                writeProfilesNow()
+                saveProfiles()
                 call.respondText(profileJson(profileId), ContentType.Application.Json)
             }
 
 
             // Returns loaded extensions for the user page
             get("/api/extensions") {
-                val sb = StringBuilder("[")
                 val installed = com.cncverse.stremiobridge.state.RepoState.installedPlugins.value
                 val knownRepos = com.cncverse.stremiobridge.state.RepoState.repos.value
-                loadedApis.forEachIndexed { i, api ->
-                    if (i > 0) sb.append(",")
-                    val name = api.name.replace("\"", "\\\"")
-                    val id = (unambiguousSlug(api) ?: api.internalName).replace("\"", "\\\"")
+                // Encoded with kotlinx (not string concatenation) so descriptions containing
+                // backslashes, tabs or control characters can't produce invalid JSON.
+                val arr = kotlinx.serialization.json.buildJsonArray {
+                loadedApis.forEach { api ->
+                    val name = api.name
+                    val id = unambiguousSlug(api) ?: api.internalName
                     val plugin = installed.find { it.internalName == api.pluginInternalName || it.internalName == api.internalName }
                     val rawRepoUrl = plugin?.repoUrl ?: ""
                     // Canonicalize: prefer the URL as stored in the known repos list so that
                     // refs/heads variants don't create phantom repo groups in the UI.
                     val knownRepo = knownRepos.find { it.url == rawRepoUrl }
                         ?: knownRepos.find { normalizeGhUrl(it.url) == normalizeGhUrl(rawRepoUrl) }
-                    val repoUrl = (knownRepo?.url ?: rawRepoUrl).replace("\"", "\\\"")
-                    val rawName = knownRepo?.name?.takeIf { it.isNotBlank() }
+                    val repoUrl = knownRepo?.url ?: rawRepoUrl
+                    val repoName = knownRepo?.name?.takeIf { it.isNotBlank() }
                         ?: run {
                             val slug = rawRepoUrl.substringAfterLast("/").substringBefore(".json").ifBlank { "CNCVerse" }
                             slug.replace(Regex("[-_]"), " ").replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
                         }
-                    val repoName = rawName.replace("\"", "\\\"")
-                    val lang = (plugin?.language?.takeIf { it.isNotBlank() } ?: "en").replace("\"", "\\\"")
-                    val iconUrl = plugin?.iconUrl?.replace("\"", "\\\"") ?: ""
-                    val enabled = !isGloballyDisabled(api)
+                    val lang = plugin?.language?.takeIf { it.isNotBlank() } ?: "en"
                     // Prefer repo-declared tvTypes (from the plugin metadata JSON) over
                     // api.supportedTypes at runtime, since runtime types can be buggy
                     // (e.g. all returning "Others" due to a CS3 issue). The repo manifest
                     // always has the correct declared types — this is the "direct TVtype".
-                    val typesJson = if (!plugin?.tvTypes.isNullOrEmpty()) {
-                        plugin!!.tvTypes.distinct().joinToString(",") { "\"${it.replace("\"", "\\\"")}\"" }
-                    } else {
-                        api.supportedTypes.distinct().joinToString(",") { "\"" + it + "\"" }
-                    }
-                    val desc = plugin?.description?.replace("\"", "\\\"")?.replace("\n", " ") ?: ""
-                    sb.append("{\"internalName\":\"$id\",\"name\":\"$name\",\"enabled\":$enabled,\"repoUrl\":\"$repoUrl\",\"repoName\":\"$repoName\",\"lang\":\"$lang\",\"iconUrl\":\"$iconUrl\",\"description\":\"$desc\",\"types\":[$typesJson]}")
+                    val types = if (!plugin?.tvTypes.isNullOrEmpty()) plugin!!.tvTypes.distinct() else api.supportedTypes.distinct()
+                    add(kotlinx.serialization.json.buildJsonObject {
+                        put("internalName", kotlinx.serialization.json.JsonPrimitive(id))
+                        put("name", kotlinx.serialization.json.JsonPrimitive(name))
+                        put("enabled", kotlinx.serialization.json.JsonPrimitive(!isGloballyDisabled(api)))
+                        put("repoUrl", kotlinx.serialization.json.JsonPrimitive(repoUrl))
+                        put("repoName", kotlinx.serialization.json.JsonPrimitive(repoName))
+                        put("lang", kotlinx.serialization.json.JsonPrimitive(lang))
+                        put("iconUrl", kotlinx.serialization.json.JsonPrimitive(plugin?.iconUrl.orEmpty()))
+                        put("description", kotlinx.serialization.json.JsonPrimitive(plugin?.description?.replace("\n", " ").orEmpty()))
+                        put("types", kotlinx.serialization.json.JsonArray(types.map { kotlinx.serialization.json.JsonPrimitive(it) }))
+                    })
                 }
-                sb.append("]")
-                call.respondText(sb.toString(), ContentType.Application.Json)
+                }
+                call.respondText(serverJson.encodeToString(kotlinx.serialization.json.JsonArray.serializer(), arr), ContentType.Application.Json)
             }
 
             // ── Repos (user-facing) ───────────────────────────────────────────
@@ -1323,7 +1368,7 @@ object StremioServer {
      * collisions when two repos ship an extension with the same name.
      */
     private fun profileMatchIds(api: MainApiWrapper): List<String> {
-        val ids = mutableListOf(api.internalName, api.pluginInternalName, api.name, nameSlug(api.name))
+        val ids = mutableListOf(api.internalName, api.pluginInternalName)
         unambiguousSlug(api)?.let { ids.add(it) }
         return ids.distinct()
     }
@@ -1701,7 +1746,12 @@ object StremioServer {
         "https://api.themoviedb.org/3"
     )
 
-    private val genericMediaCache = ConcurrentHashMap<String, Pair<String, Int?>>()
+    /** TMDB/IMDb id → (title, year). Bounded LRU: one entry per title ever requested would grow forever. */
+    private val genericMediaCache: MutableMap<String, Pair<String, Int?>> = java.util.Collections.synchronizedMap(
+        object : LinkedHashMap<String, Pair<String, Int?>>(512, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<String, Int?>>?) = size > 5_000
+        }
+    )
 
     private suspend fun fetchTmdbJson(endpointPathAndQuery: String): JsonObject? {
         val cleanPath = endpointPathAndQuery.trimStart('/')
@@ -1900,8 +1950,14 @@ object StremioServer {
     /** Returns true if the stream name/title indicates a CAM / TeleSync / Screener recording. */
     fun isCamStream(stream: StremioStream): Boolean {
         val text = "${stream.name.orEmpty()} ${stream.title.orEmpty()}".uppercase()
-        return Regex("\\b(CAM|CAMRIP|TELESYNC|TS|HDCAM|HDTS|SCR|SCREENER|DVDSCREENER)\\b").containsMatchIn(text)
+        // No bare "TS"/"SCR": they match MPEG-TS / HLS ".ts" segments and language tags.
+        return CAM_RX.containsMatchIn(text)
     }
+
+    private val CAM_RX = Regex("\\b(CAM|CAMRIP|CAM-RIP|HDCAM|HD-CAM|TELESYNC|HDTS|HD-TS|SCREENER|DVDSCR|DVDSCREENER)\\b")
+
+    /** Resolution tiers the configure page lets users pick; anything else is never filtered out. */
+    private val SELECTABLE_RESOLUTIONS = setOf("2160p", "1080p", "720p", "480p", "360p")
 
     /** Filters a list of streams against a user's profile quality preferences. */
     fun filterStreamsByProfile(streams: List<StremioStream>, profile: ProfileRecord): List<StremioStream> {
@@ -1913,11 +1969,13 @@ object StremioServer {
         }
 
         // 2. Filter allowed resolutions if user chose specific ones
-        if (profile.allowedResolutions.isNotEmpty()) {
-            val allowed = profile.allowedResolutions.map { it.lowercase().trim() }.toSet()
+        // Streams without a selectable tier (unlabeled HLS "Auto", live TV, 240p…) always pass:
+        // the UI has no checkbox for them, so filtering them would silently empty whole titles.
+        val allowed = profile.allowedResolutions.map { it.lowercase().trim() }.toSet()
+        if (allowed.isNotEmpty() && !allowed.containsAll(SELECTABLE_RESOLUTIONS)) {
             result = result.filter { stream ->
                 val res = detectStreamResolution(stream).lowercase()
-                allowed.contains(res) || (res == "other" && allowed.contains("other"))
+                res !in SELECTABLE_RESOLUTIONS || res in allowed
             }
         }
 
@@ -2016,7 +2074,9 @@ object StremioServer {
             if (matchingApis.isEmpty()) return emptyList()
 
             val directCacheKey = "stream:direct:$pluginKey:$dataUrl"
-            return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetch(directCacheKey, pluginKey) {
+            // Live TV / live events: links are short-lived session URLs — never cache them.
+            val isLive = type == "tv" || matchingApis.all { api -> api.supportedTypes.all { it == "tv" } }
+            return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetchResult(directCacheKey, pluginKey) {
                 ServerState.info("Parallel stream load: ${matchingApis.size} API(s) for key '$pluginKey'")
 
                 val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
@@ -2041,16 +2101,17 @@ object StremioServer {
                     }
                 }
 
-                val deadline = System.currentTimeMillis() + STREAM_DEADLINE_MS
-                while (System.currentTimeMillis() < deadline && jobs.any { it.isActive }) {
-                    delay(200)
-                }
+                withTimeoutOrNull(STREAM_DEADLINE_MS) { jobs.joinAll() }
                 val remaining = jobs.count { it.isActive }
                 if (remaining > 0) {
                     ServerState.warn("Deadline reached ($STREAM_DEADLINE_MS ms) — returning ${accumulated.size} stream(s), cancelling $remaining slow provider(s)")
                     jobs.forEach { it.cancel() }
                 }
-                sortStreamsByQuality(accumulated)
+                // Partial (deadline hit) or live results are served but not cached
+                com.cncverse.stremiobridge.cache.StreamCacheManager.FetchResult(
+                    sortStreamsByQuality(accumulated),
+                    cacheable = remaining == 0 && !isLive,
+                )
             }
         }
 
@@ -2063,17 +2124,19 @@ object StremioServer {
 
         ServerState.info("Generic request: id=$id, type=$type, baseId=$baseId, tmdbId=$tmdbId")
 
-        val profileSig = profileId?.let { pid ->
-            profiles[pid]?.disabled?.sorted()?.joinToString(",") ?: "p_$pid"
-        } ?: "global"
-        val aggCacheKey = "stream:generic:$type:$id:$profileSig"
+        // Key on the exact set of extensions this request may use, so profiles with
+        // different opt-ins / disables and admin enable/disable changes never share results.
+        val activeSig = loadedApis.asSequence()
+            .filter { api -> !isPluginBlocked(api, profileId) && api.supportedTypes.any { it != "tv" } }
+            .map { it.internalName }.sorted().joinToString(",").hashCode()
+        val aggCacheKey = "stream:generic:$type:$id:$activeSig"
 
-        return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetch(aggCacheKey, null) {
+        return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetchResult(aggCacheKey, null) {
             try {
                 val resolved = resolveGenericMedia(type, tmdbId)
                 if (resolved == null) {
                     ServerState.warn("Media resolve failed: no title/year found for $id")
-                    return@getOrFetch emptyList()
+                    return@getOrFetchResult com.cncverse.stremiobridge.cache.StreamCacheManager.FetchResult(emptyList())
                 }
                 val (title, year) = resolved
                 ServerState.info("Media resolve success: title='$title', year=$year")
@@ -2108,20 +2171,23 @@ object StremioServer {
                     }
                 }
 
-                val deadline = System.currentTimeMillis() + STREAM_DEADLINE_MS
-                while (System.currentTimeMillis() < deadline && jobs.any { it.isActive }) {
-                    delay(200)
-                }
+                withTimeoutOrNull(STREAM_DEADLINE_MS) { jobs.joinAll() }
                 val remaining = jobs.count { it.isActive }
                 if (remaining > 0) {
                     ServerState.warn("Deadline reached ($STREAM_DEADLINE_MS ms) — returning ${accumulated.size} stream(s), cancelling $remaining slow provider(s)")
                     jobs.forEach { it.cancel() }
                 }
                 ServerState.info("Returning total ${accumulated.size} streams")
-                sortStreamsByQuality(accumulated)
+                // Only a complete result is cached; a deadline-cut partial list is served once.
+                com.cncverse.stremiobridge.cache.StreamCacheManager.FetchResult(
+                    sortStreamsByQuality(accumulated),
+                    cacheable = remaining == 0,
+                )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Exception) {
                 ServerState.warn("Generic stream resolve error for $id: ${e.stackTraceToString()}")
-                emptyList()
+                com.cncverse.stremiobridge.cache.StreamCacheManager.FetchResult(emptyList())
             }
         }
     }
@@ -2212,12 +2278,14 @@ object StremioServer {
         } else null
 
         val bestMatch = if (requestedSeason != null) {
-            val seasonVariants = listOf("season $requestedSeason", "season 0$requestedSeason", "s0$requestedSeason", "s$requestedSeason")
-            searchResults.find { r ->
-                val norm = normalizeTitle(r.name)
-                val wanted = normalizeTitle(title)
-                (norm == wanted || " $norm ".contains(" $wanted ")) && seasonVariants.any { norm.contains(it) }
-            } ?: pickBestMatch(searchResults, title, year)
+            // Sites often list each season separately ("The Boys Season 2", sometimes with that
+            // season's year), which strict title+year matching rejects. Accept those only when the
+            // result is exactly "<title> season N" / "<title> sN" at the start — so "Season 1"
+            // never matches "Season 10" and spin-offs ("The Boys Presents …") never match.
+            val wanted = normalizeTitle(title)
+            val seasonRx = Regex("^" + Regex.escape(wanted) + " (?:season 0*$requestedSeason|s0*$requestedSeason)(?: |$)")
+            searchResults.find { r -> seasonRx.containsMatchIn(normalizeTitle(r.name)) }
+                ?: pickBestMatch(searchResults, title, year)
         } else {
             pickBestMatch(searchResults, title, year)
         } ?: run {

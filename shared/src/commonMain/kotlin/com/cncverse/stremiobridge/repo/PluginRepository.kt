@@ -34,11 +34,11 @@ object PluginRepository {
     internal var httpClient = HttpClient(CIO) {
         install(ContentNegotiation) { json(repoJson) }
         install(HttpTimeout) {
-            requestTimeoutMillis = 15_000
+            requestTimeoutMillis = 30_000
             connectTimeoutMillis = 10_000
-            socketTimeoutMillis = 15_000
+            socketTimeoutMillis = 30_000
         }
-        engine { requestTimeout = 20_000 }
+        engine { requestTimeout = 30_000 }
         defaultRequest {
             header(HttpHeaders.UserAgent, BROWSER_USER_AGENT)
             header(HttpHeaders.Accept, "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,text/plain,*/*;q=0.8")
@@ -118,14 +118,19 @@ object PluginRepository {
         }
     }
 
+    /**
+     * Original URL first, jsDelivr mirror only as a fallback: jsDelivr caches
+     * GitHub branch refs for hours, so trying it first serves stale repo
+     * listings and stale .cs3 files under a newer version number.
+     */
     private fun getCandidateUrls(url: String): List<String> = buildList {
-        githubRawToJsDelivr(url)?.let { add(it) }
         add(url)
+        githubRawToJsDelivr(url)?.let { add(it) }
     }
 
     /**
      * Fetches the top-level [CncRepository] manifest from [url].
-     * Tries jsDelivr CDN mirror first for GitHub raw URLs, falling back to original URL.
+     * Falls back to jsDelivr CDN mirror for GitHub raw URLs on failure.
      * Returns null on failure.
      */
     suspend fun fetchRepoMeta(url: String): CncRepository? = withContext(Dispatchers.IO) {
@@ -149,7 +154,7 @@ object PluginRepository {
 
     /**
      * Fetches all [SitePlugin] entries from a single plugin-list URL.
-     * Tries jsDelivr CDN mirror first for GitHub raw URLs, falling back to original URL.
+     * Falls back to jsDelivr CDN mirror for GitHub raw URLs on failure.
      */
     suspend fun fetchPluginsFromUrl(listUrl: String): List<SitePlugin> = withContext(Dispatchers.IO) {
         val urls = getCandidateUrls(listUrl)

@@ -77,7 +77,7 @@ object RepoManager {
         if (saveGlobally) {
             persistUrls()
             saveCachedRepoEntries(RepoState.repos.value.map { it.copy(isLoading = false) })
-            saveCachedAvailablePlugins(RepoState.availablePlugins.value)
+            persistAvailablePlugins()
         }
 
         // Fetch plugins for this repo
@@ -96,11 +96,20 @@ object RepoManager {
         RepoState.removeRepo(url)
         persistUrls()
         saveCachedRepoEntries(RepoState.repos.value.map { it.copy(isLoading = false) })
-        saveCachedAvailablePlugins(RepoState.availablePlugins.value)
+        persistAvailablePlugins()
         return removed
     }
 
     private val refreshMutex = Mutex()
+    private val availablePluginsWriteLock = Any()
+
+    /**
+     * Saves the available-plugins cache. Repos refresh in parallel, so writes are
+     * serialized (each writes the latest full state) instead of interleaving in the file.
+     */
+    private fun persistAvailablePlugins() = synchronized(availablePluginsWriteLock) {
+        saveCachedAvailablePlugins(RepoState.availablePlugins.value)
+    }
 
     /**
      * Refresh all repos: fetch metadata + plugin lists.
@@ -172,7 +181,7 @@ object RepoManager {
         }
         val wrapped = all.map { AvailablePlugin(plugin = it, repoEntry = repoEntry) }
         RepoState.mergeAvailablePlugins(wrapped, repoEntry.url)
-        saveCachedAvailablePlugins(RepoState.availablePlugins.value)
+        persistAvailablePlugins()
 
         // Update install states: mark UpdateAvailable where version changed
         val installed = RepoState.installedPlugins.value

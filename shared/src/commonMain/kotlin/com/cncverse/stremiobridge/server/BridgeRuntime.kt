@@ -263,8 +263,15 @@ object BridgeRuntime {
                     forceReloadPlugins()
                 }
 
-                if (!File(cacheDir, "installed_plugins.json").exists()) {
-                    runCatching { File(cacheDir, "installed_plugins.json").writeText("[]") }
+                // Fresh headless install (no installed_plugins.json on disk yet):
+                // download everything the configured repos offer so the server
+                // works out of the box — "install a repo, get all its extensions".
+                if (headlessMode && !File(cacheDir, "installed_plugins.json").exists()) {
+                    val repoUrls = RepoState.availablePlugins.value.map { it.repoEntry.url }.distinct()
+                    if (repoUrls.isNotEmpty()) {
+                        ServerState.info("Fresh install — downloading all extensions from ${repoUrls.size} repo(s)…")
+                        repoUrls.forEach { installAllFromRepo(it) }
+                    }
                 }
             }.onFailure { e ->
                 ServerState.warn("Repo refresh error: ${e.message}")

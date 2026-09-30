@@ -1799,6 +1799,15 @@ function esc(s) {
   return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
 }
 
+// For values placed inside a single-quoted JS string in an inline handler,
+// e.g. onclick="fn('" + jsa(x) + "')". Escapes for JS first (backslash, quote,
+// line breaks), then for the HTML attribute. esc() alone is not enough there:
+// a ' or \ in a plugin name from a third-party repo would break out of the string.
+function jsa(s) {
+  if (s === null || s === undefined) return "";
+  return esc(String(s).replace(/\\/g, "\\\\").replace(/'/g, "\\'").replace(/\r?\n|\r/g, " ").replace(/</g, "\\x3c"));
+}
+
 function toast(msg) {
   var el = document.getElementById("toast");
   el.textContent = msg;
@@ -1896,7 +1905,7 @@ function render() {
   if (!summary) return;
   if (tab === "server") renderServer();
   else if (tab === "extensions") renderExtensions();
-  else if (tab === "health") renderStreamHealth();
+  else if (tab === "health") { /* rendered on open / after loadStreamHealth — poll re-renders would steal the search box focus */ }
   else if (tab === "cache") { updateCacheTelemetryInPlace(); }
   else if (tab === "credits") { /* user-edited form — never re-render from poll */ }
   else if (tab === "logs") { /* append-only, don't full re-render */ }
@@ -1905,13 +1914,13 @@ function render() {
 
 // ── Server tab ────────────────────────────────────────────────────────────────
 function urlBox(label, url) {
-  var cleanUrl = esc(url).replace(/\x27/g,"&#39;");
+  var cleanUrl = url;
   return '<div class="urlbox">' +
     '<div class="urlbox-left">' +
       '<span class="urlbox-label">' + esc(label) + '</span>' +
       '<code>' + esc(url) + '</code>' +
     '</div>' +
-    '<button class="btn-copy-action" title="Copy ' + esc(label) + ' URL" onclick="copyText(\'' + cleanUrl + '\', this)">' +
+    '<button class="btn-copy-action" title="Copy ' + esc(label) + ' URL" onclick="copyText(\'' + jsa(cleanUrl) + '\', this)">' +
       svgCopy + '<span class="copy-lbl">Copy</span>' +
     '</button>' +
   '</div>';
@@ -1997,7 +2006,7 @@ function renderServer() {
     html += '<div class="hero-install-admin">';
     html += '<div class="hero-btn-row">';
     html += '<a class="btn-hero-install-admin" href="' + esc(stremioProtUrl) + '"><svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg><span>Install in Stremio</span></a>';
-    html += '<button class="btn-hero-copy-admin" onclick="copyText(\'' + esc(mainManifestUrl).replace(/\x27/g,"&#39;") + '\', this)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg><span class="copy-lbl">Copy Addon URL</span></button>';
+    html += '<button class="btn-hero-copy-admin" onclick="copyText(\'' + jsa(mainManifestUrl) + '\', this)"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg><span class="copy-lbl">Copy Addon URL</span></button>';
     html += '</div>';
     html += '</div>';
 
@@ -2329,9 +2338,9 @@ function updateExtensionsSourcesOnly() {
 
         rHtml += '<div class="repo-actions" style="gap:6px;flex-shrink:0;">';
         if (!r.isLoading && !r.error && (repoSources.length > installedInThisRepo)) {
-          rHtml += '<button class="small success" onclick="installAllFromRepo(\'' + esc(r.url).replace(/\x27/g,"%27") + '\')" title="Install all extensions from this repo">Install All (' + (repoSources.length - installedInThisRepo) + ')</button>';
+          rHtml += '<button class="small success" onclick="installAllFromRepo(\'' + jsa(r.url) + '\')" title="Install all extensions from this repo">Install All (' + (repoSources.length - installedInThisRepo) + ')</button>';
         }
-        rHtml += '<button class="small danger" onclick="removeRepo(\'' + esc(r.url).replace(/\x27/g,"%27") + '\',\'' + esc(r.name||r.url).replace(/\x27/g,"%27") + '\')" title="Remove Repository">' + svgTrash + ' Remove</button>';
+        rHtml += '<button class="small danger" onclick="removeRepo(\'' + jsa(r.url) + '\',\'' + jsa(r.name||r.url) + '\')" title="Remove Repository">' + svgTrash + ' Remove</button>';
         rHtml += '</div>';
         rHtml += '</div>';
       });
@@ -2495,12 +2504,12 @@ function renderUnifiedSourceRow(p, installedList) {
   if (p.installState === "Installing") {
     html += '<button class="small ghost" disabled style="width:100%"><span class="loader"></span> ' + esc(p.installProgress || "Installing…") + '</button>';
   } else if (!p.installed) {
-    html += '<button class="small primary" onclick="installPlugin(\'' + esc(p.internalName) + '\')" style="width:100%">+ Install</button>';
+    html += '<button class="small primary" onclick="installPlugin(\'' + jsa(p.internalName) + '\')" style="width:100%">+ Install</button>';
   } else {
     html += '<div class="row" style="align-items:center;gap:6px;">';
     if (inst) {
       html += '<label class="switch" title="' + (inst.enabled ? "Enabled on manifest" : "Disabled") + '">';
-      html += '<input type="checkbox" ' + (inst.enabled ? "checked" : "") + ' onchange="togglePlugin(\'' + esc(p.internalName) + '\')">';
+      html += '<input type="checkbox" ' + (inst.enabled ? "checked" : "") + ' onchange="togglePlugin(\'' + jsa(p.internalName) + '\')">';
       html += '<span class="track"></span>';
       html += '</label>';
       html += '<span style="font-size:11px;font-weight:700;' + (inst.enabled ? 'color:var(--green)' : 'color:var(--muted)') + '">' + (inst.enabled ? 'Active' : 'Off') + '</span>';
@@ -2509,12 +2518,12 @@ function renderUnifiedSourceRow(p, installedList) {
 
     html += '<div class="row" style="gap:6px;align-items:center;">';
     if (p.updateAvailable) {
-      html += '<button class="small primary" onclick="installPlugin(\'' + esc(p.internalName) + '\')" title="Update to latest version">↑</button>';
+      html += '<button class="small primary" onclick="installPlugin(\'' + jsa(p.internalName) + '\')" title="Update to latest version">↑</button>';
     }
     if (inst && inst.hasSettings) {
-      html += '<button class="iconbtn small" onclick="toggleSettingsDrawer(\'' + esc(p.internalName) + '\')" title="Configure Settings">' + svgGear + '</button>';
+      html += '<button class="iconbtn small" onclick="toggleSettingsDrawer(\'' + jsa(p.internalName) + '\')" title="Configure Settings">' + svgGear + '</button>';
     }
-    html += '<button class="iconbtn small danger-btn" onclick="uninstallPlugin(\'' + esc(p.internalName) + '\',\'' + esc(p.displayName||p.name).replace(/\x27/g,"%27") + '\')" title="Uninstall">' + svgTrash + '</button>';
+    html += '<button class="iconbtn small danger-btn" onclick="uninstallPlugin(\'' + jsa(p.internalName) + '\',\'' + jsa(p.displayName||p.name) + '\')" title="Uninstall">' + svgTrash + '</button>';
     html += '</div>';
   }
 
@@ -2731,7 +2740,7 @@ function toggleSettingsDrawer(id) {
         byCat[cat].forEach(function(st) { html += renderSetting(st, id); });
       });
       html += '<div class="row" style="margin-top:16px;gap:10px">';
-      html += '<button class="primary small" onclick="applySettings(\'' + esc(id) + '\')">Apply &amp; Reload</button>';
+      html += '<button class="primary small" onclick="applySettings(\'' + jsa(id) + '\')">Apply &amp; Reload</button>';
       html += '<button class="ghost small" onclick="closeSettingsModal()">Close</button>';
       html += '</div>';
       box.innerHTML = html;
@@ -2762,30 +2771,30 @@ function renderSetting(st, pluginId) {
     Object.keys(st.options).forEach(function(label) {
       var val = st.options[label];
       var checked = (st.currentValue || st.defaultValue || "") === val;
-      html += '<label class="checkrow"><input type="radio" name="opt-' + esc(pluginId) + '-' + esc(st.storageKey) + '" ' + (checked?"checked":"") + ' onchange="saveSettingValue(\'' + esc(pluginId) + '\',\'' + esc(st.storageKey) + '\',\'' + esc(val).replace(/\x27/g,"%27") + '\')"><span>' + esc(label) + '</span></label>';
+      html += '<label class="checkrow"><input type="radio" name="opt-' + esc(pluginId) + '-' + esc(st.storageKey) + '" ' + (checked?"checked":"") + ' onchange="saveSettingValue(\'' + jsa(pluginId) + '\',\'' + jsa(st.storageKey) + '\',\'' + jsa(val) + '\')"><span>' + esc(label) + '</span></label>';
     });
     html += '</div>';
   } else if (st.type === "StringSet") {
     var opts = st.defaultSet || [];
     var cur = st.currentSet || [];
     html += '<div class="row" style="margin-bottom:6px">';
-    html += '<button class="small ghost" onclick="setAllValues(\'' + esc(pluginId) + '\',\'' + esc(st.storageKey) + '\',' + (st.isDisabledStyle?"false":"true") + ',' + JSON.stringify(opts).replace(/"/g,"&quot;") + ')">' + (st.isDisabledStyle?"Enable All":"Select All") + '</button>';
-    html += '<button class="small ghost" onclick="setAllValues(\'' + esc(pluginId) + '\',\'' + esc(st.storageKey) + '\',' + (st.isDisabledStyle?"true":"false") + ',[])">' + (st.isDisabledStyle?"Disable All":"Deselect All") + '</button></div>';
+    html += '<button class="small ghost" onclick="setAllValues(\'' + jsa(pluginId) + '\',\'' + jsa(st.storageKey) + '\',' + (st.isDisabledStyle?"false":"true") + ',' + JSON.stringify(opts).replace(/"/g,"&quot;") + ')">' + (st.isDisabledStyle?"Enable All":"Select All") + '</button>';
+    html += '<button class="small ghost" onclick="setAllValues(\'' + jsa(pluginId) + '\',\'' + jsa(st.storageKey) + '\',' + (st.isDisabledStyle?"true":"false") + ',[])">' + (st.isDisabledStyle?"Disable All":"Deselect All") + '</button></div>';
     if (opts.length) {
       html += '<div class="checkgrid">';
       opts.forEach(function(o) {
         var checked = st.isDisabledStyle ? cur.indexOf(o)<0 : cur.indexOf(o)>=0;
-        html += '<label class="checkrow"><input type="checkbox" ' + (checked?"checked":"") + ' onchange="toggleSetVal(\'' + esc(pluginId) + '\',\'' + esc(st.storageKey) + '\',\'' + esc(o).replace(/\x27/g,"%27") + '\',' + (st.isDisabledStyle?"true":"false") + ',this)"><span>' + esc(o.replace("API","").replace("Api","")) + '</span></label>';
+        html += '<label class="checkrow"><input type="checkbox" ' + (checked?"checked":"") + ' onchange="toggleSetVal(\'' + jsa(pluginId) + '\',\'' + jsa(st.storageKey) + '\',\'' + jsa(o) + '\',' + (st.isDisabledStyle?"true":"false") + ',this)"><span>' + esc(o.replace("API","").replace("Api","")) + '</span></label>';
       });
       html += '</div>';
     }
   } else if (st.isBooleanLike) {
     var on = st.currentValue==="true"||(st.currentValue==null&&(st.defaultValue==="true"||st.defaultValue===true));
     html += '<div class="row" style="margin-top:4px"><span class="muted">' + (on?"Enabled":"Disabled") + '</span><div class="spacer"></div>';
-    html += '<label class="switch"><input type="checkbox" ' + (on?"checked":"") + ' onchange="saveSettingValue(\'' + esc(pluginId) + '\',\'' + esc(st.storageKey) + '\',this.checked?\'true\':\'false\')"><span class="track"></span></label></div>';
+    html += '<label class="switch"><input type="checkbox" ' + (on?"checked":"") + ' onchange="saveSettingValue(\'' + jsa(pluginId) + '\',\'' + jsa(st.storageKey) + '\',this.checked?\'true\':\'false\')"><span class="track"></span></label></div>';
   } else {
     var isNum = st.type==="Int"||st.type==="Long"||st.type==="Float";
-    html += '<input ' + (isNum?'type="number" step="any"':'type="text"') + ' value="' + esc(st.currentValue!=null?st.currentValue:(st.defaultValue!=null?st.defaultValue:"")) + '" onchange="saveSettingValue(\'' + esc(pluginId) + '\',\'' + esc(st.storageKey) + '\',this.value||null)">';
+    html += '<input ' + (isNum?'type="number" step="any"':'type="text"') + ' value="' + esc(st.currentValue!=null?st.currentValue:(st.defaultValue!=null?st.defaultValue:"")) + '" onchange="saveSettingValue(\'' + jsa(pluginId) + '\',\'' + jsa(st.storageKey) + '\',this.value||null)">';
   }
   html += '</div>';
   return html;
@@ -2996,7 +3005,7 @@ function renderFormatter() {
     html += '<div style="font-weight:600;font-size:12.5px;color:var(--text, #fff);margin-bottom:8px;display:flex;align-items:center;gap:6px;"><span>✨ Choose a Stream Style Preset:</span></div>';
     html += '<div class="row" style="gap:8px;flex-wrap:wrap;">';
     (s.presets || []).forEach(function(p) {
-      html += '<button type="button" class="small ghost" onclick="applyPreset(\'' + esc(p.id) + '\')" title="' + esc(p.description) + '">' + esc(p.title) + '</button>';
+      html += '<button type="button" class="small ghost" onclick="applyPreset(\'' + jsa(p.id) + '\')" title="' + esc(p.description) + '">' + esc(p.title) + '</button>';
     });
     html += '</div></div>';
     html += '<label class="fmt-label" for="fmt-name">Name template <span class="muted" style="font-weight:400">(stream title line in Stremio)</span></label>';
@@ -3752,13 +3761,13 @@ function renderCacheTab() {
 
       html += '<td style="padding:10px;">';
       html += '<label style="display:flex; align-items:center; gap:6px; cursor:pointer;">';
-      html += '<input type="checkbox" id="cache-p-on-' + esc(p.internalName) + '" ' + (isCacheOn ? 'checked' : '') + ' onchange="onProviderCacheToggle(\'' + esc(p.internalName) + '\', this.checked)">';
+      html += '<input type="checkbox" id="cache-p-on-' + esc(p.internalName) + '" ' + (isCacheOn ? 'checked' : '') + ' onchange="onProviderCacheToggle(\'' + jsa(p.internalName) + '\', this.checked)">';
       html += '<span style="font-weight:600; font-size:12px; color:' + (isCacheOn ? 'var(--green)' : 'var(--red)') + ';">' + (isCacheOn ? 'Cached' : 'Bypass') + '</span>';
       html += '</label>';
       html += '</td>';
 
       html += '<td style="padding:10px;">';
-      html += '<select id="cache-p-ttl-' + esc(p.internalName) + '" style="padding:4px 8px; border-radius:6px; background:var(--card2); border:1px solid var(--border); color:var(--text); font-size:12px;" onchange="onProviderTtlChange(\'' + esc(p.internalName) + '\', this.value)">';
+      html += '<select id="cache-p-ttl-' + esc(p.internalName) + '" style="padding:4px 8px; border-radius:6px; background:var(--card2); border:1px solid var(--border); color:var(--text); font-size:12px;" onchange="onProviderTtlChange(\'' + jsa(p.internalName) + '\', this.value)">';
       html += '<option value="" ' + (customTtl === null || customTtl === undefined ? 'selected' : '') + '>Default Engine TTL (' + cfg.defaultTtlMinutes + 'm)</option>';
       html += '<option value="15" ' + (customTtl === 15 ? 'selected' : '') + '>15 Minutes (Short)</option>';
       html += '<option value="30" ' + (customTtl === 30 ? 'selected' : '') + '>30 Minutes</option>';
@@ -4111,7 +4120,7 @@ function renderStreamHealth() {
 
   // ── Search ───────────────────────────────────────────────────────────────
   html += '<div style="position:relative;margin-bottom:14px;">';
-  html += '<input type="text" placeholder="Search plugins by name or error…" value="' + esc(streamHealthSearch) + '" oninput="setStreamHealthSearch(this.value)" style="padding-right:32px">';
+  html += '<input type="text" id="health-search" placeholder="Search plugins by name or error…" value="' + esc(streamHealthSearch) + '" oninput="setStreamHealthSearch(this.value)" style="padding-right:32px">';
   if (streamHealthSearch) {
     html += '<button onclick="setStreamHealthSearch(\'\')" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);padding:4px;cursor:pointer;font-size:14px;line-height:1;" title="Clear">&times;</button>';
   }
@@ -4212,14 +4221,14 @@ function renderStreamHealth() {
       if (isProbing) {
         html += '<button class="pill small" disabled style="opacity:0.6;min-height:28px;">Testing…</button>';
       } else {
-        html += '<button class="pill small" onclick="probeSingleSource(\'' + esc(p.internalName).replace(/\x27/g,"%27") + '\',\'' + esc(p.pluginName||p.internalName).replace(/\x27/g,"%27") + '\')" style="min-height:28px;" title="Test this source now">Test</button>';
+        html += '<button class="pill small" onclick="probeSingleSource(\'' + jsa(p.internalName) + '\',\'' + jsa(p.pluginName||p.internalName) + '\')" style="min-height:28px;" title="Test this source now">Test</button>';
       }
       html += '<div class="row" style="gap:6px;align-items:center;">';
       if (!isProbing && (isDead || !p.enabled)) {
-        html += '<button class="iconbtn small danger-btn" onclick="uninstallPlugin(\'' + esc(p.internalName).replace(/\x27/g,"%27") + '\',\'' + esc(p.pluginName||p.internalName).replace(/\x27/g,"%27") + '\')" title="Uninstall plugin">' + svgTrash + '</button>';
+        html += '<button class="iconbtn small danger-btn" onclick="uninstallPlugin(\'' + jsa(p.internalName) + '\',\'' + jsa(p.pluginName||p.internalName) + '\')" title="Uninstall plugin">' + svgTrash + '</button>';
       }
       html += '<label class="switch" title="' + (p.enabled ? "Disable" : "Enable") + ' provider">';
-      html += '<input type="checkbox" ' + (p.enabled ? "checked" : "") + ' onchange="togglePluginHealth(\'' + esc(p.internalName).replace(/\x27/g,"%27") + '\')">';
+      html += '<input type="checkbox" ' + (p.enabled ? "checked" : "") + ' onchange="togglePluginHealth(\'' + jsa(p.internalName) + '\')">';
       html += '<span class="track"></span>';
       html += '</label>';
       html += '<span style="font-size:10.5px;font-weight:700;' + (p.enabled ? 'color:var(--green)' : 'color:var(--muted)') + '">' + (p.enabled ? 'Active' : 'Off') + '</span>';
@@ -4236,7 +4245,20 @@ function renderStreamHealth() {
 }
 
 function setStreamHealthFilter(f) { streamHealthFilter = f; renderStreamHealth(); }
-function setStreamHealthSearch(q) { streamHealthSearch = q; renderStreamHealth(); }
+function setStreamHealthSearch(q) {
+  // The view is rebuilt on each keystroke: put focus and caret back into the search box
+  var active = document.activeElement;
+  var wasTyping = active && active.id === "health-search";
+  var caret = wasTyping ? active.selectionStart : null;
+  streamHealthSearch = q;
+  renderStreamHealth();
+  var box = el("health-search");
+  if (box && wasTyping) {
+    box.focus();
+    var pos = caret === null ? box.value.length : Math.min(caret, box.value.length);
+    box.setSelectionRange(pos, pos);
+  }
+}
 
 function fmtTimeAgo(ts) {
   if (!ts) return "never";
@@ -4284,12 +4306,8 @@ function loadGoalStats() {
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
-document.querySelectorAll(".drawer-btn[data-tab]").forEach(function(b) {
-  b.addEventListener("click", function() {
-    openTab(b.getAttribute("data-tab"));
-    toggleDrawer(false);
-  });
-});
+// Drawer buttons already carry onclick="openTab(...); toggleDrawer(false);" —
+// no extra listener here, or every tab click would run openTab (and its fetches) twice.
 
 poll();
 loadPlugins();

@@ -97,6 +97,9 @@ object WebAdmin {
      */
     val localOnlyRepos: MutableSet<String> = ConcurrentHashMap.newKeySet()
 
+    /** Guards "Benchmark all" so only one full probe sweep runs at a time. */
+    private val benchmarkRunning = java.util.concurrent.atomic.AtomicBoolean(false)
+
     private fun scope(): CoroutineScope = appScope ?: CoroutineScope(Dispatchers.Default)
 
     private fun ApplicationCall.checkAdminAuth(): Boolean {
@@ -240,7 +243,7 @@ object WebAdmin {
                 if (url.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing url"))
                 val saveGlobally = body.saveGlobally ?: true
                 scope().launch {
-                    val entry = BridgeRuntime.addRepo(url, saveGlobally = saveGlobally, autoInstallAll = false, disableNewPluginsByDefault = true)
+                    val entry = BridgeRuntime.addRepo(url, saveGlobally = saveGlobally, autoInstallAll = true, disableNewPluginsByDefault = true)
                     if (!saveGlobally) localOnlyRepos.add(url)
                     when {
                         entry == null -> ServerState.warn("Repo already installed: $url")
@@ -550,13 +553,22 @@ object WebAdmin {
                               else "❌ [${api.name}] Probe returned 0 streams"
                     call.respond(AdminActionResult(streamCount > 0, msg))
                 } else {
-                    ServerState.info("🔍 Running stream probe benchmark across all active providers (query: '$query')...")
-                    val results = StremioServer.probeAllApis(query)
-                    val success = results.values.count { it > 0 }
-                    val total = results.size
-                    val msg = "Benchmark complete: $success/$total active source(s) resolved streamable links"
-                    ServerState.info("🏁 $msg")
-                    call.respond(AdminActionResult(true, msg))
+                    // A full benchmark probes every extension (minutes of work on a small VPS):
+                    // allow one at a time so repeated clicks / tabs can't stack sweeps.
+                    if (!benchmarkRunning.compareAndSet(false, true)) {
+                        return@post call.respond(AdminActionResult(false, "A benchmark is already running — wait for it to finish"))
+                    }
+                    try {
+                        ServerState.info("🔍 Running stream probe benchmark across all active providers (query: '$query')...")
+                        val results = StremioServer.probeAllApis(query)
+                        val success = results.values.count { it > 0 }
+                        val total = results.size
+                        val msg = "Benchmark complete: $success/$total active source(s) resolved streamable links"
+                        ServerState.info("🏁 $msg")
+                        call.respond(AdminActionResult(true, msg))
+                    } finally {
+                        benchmarkRunning.set(false)
+                    }
                 }
             }
 
@@ -667,7 +679,9 @@ object WebAdmin {
             post("/cache/config") {
                 if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
                 val raw = call.receiveText()
-                val newConfig = adminJson.decodeFromString<com.cncverse.stremiobridge.cache.StreamCacheConfig>(raw)
+                val newConfig = runCatching {
+                    adminJson.decodeFromString<com.cncverse.stremiobridge.cache.StreamCacheConfig>(raw)
+                }.getOrNull() ?: return@post call.respond(AdminActionResult(false, "Invalid cache configuration"))
                 com.cncverse.stremiobridge.cache.StreamCacheManager.updateConfig(newConfig)
                 call.respond(AdminActionResult(true, "Cache configuration saved"))
             }
