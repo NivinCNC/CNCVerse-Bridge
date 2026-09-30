@@ -1537,6 +1537,46 @@ object StremioServer {
         }
     }
 
+    /** Lower-cases and strips punctuation/extra spaces so "Spider-Man: No Way Home" == "spider man no way home". */
+    private fun normalizeTitle(s: String): String = s.lowercase()
+        .replace("&", " and ")
+        .replace(TITLE_PUNCT, " ")
+        .replace(MULTI_SPACE, " ")
+        .trim()
+
+    private val TITLE_PUNCT = Regex("[^\\p{L}\\p{N}]+")
+    private val MULTI_SPACE = Regex("\\s+")
+
+    /**
+     * Picks the search result for [title]/[year], in order of confidence:
+     *  1. exact title + same year
+     *  2. exact title, result has no year
+     *  3. partial title (result contains the whole title as words) + same year
+     *  4. partial title, result has no year
+     * When TMDB gave no year, the year condition is dropped. A result whose
+     * year is known but differs is never accepted, and a result whose title
+     * doesn't match is never picked (no "first result" fallback) — so a
+     * provider without the title returns nothing instead of a wrong film.
+     */
+    private fun pickBestMatch(results: List<SearchResult>, title: String, year: Int?): SearchResult? {
+        val wanted = normalizeTitle(title)
+        if (wanted.isEmpty()) return null
+        val candidates = results.map { it to normalizeTitle(it.name) }
+        val exact = candidates.filter { (_, n) -> n == wanted }.map { it.first }
+        // Whole-word containment, result ⊇ title only: "dune part two 2024 hindi"
+        // matches "Dune Part Two", but "Up" never matches "Upgrade" and a
+        // shorter "Dune" never stands in for "Dune Part Two".
+        val partial = candidates.filter { (_, n) ->
+            n != wanted && " $n ".contains(" $wanted ")
+        }.map { it.first }
+
+        if (year == null) return exact.firstOrNull() ?: partial.firstOrNull()
+        return exact.firstOrNull { it.year == year }
+            ?: exact.firstOrNull { it.year == null }
+            ?: partial.firstOrNull { it.year == year }
+            ?: partial.firstOrNull { it.year == null }
+    }
+
     // ── Generic per-provider stream fetch (shared by buildStreams + buildStreamsForApi) ─
 
     /**
@@ -1556,11 +1596,10 @@ object StremioServer {
             ?: api.search(title).also { SearchLoadCache.putSearch(cacheKey, title, it) }
         ServerState.info("[${api.name}] Found ${searchResults.size} results")
 
-        val bestMatch = searchResults.find {
-            it.name.equals(title, ignoreCase = true) && (year == null || it.year == null || it.year == year)
-        } ?: searchResults.firstOrNull { it.name.contains(title, ignoreCase = true) }
-          ?: searchResults.firstOrNull()
-          ?: return emptyList()
+        val bestMatch = pickBestMatch(searchResults, title, year) ?: run {
+            ServerState.info("[${api.name}] No result matches '$title'" + (year?.let { " ($it)" } ?: ""))
+            return emptyList()
+        }
 
         ServerState.info("[${api.name}] Best match: '${bestMatch.name}' (url: ${bestMatch.url})")
         // load() is the most expensive call — cache it per plugin+url.
