@@ -400,6 +400,16 @@ object StreamVariables {
         }
     }
 
+    /** "Movies4u HubCloud [FSL Server]" → "HubCloud [FSL Server]"; null when it only repeats [addon]. */
+    private fun sourceName(source: String?, addon: String?): String? {
+        var s = source?.trim().orEmpty()
+        if (!addon.isNullOrBlank() && s.startsWith(addon, ignoreCase = true) && s.length > addon.length &&
+            !s[addon.length].isLetterOrDigit()) {
+            s = s.substring(addon.length).trimStart(' ', '-', ':', '•', '|')
+        }
+        return s.takeIf { it.isNotEmpty() && !it.equals(addon, ignoreCase = true) }
+    }
+
     fun build(stream: StremioStream, ctx: StreamRequestContext): Map<String, Any?> {
         val info = stream.info
         val linkText = info?.linkName ?: stream.title
@@ -445,7 +455,7 @@ object StreamVariables {
             "stream.episode" to episode?.toLong(),
             // Server/extractor the extension reports (e.g. "FslServer", "HubCloud");
             // empty when it just repeats the extension name, so templates can use ::exists
-            "stream.source" to info?.source?.trim()?.takeIf { it.isNotEmpty() && !it.equals(addon, ignoreCase = true) },
+            "stream.source" to sourceName(info?.source, addon),
             "stream.filename" to linkText,
             "stream.name" to stream.name,
             "stream.title" to stream.title,
