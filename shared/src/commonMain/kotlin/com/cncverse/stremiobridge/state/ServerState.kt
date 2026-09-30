@@ -78,10 +78,20 @@ object ServerState {
 
     var serverPort: Int = 8080
 
+    /** When true, catalogs are completely omitted from all manifests (global and profile) */
+    @Volatile var disableCatalogsGlobally: Boolean = false
+
     /** Base URL as seen by the client (e.g. "http://140.238.244.130" or "http://yourdomain.com").
      *  Updated from the HTTP request Host header on every incoming request so that
      *  proxy URLs and admin display URLs reflect the public domain instead of the internal LAN IP. */
     @Volatile var publicBaseUrl: String = ""
+
+    /** Global bridge theme accent configured by the administrator in the dev panel */
+    @Volatile var globalAccentHex: String = "#8b5cf6"
+    @Volatile var globalAccentGlow: String = "rgba(139, 92, 246, 0.28)"
+    @Volatile var globalAccentHover: String = "#7c3aed"
+    /** Global bridge base theme palette (e.g. "slate", "charcoal", "navy", "forest", "oled", "light") */
+    @Volatile var globalBaseTheme: String = "slate"
 
     fun updateStatus(newStatus: ServerStatus) {
         _status.value = newStatus
@@ -100,6 +110,39 @@ object ServerState {
     fun error(msg: String) = log(LogLevel.ERROR, msg)
     fun clearLogs() { _logs.value = emptyList() }
 }
+
+@kotlinx.serialization.Serializable
+data class AuthorCredit(
+    val id: String,
+    val repoUrl: String? = null,
+    val authorName: String = "",
+    val roleBadge: String = "Repository Author",
+    val description: String = "",
+    val avatarUrl: String? = null,
+    val githubUrl: String? = null,
+    val discordUrl: String? = null,
+    val telegramUrl: String? = null,
+    val donationUrl: String? = null,
+    val websiteUrl: String? = null,
+    val isCurated: Boolean = false,
+    val pluginCount: Int? = null,
+)
+
+@kotlinx.serialization.Serializable
+data class FooterCredit(
+    val id: String = "",
+    val label: String = "",
+    val name: String = "",
+    val url: String = "",
+)
+
+@kotlinx.serialization.Serializable
+data class ThemeConfig(
+    val accentHex: String = "#8b5cf6",
+    val accentGlow: String = "rgba(139, 92, 246, 0.28)",
+    val accentHover: String = "#7c3aed",
+    val baseTheme: String = "slate",
+)
 
 expect fun currentTimeMillis(): Long
 expect fun platformLog(level: LogLevel, message: String)

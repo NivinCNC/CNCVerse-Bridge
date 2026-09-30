@@ -3,6 +3,7 @@ package com.cncverse.stremiobridge.server
 import com.cncverse.stremiobridge.model.*
 import com.cncverse.stremiobridge.state.RepoState
 import com.cncverse.stremiobridge.state.ServerState
+import com.cncverse.stremiobridge.state.StreamTracker
 import com.cncverse.stremiobridge.state.currentTimeMillis
 import io.ktor.http.*
 import io.ktor.serialization.kotlinx.json.*
@@ -20,6 +21,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import java.io.File
@@ -31,6 +33,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.CoroutineScope
@@ -51,14 +54,18 @@ private val serverJson = Json {
 }
 
 private val httpClient by lazy {
+    try {
+        System.setProperty("java.net.preferIPv4Stack", "true")
+        System.setProperty("java.net.preferIPv6Addresses", "false")
+    } catch (_: Throwable) {}
     HttpClient(io.ktor.client.engine.cio.CIO) {
         install(io.ktor.client.plugins.contentnegotiation.ContentNegotiation) {
             json(serverJson)
         }
         try {
             install(io.ktor.client.plugins.HttpTimeout) {
-                requestTimeoutMillis = 30_000
-                connectTimeoutMillis = 15_000
+                requestTimeoutMillis = 15_000
+                connectTimeoutMillis = 5_000
                 socketTimeoutMillis = 15_000
             }
         } catch (e: Throwable) {}
@@ -176,6 +183,15 @@ object StremioServer {
         val disabled: Set<String> = emptySet(),
         /** Globally-disabled extensions this profile has explicitly opted into. */
         val enabledOverrides: Set<String> = emptySet(),
+        /** When true, catalog defs are omitted from manifest (streams & search only). */
+        val disableCatalogs: Boolean = false,
+        val disabledCatalogs: Set<String> = emptySet(),
+        /** User-chosen allowed resolutions (e.g. ["2160p", "1080p", "720p"]). Empty = all allowed. */
+        val allowedResolutions: Set<String> = emptySet(),
+        /** When true, exclude CAM / TeleSync / Screener recordings. */
+        val excludeCam: Boolean = false,
+        /** Maximum streams to return per quality tier (0 = unlimited). */
+        val maxStreamsPerResolution: Int = 0,
         val createdAt: Long = 0,
         val lastSeen: Long = 0,
     )
@@ -186,7 +202,221 @@ object StremioServer {
         val disabledExtensions: List<String> = emptyList(),
         /** Globally-disabled extensions the profile wants in its manifest. */
         val enabledExtensions: List<String> = emptyList(),
+        val disableCatalogs: Boolean = false,
+        val disabledCatalogs: List<String> = emptyList(),
+        val allowedResolutions: List<String> = emptyList(),
+        val excludeCam: Boolean = false,
+        val maxStreamsPerResolution: Int = 0,
     )
+
+    @Serializable
+    data class ProfileQualityPreferencesRequest(
+        val allowedResolutions: List<String> = emptyList(),
+        val excludeCam: Boolean = false,
+        val maxStreamsPerResolution: Int = 0,
+    )
+
+    @Serializable
+    data class ProfileCatalogToggleRequest(
+        val disableCatalogs: Boolean = false
+    )
+
+    @Serializable
+    data class ProfilePluginToggleRequest(
+        val internalName: String = ""
+    )
+
+    val credits: java.util.concurrent.CopyOnWriteArrayList<com.cncverse.stremiobridge.state.AuthorCredit> = java.util.concurrent.CopyOnWriteArrayList()
+    private var creditsFile: File? = null
+    private var themeConfigFile: File? = null
+
+    private fun loadCredits() {
+        val file = creditsFile ?: return
+        if (file.exists()) {
+            try {
+                val json = file.readText()
+                val list = serverJson.decodeFromString<List<com.cncverse.stremiobridge.state.AuthorCredit>>(json)
+                credits.clear()
+                credits.addAll(list)
+            } catch (e: Exception) {
+                ServerState.warn("Failed to load credits.json: ${e.message}")
+            }
+        }
+    }
+
+    internal fun saveCredits(list: List<com.cncverse.stremiobridge.state.AuthorCredit>) {
+        credits.clear()
+        credits.addAll(list)
+        val file = creditsFile ?: return
+        try {
+            file.writeText(serverJson.encodeToString(list))
+        } catch (e: Exception) {
+            ServerState.warn("Failed to save credits.json: ${e.message}")
+        }
+    }
+
+    // ── Footer Credits (Dynamic, configurable by admin, persisted to disk) ─────
+    private val footerCredits = mutableListOf<com.cncverse.stremiobridge.state.FooterCredit>()
+    private var footerCreditsFile: File? = null
+
+    private fun loadFooterCredits() {
+        val file = footerCreditsFile ?: return
+        if (file.exists()) {
+            try {
+                val json = file.readText()
+                val list = serverJson.decodeFromString<List<com.cncverse.stremiobridge.state.FooterCredit>>(json)
+                footerCredits.clear()
+                footerCredits.addAll(list)
+            } catch (e: Exception) {
+                ServerState.warn("Failed to load footer_credits.json: ${e.message}")
+            }
+        }
+    }
+
+    internal fun saveFooterCredits(list: List<com.cncverse.stremiobridge.state.FooterCredit>) {
+        footerCredits.clear()
+        footerCredits.addAll(list)
+        val file = footerCreditsFile ?: return
+        try {
+            file.writeText(serverJson.encodeToString(list))
+        } catch (e: Exception) {
+            ServerState.warn("Failed to save footer_credits.json: ${e.message}")
+        }
+    }
+
+    fun getFooterCredits(): List<com.cncverse.stremiobridge.state.FooterCredit> {
+        return footerCredits.toList()
+    }
+
+    fun buildFooterHtml(): String {
+        val list = getFooterCredits()
+        if (list.isEmpty()) return ""
+        fun esc(s: String) = s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;")
+        return list.joinToString(""" <span class="footer-sep">&middot;</span> """) { item ->
+            val linkHtml = if (item.url.isNotBlank()) {
+                """<a href="${esc(item.url)}" target="_blank" rel="noopener" class="footer-author-link" style="font-weight:700;">${esc(item.name)}</a>"""
+            } else {
+                """<span class="footer-author-name" style="font-weight:700;">${esc(item.name)}</span>"""
+            }
+            if (item.label.isNotBlank()) {
+                """<span>${esc(item.label)} $linkHtml</span>"""
+            } else {
+                """<span>$linkHtml</span>"""
+            }
+        }
+    }
+
+    /**
+     * Returns the live credits list:
+     *  1. Team & Contributor entries explicitly created by admin (isCurated=true, no repoUrl).
+     *  2. Installed repositories (auto-populated with live data + admin overrides).
+     *  3. Any other custom curated repo maintainer entries.
+     */
+    fun getCreditsList(): List<com.cncverse.stremiobridge.state.AuthorCredit> {
+        val knownRepos = com.cncverse.stremiobridge.state.RepoState.repos.value
+        val savedList = credits.toList()
+
+        fun normKey(url: String?): String {
+            if (url.isNullOrBlank()) return ""
+            val m = Regex("(?:raw\\.githubusercontent|github)\\.com/([^/]+)/([^/]+)").find(url)
+            if (m != null) return "${m.groupValues[1].lowercase()}/${m.groupValues[2].lowercase().removeSuffix(".git")}"
+            return url.trim().lowercase().removeSuffix("/")
+        }
+
+        val savedByRepoUrl = mutableMapOf<String, com.cncverse.stremiobridge.state.AuthorCredit>()
+        for (c in savedList) {
+            if (!c.repoUrl.isNullOrBlank()) {
+                savedByRepoUrl[c.repoUrl] = c
+                val k = normKey(c.repoUrl)
+                if (k.isNotBlank()) savedByRepoUrl.putIfAbsent(k, c)
+            }
+        }
+
+        val result = mutableListOf<com.cncverse.stremiobridge.state.AuthorCredit>()
+
+        // 1. Team / contributor entries explicitly configured by admin
+        val teamEntries = savedList.filter { it.isCurated && (it.repoUrl.isNullOrBlank()) }
+        result.addAll(teamEntries)
+
+        // 2. Installed repos (auto-populated)
+        val installedUrls = knownRepos.map { it.url }.toSet()
+        val installedKeys = knownRepos.map { normKey(it.url) }.filter { it.isNotBlank() }.toSet()
+
+        for (repo in knownRepos) {
+            if (repo.url.isBlank()) continue
+            val ghMatch = Regex("(?:raw\\.githubusercontent|github)\\.com/([^/]+)/([^/]+)").find(repo.url)
+            val ghUser = ghMatch?.groupValues?.get(1) ?: ""
+            val ghRepo = ghMatch?.groupValues?.get(2)?.removeSuffix(".git") ?: ""
+            val liveAuthorName = repo.name.ifBlank { ghUser.ifBlank { repo.url.substringAfterLast("/").ifBlank { "Unknown Repo" } } }
+            val liveAvatar = repo.iconUrl?.takeUnless { it.isBlank() } ?: (if (ghUser.isNotBlank()) "https://github.com/$ghUser.png" else null)
+            val liveGhLink = if (ghUser.isNotBlank() && ghRepo.isNotBlank()) "https://github.com/$ghUser/$ghRepo" else null
+            val id = "repo_" + kotlin.math.abs(repo.url.hashCode())
+
+            val saved = savedByRepoUrl[repo.url] ?: savedByRepoUrl[normKey(repo.url)]
+            val rawGh = saved?.githubUrl?.takeUnless { it.isBlank() } ?: liveGhLink
+            val cleanGh = if (rawGh != null && rawGh.contains("raw.githubusercontent.com")) {
+                val m = Regex("raw\\.githubusercontent\\.com/([^/]+)/([^/]+)").find(rawGh)
+                if (m != null) "https://github.com/${m.groupValues[1]}/${m.groupValues[2].removeSuffix(".git")}" else rawGh
+            } else rawGh
+
+            val pCount = com.cncverse.stremiobridge.state.RepoState.availablePlugins.value
+                .count { it.repoEntry.url == repo.url }
+
+            result.add(com.cncverse.stremiobridge.state.AuthorCredit(
+                id = saved?.id ?: id,
+                repoUrl = repo.url,
+                authorName = saved?.authorName?.takeUnless { it.isBlank() } ?: liveAuthorName,
+                avatarUrl = saved?.avatarUrl?.takeUnless { it.isBlank() } ?: liveAvatar,
+                githubUrl = cleanGh,
+                roleBadge = saved?.roleBadge?.takeUnless { it.isBlank() } ?: "Installed Repository",
+                description = saved?.description?.takeUnless { it.isBlank() } ?: (repo.description ?: "Community CloudStream repository."),
+                discordUrl = saved?.discordUrl?.trim()?.takeUnless { it.isBlank() },
+                telegramUrl = saved?.telegramUrl?.trim()?.takeUnless { it.isBlank() },
+                donationUrl = saved?.donationUrl?.trim()?.takeUnless { it.isBlank() },
+                websiteUrl = saved?.websiteUrl?.trim()?.takeUnless { it.isBlank() },
+                isCurated = false,
+                pluginCount = if (pCount > 0) pCount else null
+            ))
+        }
+
+        // 3. Extra curated repo entries
+        val curatedExtras = savedList.filter { c ->
+            c.isCurated && !c.repoUrl.isNullOrBlank() && !installedUrls.contains(c.repoUrl) && !installedKeys.contains(normKey(c.repoUrl))
+        }
+        result.addAll(curatedExtras)
+
+        return result
+    }
+
+    private fun loadThemeConfig() {
+        val file = themeConfigFile ?: return
+        if (file.exists()) {
+            try {
+                val json = file.readText()
+                val cfg = serverJson.decodeFromString<com.cncverse.stremiobridge.state.ThemeConfig>(json)
+                ServerState.globalAccentHex = cfg.accentHex
+                ServerState.globalAccentGlow = cfg.accentGlow
+                ServerState.globalAccentHover = cfg.accentHover
+                ServerState.globalBaseTheme = cfg.baseTheme.ifBlank { "slate" }
+            } catch (e: Exception) {
+                ServerState.warn("Failed to load theme_config.json: ${e.message}")
+            }
+        }
+    }
+
+    internal fun saveThemeConfig(hex: String, glow: String, hover: String, baseTheme: String = "slate") {
+        ServerState.globalAccentHex = hex
+        ServerState.globalAccentGlow = glow
+        ServerState.globalAccentHover = hover
+        ServerState.globalBaseTheme = baseTheme
+        val file = themeConfigFile ?: return
+        try {
+            val cfg = com.cncverse.stremiobridge.state.ThemeConfig(hex, glow, hover, baseTheme)
+            file.writeText(serverJson.encodeToString(cfg))
+        } catch (e: Exception) {
+            ServerState.warn("Failed to save theme_config.json: ${e.message}")
+        }
+    }
 
     private fun loadProfiles() {
         val file = profilesFile ?: return
@@ -271,13 +501,45 @@ object StremioServer {
     }
 
     /** Replaces the whole selection for a profile (bulk select / clear all). */
-    fun setProfileSelections(profileId: String, disabled: Set<String>, enabledOverrides: Set<String>) {
+    fun setProfileSelections(
+        profileId: String,
+        disabled: Set<String>,
+        enabledOverrides: Set<String>,
+        disableCatalogs: Boolean = false,
+        disabledCatalogs: Set<String> = emptySet(),
+        allowedResolutions: Set<String>? = null,
+        excludeCam: Boolean? = null,
+        maxStreamsPerResolution: Int? = null,
+    ) {
         val now = currentTimeMillis()
         val existing = profiles[profileId]
         profiles[profileId] = ProfileRecord(
             disabled = disabled,
             enabledOverrides = enabledOverrides,
+            disableCatalogs = disableCatalogs,
+            disabledCatalogs = disabledCatalogs,
+            allowedResolutions = allowedResolutions ?: existing?.allowedResolutions ?: emptySet(),
+            excludeCam = excludeCam ?: existing?.excludeCam ?: false,
+            maxStreamsPerResolution = maxStreamsPerResolution ?: existing?.maxStreamsPerResolution ?: 0,
             createdAt = existing?.createdAt ?: now,
+            lastSeen = now,
+        )
+        saveProfiles()
+    }
+
+    /** Updates quality preferences for a user profile. */
+    fun updateProfileQualityPreferences(
+        profileId: String,
+        allowedResolutions: Set<String>,
+        excludeCam: Boolean,
+        maxStreamsPerResolution: Int,
+    ) {
+        val now = currentTimeMillis()
+        val existing = profiles.getOrPut(profileId) { ProfileRecord(createdAt = now, lastSeen = now) }
+        profiles[profileId] = existing.copy(
+            allowedResolutions = allowedResolutions,
+            excludeCam = excludeCam,
+            maxStreamsPerResolution = maxStreamsPerResolution,
             lastSeen = now,
         )
         saveProfiles()
@@ -348,12 +610,24 @@ object StremioServer {
         val rec = profiles[profileId]
         val disabled = rec?.disabled ?: emptySet()
         val overrides = rec?.enabledOverrides ?: emptySet()
+        val disableCatalogs = rec?.disableCatalogs ?: false
         val disabledJson = disabled.joinToString(",") { "\"" + it.replace("\"", "\\\"") + "\"" }
         val overridesJson = overrides.joinToString(",") { "\"" + it.replace("\"", "\\\"") + "\"" }
+        val disabledCatalogs = rec?.disabledCatalogs ?: emptySet()
+        val disabledCatalogsJson = disabledCatalogs.joinToString(",") { "\"" + it.replace("\"", "\\\"") + "\"" }
+        val allowedResolutions = rec?.allowedResolutions ?: emptySet()
+        val allowedResolutionsJson = allowedResolutions.joinToString(",") { "\"" + it.replace("\"", "\\\"") + "\"" }
+        val excludeCam = rec?.excludeCam ?: false
+        val maxStreamsPerResolution = rec?.maxStreamsPerResolution ?: 0
         val extra = if (nowEnabled != null) ",\"nowEnabled\":$nowEnabled" else ""
         return "{\"profileId\":\"" + profileId + "\",\"disabledExtensions\":[" + disabledJson +
             "],\"enabledExtensions\":[" + overridesJson +
-            "],\"createdAt\":" + (rec?.createdAt ?: 0) + ",\"lastSeen\":" + (rec?.lastSeen ?: 0) + extra + "}"
+            "],\"disableCatalogs\":" + disableCatalogs +
+            ",\"disabledCatalogs\":[" + disabledCatalogsJson + "]" +
+            ",\"allowedResolutions\":[" + allowedResolutionsJson + "]" +
+            ",\"excludeCam\":" + excludeCam +
+            ",\"maxStreamsPerResolution\":" + maxStreamsPerResolution +
+            ",\"createdAt\":" + (rec?.createdAt ?: 0) + ",\"lastSeen\":" + (rec?.lastSeen ?: 0) + extra + "}"
     }
 
 
@@ -436,7 +710,16 @@ object StremioServer {
             loadDisabledPlugins()
             profilesFile = File(cacheDir, "profiles.json")
             loadProfiles()
-            com.cncverse.stremiobridge.format.StreamFormatter.init(cacheDir)
+            creditsFile = File(cacheDir, "credits.json")
+            loadCredits()
+            footerCreditsFile = File(cacheDir, "footer_credits.json")
+            loadFooterCredits()
+            themeConfigFile = File(cacheDir, "theme_config.json")
+            loadThemeConfig()
+            com.cncverse.stremiobridge.cache.StreamCacheManager.init(cacheDir)
+        } else {
+            val defaultCache = System.getProperty("user.home") + "/.cncverse_bridge"
+            com.cncverse.stremiobridge.cache.StreamCacheManager.init(defaultCache)
         }
         val targetPort = findAvailablePort(port)
         activePort = targetPort
@@ -461,6 +744,7 @@ object StremioServer {
         stopPeriodicRefreshJob()
         if (profileSavePending.getAndSet(false)) writeProfilesNow()
         com.cncverse.stremiobridge.tunnel.CloudflaredManager.stopTunnel()
+        com.cncverse.stremiobridge.cache.StreamCacheManager.shutdown()
         engine?.stop(0, 500)
         engine = null
         ServerState.info("Stremio server stopped")
@@ -697,19 +981,43 @@ object StremioServer {
                 call.respondText(profileJson(profileId), ContentType.Application.Json)
             }
 
+            post("/api/profile/{profileId}/catalogs") {
+                val profileId = call.parameters["profileId"] ?: return@post call.respond(HttpStatusCode.BadRequest)
+                val rawText = try { call.receiveText() } catch (_: Throwable) { "" }
+                val disable = try {
+                    serverJson.decodeFromString<ProfileCatalogToggleRequest>(rawText).disableCatalogs
+                } catch (_: Throwable) {
+                    rawText.contains("\"disableCatalogs\":true") || rawText.contains("\"disableCatalogs\": true")
+                }
+                val now = currentTimeMillis()
+                val existing = profiles.getOrPut(profileId) { ProfileRecord(createdAt = now, lastSeen = now) }
+                profiles[profileId] = existing.copy(disableCatalogs = disable, lastSeen = now)
+                writeProfilesNow()
+                call.respondText(profileJson(profileId), ContentType.Application.Json)
+            }
+
             // Toggle an extension on/off for this profile
             post("/api/profile/{profileId}/toggle") {
                 val profileId = call.parameters["profileId"] ?: return@post call.respond(HttpStatusCode.BadRequest)
-                val body = try { call.receive<Map<String, String>>() } catch (e: Exception) { emptyMap() }
-                val internalName = body["internalName"] ?: return@post call.respond(HttpStatusCode.BadRequest)
+                val rawText = try { call.receiveText() } catch (_: Throwable) { "" }
+                val internalName = try {
+                    serverJson.decodeFromString<ProfilePluginToggleRequest>(rawText).internalName
+                } catch (_: Throwable) {
+                    Regex("\"internalName\"\\s*:\\s*\"([^\"]+)\"").find(rawText)?.groupValues?.get(1) ?: ""
+                }
+                if (internalName.isBlank()) return@post call.respond(HttpStatusCode.BadRequest)
                 val nowEnabled = toggleProfilePlugin(profileId, internalName)
+                writeProfilesNow()
                 call.respondText(profileJson(profileId, nowEnabled), ContentType.Application.Json)
             }
 
             // Replace the whole disabled set for this profile (Select all / Clear all)
             post("/api/profile/{profileId}/set") {
                 val profileId = call.parameters["profileId"] ?: return@post call.respond(HttpStatusCode.BadRequest)
-                val body = try { call.receive<ProfileSetRequest>() } catch (e: Exception) {
+                val rawText = try { call.receiveText() } catch (_: Throwable) { "" }
+                val body = try {
+                    serverJson.decodeFromString<ProfileSetRequest>(rawText)
+                } catch (e: Exception) {
                     return@post call.respondText(
                         "{\"error\":\"expected a disabledExtensions string array\"}",
                         ContentType.Application.Json,
@@ -720,7 +1028,55 @@ object StremioServer {
                     profileId,
                     disabled = body.disabledExtensions.toSet(),
                     enabledOverrides = body.enabledExtensions.toSet(),
+                    disableCatalogs = body.disableCatalogs,
+                    disabledCatalogs = body.disabledCatalogs.toSet(),
+                    allowedResolutions = body.allowedResolutions.toSet(),
+                    excludeCam = body.excludeCam,
+                    maxStreamsPerResolution = body.maxStreamsPerResolution,
                 )
+                writeProfilesNow()
+                call.respondText(profileJson(profileId), ContentType.Application.Json)
+            }
+
+            // Save user quality filter preferences
+            post("/api/profile/{profileId}/quality") {
+                val profileId = call.parameters["profileId"] ?: return@post call.respond(HttpStatusCode.BadRequest)
+                val rawText = try { call.receiveText() } catch (_: Throwable) { "" }
+                val body = try {
+                    serverJson.decodeFromString<ProfileQualityPreferencesRequest>(rawText)
+                } catch (e: Exception) {
+                    return@post call.respondText(
+                        "{\"error\":\"invalid quality preferences body: ${e.message}\"}",
+                        ContentType.Application.Json,
+                        HttpStatusCode.BadRequest
+                    )
+                }
+                updateProfileQualityPreferences(
+                    profileId,
+                    allowedResolutions = body.allowedResolutions.toSet(),
+                    excludeCam = body.excludeCam,
+                    maxStreamsPerResolution = body.maxStreamsPerResolution,
+                )
+                writeProfilesNow()
+                call.respondText(profileJson(profileId), ContentType.Application.Json)
+            }
+
+            // Toggle per-plugin catalog on/off for this profile
+            post("/api/profile/{profileId}/toggle-catalog") {
+                val profileId = call.parameters["profileId"] ?: return@post call.respond(HttpStatusCode.BadRequest)
+                val rawText = try { call.receiveText() } catch (_: Throwable) { "" }
+                val internalName = try {
+                    serverJson.decodeFromString<ProfilePluginToggleRequest>(rawText).internalName
+                } catch (_: Throwable) {
+                    Regex("\"internalName\"\\s*:\\s*\"([^\"]+)\"").find(rawText)?.groupValues?.get(1) ?: ""
+                }
+                if (internalName.isBlank()) return@post call.respond(HttpStatusCode.BadRequest)
+                val now = currentTimeMillis()
+                val existing = profiles.getOrPut(profileId) { ProfileRecord(createdAt = now, lastSeen = now) }
+                val cur = existing.disabledCatalogs.toMutableSet()
+                if (cur.contains(internalName)) cur.remove(internalName) else cur.add(internalName)
+                profiles[profileId] = existing.copy(disabledCatalogs = cur, lastSeen = now)
+                writeProfilesNow()
                 call.respondText(profileJson(profileId), ContentType.Application.Json)
             }
 
@@ -741,7 +1097,13 @@ object StremioServer {
                     val knownRepo = knownRepos.find { it.url == rawRepoUrl }
                         ?: knownRepos.find { normalizeGhUrl(it.url) == normalizeGhUrl(rawRepoUrl) }
                     val repoUrl = (knownRepo?.url ?: rawRepoUrl).replace("\"", "\\\"")
-                    val repoName = knownRepo?.name?.replace("\"", "\\\"") ?: ""
+                    val rawName = knownRepo?.name?.takeIf { it.isNotBlank() }
+                        ?: run {
+                            val slug = rawRepoUrl.substringAfterLast("/").substringBefore(".json").ifBlank { "CNCVerse" }
+                            slug.replace(Regex("[-_]"), " ").replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+                        }
+                    val repoName = rawName.replace("\"", "\\\"")
+                    val lang = (plugin?.language?.takeIf { it.isNotBlank() } ?: "en").replace("\"", "\\\"")
                     val iconUrl = plugin?.iconUrl?.replace("\"", "\\\"") ?: ""
                     val enabled = !isGloballyDisabled(api)
                     // Prefer repo-declared tvTypes (from the plugin metadata JSON) over
@@ -753,7 +1115,8 @@ object StremioServer {
                     } else {
                         api.supportedTypes.distinct().joinToString(",") { "\"" + it + "\"" }
                     }
-                    sb.append("{\"internalName\":\"$id\",\"name\":\"$name\",\"enabled\":$enabled,\"repoUrl\":\"$repoUrl\",\"repoName\":\"$repoName\",\"iconUrl\":\"$iconUrl\",\"types\":[$typesJson]}")
+                    val desc = plugin?.description?.replace("\"", "\\\"")?.replace("\n", " ") ?: ""
+                    sb.append("{\"internalName\":\"$id\",\"name\":\"$name\",\"enabled\":$enabled,\"repoUrl\":\"$repoUrl\",\"repoName\":\"$repoName\",\"lang\":\"$lang\",\"iconUrl\":\"$iconUrl\",\"description\":\"$desc\",\"types\":[$typesJson]}")
                 }
                 sb.append("]")
                 call.respondText(sb.toString(), ContentType.Application.Json)
@@ -778,6 +1141,14 @@ object StremioServer {
                 }
                 sb.append("]")
                 call.respondText(sb.toString(), ContentType.Application.Json)
+            }
+
+            get("/api/credits") {
+                call.respondText(serverJson.encodeToString(getCreditsList()), ContentType.Application.Json)
+            }
+
+            get("/api/footer-credits") {
+                call.respondText(serverJson.encodeToString(getFooterCredits()), ContentType.Application.Json)
             }
 
             // User-initiated repo install is disabled — repos must be managed by the admin.
@@ -853,6 +1224,12 @@ object StremioServer {
 
     /** Serves a catalog request; applies the profile's disabled set when scoped. */
     private suspend fun ApplicationCall.respondCatalog(profileId: String?) {
+        val rec = profileId?.let { profiles[it] }
+        if (rec?.disableCatalogs == true || ServerState.disableCatalogsGlobally) {
+            respond(StremioCatalogResponse(emptyList()))
+            return
+        }
+
         val pathSegments = parameters.getAll("path") ?: emptyList()
         if (pathSegments.size < 2) {
             respond(HttpStatusCode.BadRequest)
@@ -913,8 +1290,17 @@ object StremioServer {
         val id   = parameters["id"]   ?: return respond(HttpStatusCode.BadRequest)
 
         val streams = withContext(pluginDispatcher) { buildStreams(type, id, profileId) }
+        val sorted = sortStreamsByQuality(streams)
+
+        // Filter streams according to user profile quality preferences (if requested with a profile)
+        val filtered = if (profileId != null) {
+            profiles[profileId]?.let { filterStreamsByProfile(sorted, it) } ?: sorted
+        } else {
+            sorted
+        }
+
         val formatted = com.cncverse.stremiobridge.format.StreamFormatter.apply(
-            sortStreamsByQuality(streams),
+            filtered,
             com.cncverse.stremiobridge.format.StreamFormatter.contextFromId(type, id),
         )
         respond(StremioStreamResponse(formatted))
@@ -937,7 +1323,7 @@ object StremioServer {
      * collisions when two repos ship an extension with the same name.
      */
     private fun profileMatchIds(api: MainApiWrapper): List<String> {
-        val ids = mutableListOf(api.internalName, api.pluginInternalName)
+        val ids = mutableListOf(api.internalName, api.pluginInternalName, api.name, nameSlug(api.name))
         unambiguousSlug(api)?.let { ids.add(it) }
         return ids.distinct()
     }
@@ -1198,12 +1584,18 @@ object StremioServer {
         val activeApis = loadedApis.filter { !isPluginBlocked(it, profileId) }
         val types = listOf("movie", "series", "other", "tv")
 
-        val catalogs = activeApis.flatMap { api ->
-            providerCatalogCache[api.internalName] ?: defaultCatalogDefsForApi(api)
-        }.distinctBy { it.id }
-            .ifEmpty {
-                listOf(StremioCatalogDef("movie", "cnc_all_movie", "CNCVerse (Movie)"))
-            }
+        val rec = profileId?.let { profiles[it] }
+
+        val catalogs = if (rec?.disableCatalogs == true || ServerState.disableCatalogsGlobally) {
+            emptyList()
+        } else {
+            activeApis.filter { api -> rec == null || !profileMatchIds(api).any { rec.disabledCatalogs.contains(it) } }.flatMap { api ->
+                providerCatalogCache[api.internalName] ?: defaultCatalogDefsForApi(api)
+            }.distinctBy { it.id }
+        }
+
+        val hasCatalogs = catalogs.isNotEmpty() && !(rec?.disableCatalogs ?: false) && !ServerState.disableCatalogsGlobally
+        val effectiveCatalogs = if (hasCatalogs) catalogs else emptyList()
 
         // Unique manifest id per profile so the personal addon can be
         // installed alongside the global one in Stremio without replacing it.
@@ -1211,16 +1603,26 @@ object StremioServer {
             ?.replace(Regex("[^a-zA-Z0-9]"), "")
             ?.take(24)
             ?.ifBlank { null }
+
+        // Dynamic version hash so Stremio client invalidates manifest cache on config changes
+        val configHash = (
+            (if (rec?.disableCatalogs == true || ServerState.disableCatalogsGlobally) 1 else 0) * 397 xor
+            (rec?.disabledCatalogs?.hashCode() ?: 0) * 31 xor
+            (rec?.disabled?.hashCode() ?: 0) * 17 xor
+            (rec?.enabledOverrides?.hashCode() ?: 0) xor
+            effectiveCatalogs.size
+        ).let { kotlin.math.abs(it) % 10000 }
+
         return StremioManifest(
             id          = if (profileSuffix == null) "com.cncverse.stremiobridge"
                           else "com.cncverse.stremiobridge." + profileSuffix,
-            version     = "1.0.0",
-            name        = if (profileId == null) "CNCVerse Bridge" else "CNCVerse Bridge · Profile",
-            description = "Cloudstream plugin bridge for Stremio — Developed by NivinCNC",
+            version     = "1.0.$configHash",
+            name        = if (profileId == null) "CNCVerse Bridge" else "CNCVerse Bridge \u00B7 Profile",
+            description = "Cloudstream plugin bridge for Stremio \u2014 Developed by NivinCNC",
             logo        = "https://raw.githubusercontent.com/NivinCNC/CNCVerse-Bridge/refs/heads/main/logo.png",
             types       = types,
-            resources   = listOf("catalog", "meta", "stream", "subtitles"),
-            catalogs    = catalogs,
+            resources   = if (hasCatalogs) listOf("catalog", "meta", "stream", "subtitles") else listOf("meta", "stream", "subtitles"),
+            catalogs    = effectiveCatalogs,
             behaviorHints = BehaviorHints(configurable = true),
         )
     }
@@ -1266,41 +1668,6 @@ object StremioServer {
         }
     }
 
-    private val TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
-    private suspend fun buildCatalog(
-        type: String, id: String, search: String?, skip: Int, genre: String?, profileId: String? = null
-    ): List<StremioMeta> {
-        val prefix = "cnc_"
-        if (!id.startsWith(prefix)) return emptyList()
-        val rest = id.removePrefix(prefix)
-        val nameSlugFromId = rest.removeSuffix("_$type")
-        val api = loadedApis.find { apiKey(it) == nameSlugFromId }
-            ?: loadedApis.find { nameSlug(it.name) == nameSlugFromId }
-            ?: loadedApis.find { it.internalName == nameSlugFromId }
-            ?: loadedApis.find { rest.startsWith(it.internalName + "_") }
-            ?: loadedApis.firstOrNull()
-            ?: return emptyList()
-
-        if (isPluginBlocked(api, profileId)) return emptyList()
-
-        val isHomePage = search.isNullOrBlank() && skip == 0
-        val cacheKey = "$type:$id:$genre"
-
-        if (isHomePage) {
-            val cached = homePageCatalogCache[cacheKey]
-            if (!cached.isNullOrEmpty()) {
-                return cached
-            }
-        }
-
-        val metas = fetchCatalogItemsDirect(type, id, search, skip, genre)
-        if (isHomePage && metas.isNotEmpty()) {
-            homePageCatalogCache[cacheKey] = metas
-        }
-        return metas
-    }
-
-
     /**
      * Stremio item id → display title for items we served in catalogs/meta.
      * Stream requests only carry the id, so this is how streams opened from our
@@ -1327,6 +1694,135 @@ object StremioServer {
             if (info.metadataTitle != null) st else st.copy(info = info.copy(metadataTitle = title))
         }
     }
+
+    private val TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
+    private val TMDB_HOSTS = listOf(
+        "https://api.tmdb.org/3",
+        "https://api.themoviedb.org/3"
+    )
+
+    private val genericMediaCache = ConcurrentHashMap<String, Pair<String, Int?>>()
+
+    private suspend fun fetchTmdbJson(endpointPathAndQuery: String): JsonObject? {
+        val cleanPath = endpointPathAndQuery.trimStart('/')
+        val delimiter = if (cleanPath.contains("?")) "&" else "?"
+        for (host in TMDB_HOSTS) {
+            val url = "$host/$cleanPath${delimiter}api_key=$TMDB_API_KEY"
+            try {
+                ServerState.info("Fetching TMDB: $url")
+                val responseText = withTimeoutOrNull(5_000) {
+                    httpClient.get(url).bodyAsText()
+                } ?: run {
+                    ServerState.warn("TMDB timeout on $host, trying fallback...")
+                    null
+                } ?: continue
+                return serverJson.parseToJsonElement(responseText).jsonObject
+            } catch (e: Throwable) {
+                ServerState.warn("TMDB error on $host: ${e.message?.take(80)}, trying fallback...")
+            }
+        }
+        return null
+    }
+
+    private suspend fun resolveGenericMedia(type: String, tmdbId: String): Pair<String, Int?>? {
+        val cacheKey = "$type:$tmdbId"
+        genericMediaCache[cacheKey]?.let { return it }
+
+        val isImdbId = tmdbId.startsWith("tt")
+        val mediaType = if (type == "series") "tv" else "movie"
+
+        // 1. If it's an IMDb ID, try Cinemeta first (extremely fast & resilient)
+        if (isImdbId) {
+            try {
+                val cinemetaType = if (type == "series") "series" else "movie"
+                val cinemetaUrl = "https://v3-cinemeta.strem.io/meta/$cinemetaType/$tmdbId.json"
+                val responseText = withTimeoutOrNull(4_000) {
+                    httpClient.get(cinemetaUrl).bodyAsText()
+                }
+                if (responseText != null) {
+                    val json = serverJson.parseToJsonElement(responseText).jsonObject
+                    val meta = json["meta"]?.jsonObject
+                    val title = meta?.get("name")?.jsonPrimitive?.content
+                    if (!title.isNullOrBlank()) {
+                        val yearStr = meta["year"]?.jsonPrimitive?.content
+                            ?: meta["releaseInfo"]?.jsonPrimitive?.content
+                        val year = yearStr?.take(4)?.toIntOrNull()
+                        val result = Pair(title, year)
+                        genericMediaCache[cacheKey] = result
+                        ServerState.info("Cinemeta resolved $tmdbId -> '$title' ($year)")
+                        return result
+                    }
+                }
+            } catch (e: Throwable) {
+                ServerState.warn("Cinemeta resolve error for $tmdbId: ${e.message?.take(80)}")
+            }
+        }
+
+        // 2. Query TMDB with multi-host fallback (api.tmdb.org -> api.themoviedb.org)
+        val endpoint = if (isImdbId) {
+            "find/$tmdbId?external_source=imdb_id"
+        } else {
+            "$mediaType/$tmdbId"
+        }
+
+        val jsonObject = fetchTmdbJson(endpoint) ?: return null
+
+        val mediaObj = if (isImdbId) {
+            val movieResults = jsonObject["movie_results"] as? kotlinx.serialization.json.JsonArray
+            val tvResults = jsonObject["tv_results"] as? kotlinx.serialization.json.JsonArray
+            (movieResults?.firstOrNull() ?: tvResults?.firstOrNull())?.jsonObject
+        } else {
+            jsonObject
+        } ?: return null
+
+        val title = mediaObj["title"]?.jsonPrimitive?.content
+            ?: mediaObj["name"]?.jsonPrimitive?.content
+            ?: return null
+
+        val year = mediaObj["release_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
+            ?: mediaObj["first_air_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
+
+        val result = Pair(title, year)
+        genericMediaCache[cacheKey] = result
+        ServerState.info("TMDB resolved $tmdbId -> '$title' ($year)")
+        return result
+    }
+    private suspend fun buildCatalog(
+        type: String, id: String, search: String?, skip: Int, genre: String?, profileId: String? = null
+    ): List<StremioMeta> {
+        val prefix = "cnc_"
+        if (!id.startsWith(prefix)) return emptyList()
+        val rest = id.removePrefix(prefix)
+        val nameSlugFromId = rest.removeSuffix("_$type")
+        val api = loadedApis.find { apiKey(it) == nameSlugFromId }
+            ?: loadedApis.find { nameSlug(it.name) == nameSlugFromId }
+            ?: loadedApis.find { it.internalName == nameSlugFromId }
+            ?: loadedApis.find { rest.startsWith(it.internalName + "_") }
+            ?: loadedApis.firstOrNull()
+            ?: return emptyList()
+
+        if (ServerState.disableCatalogsGlobally) return emptyList()
+        if (isPluginBlocked(api, profileId)) return emptyList()
+        val rec = profileId?.let { profiles[it] }
+        if (rec != null && (rec.disableCatalogs || profileMatchIds(api).any { rec.disabledCatalogs.contains(it) })) return emptyList()
+
+        val isHomePage = search.isNullOrBlank() && skip == 0
+        val cacheKey = "$type:$id:$genre"
+
+        if (isHomePage) {
+            val cached = homePageCatalogCache[cacheKey]
+            if (!cached.isNullOrEmpty()) {
+                return cached
+            }
+        }
+
+        val metas = fetchCatalogItemsDirect(type, id, search, skip, genre)
+        if (isHomePage && metas.isNotEmpty()) {
+            homePageCatalogCache[cacheKey] = metas
+        }
+        return metas
+    }
+
 
     // ── Meta builder ──────────────────────────────────────────────────────────
 
@@ -1372,6 +1868,74 @@ object StremioServer {
 
     private fun sortStreamsByQuality(streams: List<StremioStream>): List<StremioStream> =
         streams.sortedByDescending { streamQualityRank(it) }
+
+    /** Detects standard resolution tier: 2160p, 1080p, 720p, 480p, 360p, or other. */
+    fun detectStreamResolution(stream: StremioStream): String {
+        val q = stream.info?.quality
+        if (q != null && q > 0) {
+            return when {
+                q >= 2160 -> "2160p"
+                q >= 1080 -> "1080p"
+                q >= 720  -> "720p"
+                q >= 480  -> "480p"
+                q >= 360  -> "360p"
+                else      -> "${q}p"
+            }
+        }
+        val text = "${stream.name.orEmpty()} ${stream.title.orEmpty()}".uppercase()
+        val resMatch = Regex("(2160|1440|1080|720|480|360)P").find(text)
+        if (resMatch != null) {
+            val v = resMatch.groupValues[1]
+            return if (v == "1440") "1080p" else "${v}p"
+        }
+        return when {
+            Regex("\\b(4K|UHD)\\b").containsMatchIn(text) -> "2160p"
+            Regex("\\b(FHD)\\b").containsMatchIn(text)    -> "1080p"
+            Regex("\\b(HD)\\b").containsMatchIn(text)     -> "720p"
+            Regex("\\b(SD)\\b").containsMatchIn(text)     -> "480p"
+            else                                          -> "other"
+        }
+    }
+
+    /** Returns true if the stream name/title indicates a CAM / TeleSync / Screener recording. */
+    fun isCamStream(stream: StremioStream): Boolean {
+        val text = "${stream.name.orEmpty()} ${stream.title.orEmpty()}".uppercase()
+        return Regex("\\b(CAM|CAMRIP|TELESYNC|TS|HDCAM|HDTS|SCR|SCREENER|DVDSCREENER)\\b").containsMatchIn(text)
+    }
+
+    /** Filters a list of streams against a user's profile quality preferences. */
+    fun filterStreamsByProfile(streams: List<StremioStream>, profile: ProfileRecord): List<StremioStream> {
+        var result = streams
+
+        // 1. Exclude CAM / Screener rips
+        if (profile.excludeCam) {
+            result = result.filter { !isCamStream(it) }
+        }
+
+        // 2. Filter allowed resolutions if user chose specific ones
+        if (profile.allowedResolutions.isNotEmpty()) {
+            val allowed = profile.allowedResolutions.map { it.lowercase().trim() }.toSet()
+            result = result.filter { stream ->
+                val res = detectStreamResolution(stream).lowercase()
+                allowed.contains(res) || (res == "other" && allowed.contains("other"))
+            }
+        }
+
+        // 3. Limit streams per resolution tier if configured
+        if (profile.maxStreamsPerResolution > 0) {
+            val groups = LinkedHashMap<String, MutableList<StremioStream>>()
+            for (st in result) {
+                val res = detectStreamResolution(st)
+                val list = groups.getOrPut(res) { mutableListOf() }
+                if (list.size < profile.maxStreamsPerResolution) {
+                    list.add(st)
+                }
+            }
+            result = groups.values.flatten()
+        }
+
+        return result
+    }
         
     // ── Main stream builder ───────────────────────────────────────────────────
 
@@ -1383,7 +1947,7 @@ object StremioServer {
      * gets a response well within its 60-second addon timeout.
      */
     private val STREAM_DEADLINE_MS = 45_000L
-    private val PROVIDER_TIMEOUT_MS = 25_000L
+    private val PROVIDER_TIMEOUT_MS = 38_000L
     private val streamSearchScope = CoroutineScope(pluginDispatcher + SupervisorJob())
 
     /**
@@ -1450,34 +2014,44 @@ object StremioServer {
             }.filter { !isPluginBlocked(it, profileId) }
 
             if (matchingApis.isEmpty()) return emptyList()
-            ServerState.info("Parallel stream load: ${matchingApis.size} API(s) for key '$pluginKey'")
 
-            val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
-            val jobs = matchingApis.map { api ->
-                streamSearchScope.launch {
-                    withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
-                        try {
-                            ServerState.info("[${api.name}] Loading links for $dataUrl")
-                            val links = api.loadLinks(dataUrl)
-                            ServerState.info("[${api.name}] Got ${links.size} stream(s)")
-                            accumulated.addAll(withMetadataTitle(links, titleForId(id)))
-                        } catch (e: Throwable) {
-                            ServerState.warn("[${api.name}] Stream error: ${e.message}")
+            val directCacheKey = "stream:direct:$pluginKey:$dataUrl"
+            return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetch(directCacheKey, pluginKey) {
+                ServerState.info("Parallel stream load: ${matchingApis.size} API(s) for key '$pluginKey'")
+
+                val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
+                val jobs = matchingApis.map { api ->
+                    streamSearchScope.launch {
+                        withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
+                            try {
+                                ServerState.info("[${api.name}] Loading links for $dataUrl")
+                                val links = api.loadLinks(dataUrl)
+                                StreamTracker.record(api.pluginInternalName, api.internalName, api.name, links.size, null)
+                                if (links.isNotEmpty()) {
+                                    ServerState.info("[STREAM_SUCCESS] [${api.name}] Resolved ${links.size} streamable link(s)")
+                                } else {
+                                    ServerState.warn("[STREAM_EMPTY] [${api.name}] 0 streamable links returned")
+                                }
+                                accumulated.addAll(withMetadataTitle(links, titleForId(id)))
+                            } catch (e: Throwable) {
+                                StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, e.message)
+                                ServerState.error("[STREAM_ERROR] [${api.name}] Stream error: ${e.message}")
+                            }
                         }
                     }
                 }
-            }
 
-            val deadline = System.currentTimeMillis() + STREAM_DEADLINE_MS
-            while (System.currentTimeMillis() < deadline && jobs.any { it.isActive }) {
-                delay(200)
+                val deadline = System.currentTimeMillis() + STREAM_DEADLINE_MS
+                while (System.currentTimeMillis() < deadline && jobs.any { it.isActive }) {
+                    delay(200)
+                }
+                val remaining = jobs.count { it.isActive }
+                if (remaining > 0) {
+                    ServerState.warn("Deadline reached ($STREAM_DEADLINE_MS ms) — returning ${accumulated.size} stream(s), cancelling $remaining slow provider(s)")
+                    jobs.forEach { it.cancel() }
+                }
+                sortStreamsByQuality(accumulated)
             }
-            val remaining = jobs.count { it.isActive }
-            if (remaining > 0) {
-                ServerState.warn("Deadline reached ($STREAM_DEADLINE_MS ms) — returning ${accumulated.size} stream(s), cancelling $remaining slow provider(s)")
-                jobs.forEach { it.cancel() }
-            }
-            return sortStreamsByQuality(accumulated)
         }
 
         // Handle generic Stremio requests with TMDB/IMDB IDs
@@ -1489,83 +2063,88 @@ object StremioServer {
 
         ServerState.info("Generic request: id=$id, type=$type, baseId=$baseId, tmdbId=$tmdbId")
 
-        return try {
-            val isImdbId = tmdbId.startsWith("tt")
-            val tmdbUrl = if (isImdbId) {
-                "https://api.themoviedb.org/3/find/$tmdbId?api_key=$TMDB_API_KEY&external_source=imdb_id"
-            } else {
-                "https://api.themoviedb.org/3/$mediaType/$tmdbId?api_key=$TMDB_API_KEY"
-            }
+        val profileSig = profileId?.let { pid ->
+            profiles[pid]?.disabled?.sorted()?.joinToString(",") ?: "p_$pid"
+        } ?: "global"
+        val aggCacheKey = "stream:generic:$type:$id:$profileSig"
 
-            ServerState.info("Fetching TMDB: $tmdbUrl")
-            val responseText = httpClient.get(tmdbUrl).bodyAsText()
-            val jsonObject = serverJson.parseToJsonElement(responseText).jsonObject
+        return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetch(aggCacheKey, null) {
+            try {
+                val resolved = resolveGenericMedia(type, tmdbId)
+                if (resolved == null) {
+                    ServerState.warn("Media resolve failed: no title/year found for $id")
+                    return@getOrFetch emptyList()
+                }
+                val (title, year) = resolved
+                ServerState.info("Media resolve success: title='$title', year=$year")
 
-            val mediaObj = if (isImdbId) {
-                val movieResults = jsonObject["movie_results"] as? kotlinx.serialization.json.JsonArray
-                val tvResults = jsonObject["tv_results"] as? kotlinx.serialization.json.JsonArray
-                (movieResults?.firstOrNull() ?: tvResults?.firstOrNull())?.jsonObject
-            } else {
-                jsonObject
-            }
+                // Exclude live-TV-only extensions from generic TMDB VOD searches —
+                // they don't carry on-demand movie/series content.
+                val activePlugins = loadedApis.filter { api ->
+                    !isPluginBlocked(api, profileId) &&
+                    api.supportedTypes.any { it != "tv" }
+                }
+                ServerState.info("Searching across ${activePlugins.size} plugin(s) (live-TV-only excluded)...")
 
-            if (mediaObj == null) {
-                ServerState.warn("TMDB resolve failed: no media found for $tmdbId")
-                return emptyList()
-            }
-
-            val title = mediaObj["title"]?.jsonPrimitive?.content
-                ?: mediaObj["name"]?.jsonPrimitive?.content
-
-            if (title == null) {
-                ServerState.warn("TMDB resolve failed: no title found")
-                return emptyList()
-            }
-
-            val year = mediaObj["release_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
-                ?: mediaObj["first_air_date"]?.jsonPrimitive?.content?.substringBefore("-")?.toIntOrNull()
-
-            ServerState.info("TMDB resolve success: title='$title', year=$year")
-
-            // Exclude live-TV-only extensions from generic TMDB VOD searches —
-            // they don't carry on-demand movie/series content.
-            val activePlugins = loadedApis.filter { api ->
-                !isPluginBlocked(api, profileId) &&
-                api.supportedTypes.any { it != "tv" }
-            }
-            ServerState.info("Searching across ${activePlugins.size} plugin(s) (live-TV-only excluded)...")
-
-            val sem = Semaphore(20)
-            val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
-            val jobs = activePlugins.map { api ->
-                streamSearchScope.launch {
-                    sem.withPermit {
-                        withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
-                            try {
-                                val streams = buildGenericStreamsForApi(api, type, id, title, year)
-                                accumulated.addAll(streams)
-                            } catch (e: Throwable) {
-                                ServerState.warn("[${api.name}] Generic stream error: ${e.message}")
+                val sem = Semaphore(20)
+                val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
+                val jobs = activePlugins.map { api ->
+                    streamSearchScope.launch {
+                        sem.withPermit {
+                            val res = withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
+                                try {
+                                    val streams = buildGenericStreamsForApi(api, type, id, title, year)
+                                    accumulated.addAll(streams)
+                                } catch (e: Throwable) {
+                                    ServerState.warn("[${api.name}] Generic stream error: ${e.message}")
+                                    StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, e.message ?: "Stream error")
+                                }
+                            }
+                            if (res == null) {
+                                ServerState.warn("[STREAM_TIMEOUT] [${api.name}] Provider timed out after ${PROVIDER_TIMEOUT_MS}ms")
+                                StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Timed out after ${PROVIDER_TIMEOUT_MS}ms")
                             }
                         }
                     }
                 }
-            }
 
-            val deadline = System.currentTimeMillis() + STREAM_DEADLINE_MS
-            while (System.currentTimeMillis() < deadline && jobs.any { it.isActive }) {
-                delay(200)
+                val deadline = System.currentTimeMillis() + STREAM_DEADLINE_MS
+                while (System.currentTimeMillis() < deadline && jobs.any { it.isActive }) {
+                    delay(200)
+                }
+                val remaining = jobs.count { it.isActive }
+                if (remaining > 0) {
+                    ServerState.warn("Deadline reached ($STREAM_DEADLINE_MS ms) — returning ${accumulated.size} stream(s), cancelling $remaining slow provider(s)")
+                    jobs.forEach { it.cancel() }
+                }
+                ServerState.info("Returning total ${accumulated.size} streams")
+                sortStreamsByQuality(accumulated)
+            } catch (e: Exception) {
+                ServerState.warn("Generic stream resolve error for $id: ${e.stackTraceToString()}")
+                emptyList()
             }
-            val remaining = jobs.count { it.isActive }
-            if (remaining > 0) {
-                ServerState.warn("Deadline reached ($STREAM_DEADLINE_MS ms) — returning ${accumulated.size} stream(s), cancelling $remaining slow provider(s)")
-                jobs.forEach { it.cancel() }
-            }
-            ServerState.info("Returning total ${accumulated.size} streams")
-            sortStreamsByQuality(accumulated)
-        } catch (e: Exception) {
-            ServerState.warn("TMDB resolve error for $id: ${e.stackTraceToString()}")
-            emptyList()
+        }
+    }
+
+    // ── Generic per-provider stream fetch (shared by buildStreams + buildStreamsForApi) ─
+
+    /**
+     * Resolves streams from a single [api] for a generic title/year.
+     * Reuses already-resolved title & year to avoid redundant TMDB requests.
+     */
+    internal suspend fun buildGenericStreamsForApi(
+        api: MainApiWrapper,
+        type: String,
+        id: String,
+        title: String,
+        year: Int?
+    ): List<StremioStream> {
+        if (id.startsWith("probe_")) {
+            return doBuildGenericStreamsForApi(api, type, id, title, year)
+        }
+        val providerCacheKey = "stream:provider:${api.internalName}:$type:$id"
+        return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetch(providerCacheKey, api.internalName) {
+            doBuildGenericStreamsForApi(api, type, id, title, year)
         }
     }
 
@@ -1609,13 +2188,7 @@ object StremioServer {
             ?: partial.firstOrNull { it.year == null }
     }
 
-    // ── Generic per-provider stream fetch (shared by buildStreams + buildStreamsForApi) ─
-
-    /**
-     * Resolves streams from a single [api] for a generic title/year.
-     * Reuses already-resolved title & year to avoid 95 redundant TMDB requests.
-     */
-    private suspend fun buildGenericStreamsForApi(
+    private suspend fun doBuildGenericStreamsForApi(
         api: MainApiWrapper,
         type: String,
         id: String,
@@ -1624,29 +2197,55 @@ object StremioServer {
     ): List<StremioStream> {
         ServerState.info("[${api.name}] Searching for '$title'")
         val cacheKey = api.internalName
-        val searchResults = SearchLoadCache.getSearch(cacheKey, title)
-            ?: api.search(title).also { SearchLoadCache.putSearch(cacheKey, title, it) }
+        val searchResults = try {
+            SearchLoadCache.getSearch(cacheKey, title)
+                ?: api.search(title).also { SearchLoadCache.putSearch(cacheKey, title, it) }
+        } catch (e: Throwable) {
+            ServerState.warn("[STREAM_ERROR] [${api.name}] Search failed: ${e.message}")
+            StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Search error: ${e.message}")
+            return emptyList()
+        }
         ServerState.info("[${api.name}] Found ${searchResults.size} results")
 
-        val bestMatch = pickBestMatch(searchResults, title, year) ?: run {
+        val requestedSeason = if (type == "series" && id.contains(":")) {
+            id.split(":").getOrNull(1)?.toIntOrNull()
+        } else null
+
+        val bestMatch = if (requestedSeason != null) {
+            val seasonVariants = listOf("season $requestedSeason", "season 0$requestedSeason", "s0$requestedSeason", "s$requestedSeason")
+            searchResults.find { r ->
+                val norm = normalizeTitle(r.name)
+                val wanted = normalizeTitle(title)
+                (norm == wanted || " $norm ".contains(" $wanted ")) && seasonVariants.any { norm.contains(it) }
+            } ?: pickBestMatch(searchResults, title, year)
+        } else {
+            pickBestMatch(searchResults, title, year)
+        } ?: run {
             ServerState.info("[${api.name}] No result matches '$title'" + (year?.let { " ($it)" } ?: ""))
+            StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "No result matches '$title'")
             return emptyList()
         }
 
         ServerState.info("[${api.name}] Best match: '${bestMatch.name}' (url: ${bestMatch.url})")
-        // load() is the most expensive call — cache it per plugin+url.
-        // getLoad() returns a CachedLoad wrapper (non-null = hit); .info may still be null.
         val cachedLoad = SearchLoadCache.getLoad(cacheKey, bestMatch.url)
-        val mediaInfo = if (cachedLoad != null) {
-            cachedLoad.info   // respect cached null: plugin had no result
-        } else {
-            val fresh = api.load(bestMatch.url)
-            SearchLoadCache.putLoad(cacheKey, bestMatch.url, fresh)
-            fresh
+        val mediaInfo = try {
+            if (cachedLoad != null) {
+                cachedLoad.info
+            } else {
+                val fresh = api.load(bestMatch.url)
+                SearchLoadCache.putLoad(cacheKey, bestMatch.url, fresh)
+                fresh
+            }
+        } catch (e: Throwable) {
+            ServerState.warn("[STREAM_ERROR] [${api.name}] MediaInfo load failed: ${e.message}")
+            StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Load error: ${e.message}")
+            return emptyList()
         } ?: run {
-            ServerState.warn("[${api.name}] MediaInfo load failed for ${bestMatch.url}")
+            ServerState.warn("[STREAM_EMPTY] [${api.name}] MediaInfo load returned null for ${bestMatch.url}")
+            StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "MediaInfo null for match")
             return emptyList()
         }
+
         var dataUrlToLoad = mediaInfo.dataUrl
         if (type == "series" && id.contains(":")) {
             val parts   = id.split(":")
@@ -1658,20 +2257,66 @@ object StremioServer {
                     dataUrlToLoad = ep.dataUrl
                     ServerState.info("[${api.name}] Found episode S${season}E${episode}")
                 } else {
-                    ServerState.warn("[${api.name}] Episode S${season}E${episode} not found")
+                    ServerState.warn("[STREAM_EMPTY] [${api.name}] Episode S${season}E${episode} not found")
+                    StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Episode S${season}E${episode} not found")
                     return emptyList()
                 }
             }
         }
         ServerState.info("[${api.name}] Loading links for $dataUrlToLoad")
-        val links = api.loadLinks(dataUrlToLoad)
-        ServerState.info("[${api.name}] Found ${links.size} streams")
-        return links.map { stream ->
-            val newName = bestMatch.name + (if (!stream.name.isNullOrBlank()) "\n${stream.name}" else "")
-            val info = (stream.info ?: com.cncverse.stremiobridge.model.StreamInfo(addonName = api.name))
-                .copy(metadataTitle = title, metadataYear = year)
-            stream.copy(name = newName, info = info)
+        try {
+            val links = api.loadLinks(dataUrlToLoad)
+            StreamTracker.record(api.pluginInternalName, api.internalName, api.name, links.size, null)
+            if (links.isNotEmpty()) {
+                ServerState.info("[STREAM_SUCCESS] [${api.name}] Resolved ${links.size} streamable link(s) for '$title'")
+            } else {
+                ServerState.warn("[STREAM_EMPTY] [${api.name}] 0 streamable links returned for '$title'")
+            }
+            return links.map { stream ->
+                val newName = bestMatch.name + (if (!stream.name.isNullOrBlank()) "\n${stream.name}" else "")
+                val info = (stream.info ?: com.cncverse.stremiobridge.model.StreamInfo(addonName = api.name))
+                    .copy(metadataTitle = title, metadataYear = year)
+                stream.copy(name = newName, info = info)
+            }
+        } catch (e: Throwable) {
+            StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, e.message)
+            ServerState.error("[STREAM_ERROR] [${api.name}] Stream error for '$title': ${e.message}")
+            return emptyList()
         }
+    }
+
+    /** Probes a single API wrapper with a search & loadLinks test, returning stream count. */
+    suspend fun probeApi(api: MainApiWrapper, query: String = "Avatar"): Int {
+        return try {
+            val streams = buildGenericStreamsForApi(api, "movie", "probe_test", query, null)
+            streams.size
+        } catch (e: Throwable) {
+            StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, e.message)
+            0
+        }
+    }
+
+    /** Probes all active APIs in parallel (up to 5 concurrent) and updates StreamTracker. */
+    suspend fun probeAllApis(query: String = "Avatar"): Map<String, Int> {
+        val active = loadedApis.filter { api -> api.supportedTypes.any { it != "tv" } }
+        val results = java.util.concurrent.ConcurrentHashMap<String, Int>()
+        val sem = Semaphore(5)
+        coroutineScope {
+            active.map { api ->
+                launch {
+                    sem.withPermit {
+                        withTimeoutOrNull(20_000) {
+                            val count = probeApi(api, query)
+                            results[api.internalName] = count
+                        } ?: run {
+                            StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Probe timed out (20s)")
+                            results[api.internalName] = 0
+                        }
+                    }
+                }
+            }.joinAll()
+        }
+        return results
     }
 
 
@@ -1688,8 +2333,9 @@ object StremioServer {
      * dollar characters so it can live inside a Kotlin raw string unescaped.
      */
     private fun buildIndexHtml(): String {
-        return """<!DOCTYPE html>
-<html lang="en">
+        return """
+<!DOCTYPE html>
+<html lang="en" data-base-theme="${ServerState.globalBaseTheme}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
@@ -1701,32 +2347,128 @@ object StremioServer {
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
-:root {
-  --bg: #090b10;
-  --surface: #111520;
-  --surface-active: #171d2d;
-  --surface-card: #131826;
-  --surface-card-hover: #181f30;
-  --border: #1e2638;
-  --border-focus: #33415e;
-  --border-active: #6366f1;
-  --text: #f1f3f7;
-  --text-sub: #94a3b8;
-  --text-dim: #64748b;
-  --accent: #6366f1;
-  --accent-hover: #4f46e5;
-  --accent-glow: rgba(99, 102, 241, 0.18);
-  --code-bg: #151a28;
+:root, [data-base-theme="slate"] {
+  --bg: #0f172a;
+  --surface: #1e293b;
+  --surface-active: #334155;
+  --surface-card: #1e293b;
+  --surface-card-hover: #243248;
+  --border: #334155;
+  --border-focus: #475569;
+  --border-active: ${ServerState.globalAccentHex};
+  --text: #ffffff;
+  --text-sub: #cbd5e1;
+  --text-dim: #94a3b8;
+  --accent: ${ServerState.globalAccentHex};
+  --accent-hover: ${ServerState.globalAccentHover};
+  --accent-glow: ${ServerState.globalAccentGlow};
+  --code-bg: #1e293b;
   --green: #10b981;
-  --green-bg: rgba(16, 185, 129, 0.12);
-  --cyan: #38bdf8;
-  --cyan-bg: rgba(56, 189, 248, 0.1);
+  --green-bg: rgba(16, 185, 129, 0.14);
+  --cyan: #06b6d4;
+  --cyan-bg: rgba(6, 182, 212, 0.14);
   --amber: #f59e0b;
-  --amber-bg: rgba(245, 158, 11, 0.12);
-  --red: #f87171;
-  --red-bg: rgba(248, 113, 113, 0.12);
+  --amber-bg: rgba(245, 158, 11, 0.14);
+  --red: #f43f5e;
+  --card-radius: 14px;
 }
-[data-theme="light"] {
+[data-base-theme="charcoal"] {
+  --bg: #18181b;
+  --surface: #27272a;
+  --surface-active: #3f3f46;
+  --surface-card: #27272a;
+  --surface-card-hover: #323236;
+  --border: #3f3f46;
+  --border-focus: #52525b;
+  --border-active: ${ServerState.globalAccentHex};
+  --text: #ffffff;
+  --text-sub: #d4d4d8;
+  --text-dim: #a1a1aa;
+  --accent: ${ServerState.globalAccentHex};
+  --accent-hover: ${ServerState.globalAccentHover};
+  --accent-glow: ${ServerState.globalAccentGlow};
+  --code-bg: #27272a;
+  --green: #10b981;
+  --green-bg: rgba(16, 185, 129, 0.14);
+  --cyan: #06b6d4;
+  --cyan-bg: rgba(6, 182, 212, 0.14);
+  --amber: #f59e0b;
+  --amber-bg: rgba(245, 158, 11, 0.14);
+  --red: #f43f5e;
+}
+[data-base-theme="navy"] {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --surface-active: #21262d;
+  --surface-card: #161b22;
+  --surface-card-hover: #1c2128;
+  --border: #30363d;
+  --border-focus: #484f58;
+  --border-active: ${ServerState.globalAccentHex};
+  --text: #ffffff;
+  --text-sub: #cbd5e1;
+  --text-dim: #94a3b8;
+  --accent: ${ServerState.globalAccentHex};
+  --accent-hover: ${ServerState.globalAccentHover};
+  --accent-glow: ${ServerState.globalAccentGlow};
+  --code-bg: #161b22;
+  --green: #10b981;
+  --green-bg: rgba(16, 185, 129, 0.14);
+  --cyan: #06b6d4;
+  --cyan-bg: rgba(6, 182, 212, 0.14);
+  --amber: #f59e0b;
+  --amber-bg: rgba(245, 158, 11, 0.14);
+  --red: #f43f5e;
+}
+[data-base-theme="forest"] {
+  --bg: #0c1512;
+  --surface: #13221d;
+  --surface-active: #1a2f28;
+  --surface-card: #13221d;
+  --surface-card-hover: #172a24;
+  --border: #223c33;
+  --border-focus: #2f5246;
+  --border-active: ${ServerState.globalAccentHex};
+  --text: #ffffff;
+  --text-sub: #c7eedd;
+  --text-dim: #8ecbb0;
+  --accent: ${ServerState.globalAccentHex};
+  --accent-hover: ${ServerState.globalAccentHover};
+  --accent-glow: ${ServerState.globalAccentGlow};
+  --code-bg: #13221d;
+  --green: #10b981;
+  --green-bg: rgba(16, 185, 129, 0.14);
+  --cyan: #06b6d4;
+  --cyan-bg: rgba(6, 182, 212, 0.14);
+  --amber: #f59e0b;
+  --amber-bg: rgba(245, 158, 11, 0.14);
+  --red: #f43f5e;
+}
+[data-base-theme="oled"] {
+  --bg: #000000;
+  --surface: #0a0a0a;
+  --surface-active: #141414;
+  --surface-card: #0f0f0f;
+  --surface-card-hover: #161616;
+  --border: #242424;
+  --border-focus: #383838;
+  --border-active: ${ServerState.globalAccentHex};
+  --text: #ffffff;
+  --text-sub: #e5e5e5;
+  --text-dim: #a3a3a3;
+  --accent: ${ServerState.globalAccentHex};
+  --accent-hover: ${ServerState.globalAccentHover};
+  --accent-glow: ${ServerState.globalAccentGlow};
+  --code-bg: #0f0f0f;
+  --green: #10b981;
+  --green-bg: rgba(16, 185, 129, 0.14);
+  --cyan: #06b6d4;
+  --cyan-bg: rgba(6, 182, 212, 0.14);
+  --amber: #f59e0b;
+  --amber-bg: rgba(245, 158, 11, 0.14);
+  --red: #f43f5e;
+}
+[data-base-theme="light"], [data-theme="light"] {
   --bg: #f8fafc;
   --surface: #ffffff;
   --surface-active: #f1f5f9;
@@ -1734,22 +2476,21 @@ object StremioServer {
   --surface-card-hover: #f8fafc;
   --border: #e2e8f0;
   --border-focus: #cbd5e1;
-  --border-active: #4f46e5;
+  --border-active: ${ServerState.globalAccentHex};
   --text: #0f172a;
-  --text-sub: #475569;
-  --text-dim: #94a3b8;
-  --accent: #4f46e5;
-  --accent-hover: #4338ca;
-  --accent-glow: rgba(79, 70, 229, 0.12);
-  --code-bg: #f1f5f9;
+  --text-sub: #334155;
+  --text-dim: #64748b;
+  --accent: ${ServerState.globalAccentHex};
+  --accent-hover: ${ServerState.globalAccentHover};
+  --accent-glow: ${ServerState.globalAccentGlow};
+  --code-bg: #f8fafc;
   --green: #059669;
   --green-bg: rgba(5, 150, 105, 0.08);
   --cyan: #0284c7;
   --cyan-bg: rgba(2, 132, 199, 0.08);
   --amber: #d97706;
   --amber-bg: rgba(217, 119, 6, 0.08);
-  --red: #dc2626;
-  --red-bg: rgba(220, 38, 38, 0.08);
+  --red: #f43f5e;
 }
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body { overflow-x: hidden; max-width: 100vw; }
@@ -1757,7 +2498,7 @@ body {
   background: var(--bg);
   color: var(--text);
   font: 14px/1.5 'Inter', system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  padding: 1.5rem 1.25rem 4rem;
+  padding: 1.25rem 1rem 4rem;
   min-height: 100vh;
   -webkit-font-smoothing: antialiased;
 }
@@ -1765,879 +2506,743 @@ body {
   body { padding: 12px 10px 4rem; }
 }
 .container {
-  max-width: 68rem;
+  max-width: 42rem;
   width: 100%;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
-  gap: 1rem;
+  gap: 0.9rem;
   min-width: 0;
 }
-
-
 
 /* Header */
 .hdr {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding-bottom: 0.1rem;
+  padding: 0.2rem 0;
 }
 .brand-wrap {
   display: flex;
   align-items: center;
-  gap: 12px;
-  min-width: 0;
+  gap: 10px;
 }
-.brand-logo-container {
-  width: 42px;
-  height: 42px;
-  border-radius: 12px;
-  background: rgba(99, 102, 241, 0.12);
-  border: 1px solid rgba(99, 102, 241, 0.25);
+.logo-box {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: var(--accent-glow);
+  border: 1px solid rgba(139, 92, 246, 0.3);
   display: flex;
   align-items: center;
   justify-content: center;
-  flex-shrink: 0;
-  box-shadow: 0 4px 14px rgba(99, 102, 241, 0.15);
-  overflow: hidden;
-  transition: transform 0.2s ease, box-shadow 0.2s ease;
+  flex: 0 0 32px;
 }
-.brand-logo-container:hover {
-  transform: scale(1.05);
-  box-shadow: 0 6px 20px rgba(99, 102, 241, 0.25);
+.btn-icon-hdr {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text);
+  width: 38px;
+  height: 38px;
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  text-decoration: none;
 }
-.brand-logo {
-  width: 30px;
-  height: 30px;
-  object-fit: contain;
-  display: block;
+.btn-icon-hdr:hover {
+  background: var(--surface-active);
+  border-color: var(--border-focus);
+  color: var(--accent);
 }
 .brand-title {
-  font-size: 1.55rem;
+  font-size: 1.35rem;
   font-weight: 800;
   color: var(--text);
-  letter-spacing: -0.5px;
-  margin: 0;
-  line-height: 1.2;
+  letter-spacing: -0.4px;
 }
 .hdr-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
-  flex-shrink: 0;
-}
-.btn-hdr {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  color: var(--text-sub);
-  padding: 7px 11px;
-  border-radius: 8px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  transition: all 0.15s ease;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  text-decoration: none;
-}
-.btn-hdr:hover { color: var(--text); border-color: var(--border-focus); background: var(--surface-active); }
-.hdr-badge {
-  font-size: 10px;
-  font-weight: 700;
-  background: var(--accent-glow);
-  color: var(--accent);
-  padding: 1px 6px;
-  border-radius: 999px;
-}
-@media (max-width: 680px) {
-  .brand-wrap {
-    gap: 8px;
-  }
-  .brand-logo-container {
-    width: 32px;
-    height: 32px;
-    border-radius: 8px;
-  }
-  .brand-logo {
-    width: 22px;
-    height: 22px;
-  }
-  .brand-title {
-    font-size: 1.18rem;
-    white-space: nowrap;
-    margin: 0;
-  }
-  .hdr-actions {
-    gap: 6px;
-  }
-  .btn-hdr {
-    padding: 6px 9px;
-    border-radius: 7px;
-  }
-  .btn-hdr-text {
-    display: none;
-  }
-  .hdr-badge {
-    padding: 1px 5px;
-    font-size: 9px;
-  }
-}
-
-/* Community Donation Goal Bar */
-.goal-card {
-  background: var(--surface-card);
-  border: 1.5px solid var(--border);
-  border-radius: 12px;
-  padding: 11px 16px;
-  display: flex;
-  align-items: center;
-  gap: 16px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
-  width: 100%;
-  box-sizing: border-box;
-  transition: border-color 0.2s ease, box-shadow 0.2s ease;
-}
-.goal-card:hover {
-  border-color: var(--border-focus);
-}
-.goal-donate-btn {
-  background: linear-gradient(135deg, #f43f5e 0%, #a855f7 100%);
-  color: #ffffff !important;
-  font-size: 12.5px;
-  font-weight: 700;
-  padding: 8px 15px;
-  border-radius: 8px;
-  text-decoration: none;
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  flex-shrink: 0;
-  box-shadow: 0 2px 8px rgba(244, 63, 94, 0.28);
-  transition: all 0.18s cubic-bezier(0.16, 1, 0.3, 1);
-  cursor: pointer;
-  line-height: 1;
-}
-.goal-donate-btn:hover {
-  filter: brightness(1.1);
-  transform: translateY(-1px);
-  box-shadow: 0 4px 14px rgba(244, 63, 94, 0.42);
-}
-.goal-donate-btn:active {
-  transform: translateY(0);
-}
-.goal-body {
-  flex: 1;
-  min-width: 0;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-.goal-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-.goal-text {
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-.goal-text b {
-  color: var(--text);
-  font-weight: 700;
-}
-.goal-pct {
-  font-size: 13px;
-  font-weight: 700;
-  color: #f43f5e;
-  flex-shrink: 0;
-  letter-spacing: 0.2px;
-}
-.goal-track {
-  width: 100%;
-  height: 8px;
-  background: rgba(255, 255, 255, 0.08);
-  border-radius: 999px;
-  overflow: hidden;
-}
-[data-theme="light"] .goal-track {
-  background: rgba(0, 0, 0, 0.08);
-}
-.goal-fill {
-  height: 100%;
-  width: 0%;
-  border-radius: 999px;
-  background: linear-gradient(90deg, #f43f5e 0%, #ec4899 35%, #a855f7 70%, #6366f1 100%);
-  transition: width 0.8s cubic-bezier(0.16, 1, 0.3, 1);
-}
-@media (max-width: 520px) {
-  .goal-card {
-    padding: 10px 12px;
-    gap: 10px;
-  }
-  .goal-donate-btn {
-    padding: 6px 11px;
-    font-size: 11.5px;
-    gap: 5px;
-  }
-  .goal-text {
-    font-size: 11.5px;
-  }
-  .goal-pct {
-    font-size: 11.5px;
-  }
-  .goal-track {
-    height: 7px;
-  }
-}
-
-/* Mode Selector (2 Clean Cards) */
-.nav-cards {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-  width: 100%;
-  box-sizing: border-box;
-}
-.nav-card {
-  background: var(--surface-card);
-  border: 1.5px solid var(--border);
-  border-radius: 12px;
-  padding: 12px 14px;
-  text-align: left;
-  cursor: pointer;
-  transition: all 0.18s ease;
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
-  min-width: 0;
-  overflow: hidden;
-  box-sizing: border-box;
-  font: inherit;
-}
-@media (max-width: 480px) {
-  .nav-cards { gap: 8px; }
-  .nav-card { padding: 10px 10px; gap: 2px; border-radius: 10px; }
-}
-.nav-card:hover { border-color: var(--border-focus); background: var(--surface-active); }
-.nav-card.active {
-  border-color: var(--accent);
-  background: var(--surface-card);
-  box-shadow: 0 4px 16px var(--accent-glow);
-}
-.nav-card-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  margin-bottom: 4px;
-  width: 100%;
-  min-width: 0;
-}
-.nav-card-icon {
-  width: 28px;
-  height: 28px;
-  border-radius: 7px;
-  background: var(--accent-glow);
-  color: var(--accent);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.nav-card-badge {
-  font-size: 10.5px;
-  font-weight: 700;
-  padding: 2px 7px;
-  border-radius: 999px;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  color: var(--text-sub);
-  flex-shrink: 0;
-}
-.nav-card.active .nav-card-badge {
-  background: var(--accent-glow);
-  border-color: rgba(99, 102, 241, 0.3);
-  color: var(--accent);
-}
-.nav-card-title {
-  font-size: 13.5px;
-  font-weight: 700;
-  color: var(--text);
-  line-height: 1.25;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  width: 100%;
-}
-@media (max-width: 480px) { .nav-card-title { font-size: 12.5px; } }
-.nav-card-desc {
-  font-size: 11px;
-  color: var(--text-sub);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  width: 100%;
-}
-@media (max-width: 480px) { .nav-card-desc { font-size: 10px; } }
-
-/* Tab Panels */
-.tab-panel {
-  display: none;
-  flex-direction: column;
-  gap: 1rem;
-  width: 100%;
-  min-width: 0;
-}
-.tab-panel.active { display: flex; }
-
-/* Hero Card */
-.hero-card {
-  background: var(--surface-card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 18px 20px;
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-  box-shadow: 0 6px 20px -6px rgba(0, 0, 0, 0.35);
-  max-width: 100%;
-  box-sizing: border-box;
-  overflow: hidden;
-}
-@media (max-width: 680px) { .hero-card { padding: 14px 14px; gap: 11px; } }
-.hero-top {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  flex-wrap: wrap;
-  gap: 8px;
-}
-.hero-status {
-  display: inline-flex;
-  align-items: center;
   gap: 7px;
-  font-size: 13px;
-  font-weight: 700;
-  color: var(--green);
-}
-.status-dot {
-  width: 7px;
-  height: 7px;
-  border-radius: 50%;
-  background: var(--green);
-  box-shadow: 0 0 7px var(--green);
-  flex-shrink: 0;
-}
-.hero-scope {
-  font-size: 11.5px;
-  color: var(--text-sub);
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  flex-wrap: wrap;
-}
-.hero-desc {
-  font-size: 12.5px;
-  color: var(--text-sub);
-  line-height: 1.45;
 }
 
-
-
-/* Install Button CTA */
-.btn-install {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 9px;
-  width: 100%;
-  background: var(--accent);
-  color: #ffffff !important;
-  font-weight: 700;
-  font-size: 14.5px;
-  padding: 12px 20px;
-  border-radius: 9px;
-  text-decoration: none;
-  cursor: pointer;
-  box-shadow: 0 4px 14px var(--accent-glow);
-  transition: all 0.15s ease;
+/* Slide-Over Drawer Menu */
+.drawer-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.65);
+  backdrop-filter: blur(4px);
+  -webkit-backdrop-filter: blur(4px);
+  z-index: 600;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.22s ease;
 }
-.btn-install:hover {
-  background: var(--accent-hover);
-  box-shadow: 0 6px 18px rgba(99, 102, 241, 0.35);
-  transform: translateY(-1px);
+.drawer-backdrop.open {
+  opacity: 1;
+  pointer-events: auto;
 }
-.btn-install:active { transform: translateY(0); }
-
-/* Single-Line Compact Manifest Group */
-.manifest-input-group {
-  display: flex;
-  align-items: center;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 4px 5px 4px 10px;
-  width: 100%;
-  box-sizing: border-box;
-  gap: 8px;
-  overflow: hidden;
-  transition: border-color 0.15s;
-}
-.manifest-input-group:focus-within { border-color: var(--accent); }
-.manifest-tag {
-  font-size: 9.5px;
-  font-weight: 800;
-  letter-spacing: 0.5px;
-  text-transform: uppercase;
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 290px;
+  max-width: 85vw;
   background: var(--surface);
-  color: var(--text-dim);
-  border: 1px solid var(--border);
-  border-radius: 5px;
-  padding: 3px 6px;
-  flex-shrink: 0;
-}
-.manifest-input {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-  font-size: 12px;
-  color: var(--text);
-  background: transparent;
-  border: none;
-  outline: none;
-  flex: 1 1 0;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.btn-copy-manifest {
-  background: var(--surface);
-  border: 1px solid var(--border);
-  color: var(--text);
-  font-size: 11.5px;
-  font-weight: 600;
-  padding: 6px 12px;
-  border-radius: 6px;
-  cursor: pointer;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  flex-shrink: 0;
-  transition: all 0.15s ease;
-  white-space: nowrap;
-}
-.btn-copy-manifest:hover { background: var(--surface-active); border-color: var(--border-focus); }
-
-/* Bridge Specifications Card */
-.features-card {
-  background: var(--surface-card);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 16px 18px;
+  border-left: 1px solid var(--border);
+  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.5);
+  z-index: 650;
   display: flex;
   flex-direction: column;
+  padding: 16px 14px;
   gap: 12px;
-  max-width: 100%;
+  transform: translateX(100%);
+  transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
   box-sizing: border-box;
-  overflow: hidden;
 }
-.features-title {
+.drawer.open {
+  transform: translateX(0);
+}
+.drawer-hdr {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.drawer-title {
+  font-size: 14px;
+  font-weight: 800;
+  color: var(--text);
+  letter-spacing: -0.2px;
+}
+.drawer-close {
+  background: none;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 6px;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: all 0.15s ease;
+}
+.drawer-close:hover {
+  background: var(--surface-active);
+  color: var(--text);
+}
+.drawer-menu {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  overflow-y: auto;
+  flex: 1;
+}
+.drawer-section-label {
   font-size: 10px;
   font-weight: 800;
   letter-spacing: 0.8px;
   text-transform: uppercase;
   color: var(--text-dim);
+  padding: 6px 4px 2px;
 }
-.features-grid {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-  width: 100%;
-  box-sizing: border-box;
-}
-@media (max-width: 480px) {
-  .features-grid { grid-template-columns: 1fr; gap: 8px; }
-}
-.feature-item {
+.drawer-btn {
   display: flex;
-  justify-content: space-between;
   align-items: center;
-  padding: 9px 12px;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  font-size: 12px;
-}
-.feat-label { color: var(--text-sub); font-weight: 500; }
-.feat-val { color: var(--text); font-weight: 700; }
-
-/* Customize Prompt Banner */
-.customize-prompt-card {
+  justify-content: space-between;
+  padding: 10px 12px;
   background: var(--surface-card);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 14px 16px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  border-radius: 9px;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
   cursor: pointer;
-  transition: all 0.18s ease;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.12);
-  max-width: 100%;
+  transition: all 0.15s ease;
+  width: 100%;
   box-sizing: border-box;
-  overflow: hidden;
+  font-family: inherit;
 }
-.customize-prompt-card:hover {
-  border-color: var(--accent);
-  background: var(--surface-card-hover);
-  transform: translateY(-1px);
-  box-shadow: 0 4px 16px var(--accent-glow);
-}
-.cp-content { display: flex; align-items: center; gap: 12px; min-width: 0; }
-.cp-icon {
-  width: 36px;
-  height: 36px;
-  border-radius: 10px;
-  background: var(--accent-glow);
+.drawer-btn:hover {
+  background: var(--surface-active);
+  border-color: var(--border-focus);
   color: var(--accent);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-.cp-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
-.cp-title { font-size: 13.5px; font-weight: 700; color: var(--text); letter-spacing: -0.2px; }
-.cp-sub { font-size: 11.5px; color: var(--text-sub); line-height: 1.35; }
-.cp-action {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  font-size: 12px;
-  font-weight: 700;
-  color: var(--accent);
-  flex-shrink: 0;
-}
-@media (max-width: 480px) {
-  .customize-prompt-card { padding: 12px 14px; gap: 10px; }
-  .cp-sub { display: none; }
 }
 
-/* Customizer Bar */
-.customizer-bar {
+/* Donation Goal Bar (pengu.uk top bar) */
+.goal-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  border-radius: var(--card-radius);
+  padding: 12px 16px;
   display: flex;
   flex-direction: column;
   gap: 8px;
-  width: 100%;
-  min-width: 0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+  cursor: pointer;
+  text-decoration: none;
+  transition: all 0.15s ease;
 }
-.customizer-hdr {
+.goal-card:hover {
+  border-color: var(--border-focus);
+  transform: translateY(-1px);
+}
+.goal-top {
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  font-size: 13.5px;
+  font-weight: 700;
+  gap: 10px;
 }
-.customizer-title {
-  font-size: 1.1rem;
-  font-weight: 800;
-  color: var(--text);
-  letter-spacing: -0.3px;
-}
-.customizer-sub { font-size: 12px; color: var(--text-sub); margin-top: 2px; }
-.customizer-actions {
+.goal-text { color: var(--text); font-weight: 700; }
+.goal-pct { color: #f43f5e; font-weight: 800; font-size: 13px; }
+.goal-bar-row {
   display: flex;
   align-items: center;
   gap: 10px;
-  flex-shrink: 0;
-}
-.btn-reset-action {
-  font-size: 11.5px;
-  color: var(--accent);
-  background: none;
-  border: none;
-  cursor: pointer;
-  padding: 0;
-  white-space: nowrap;
-  font-weight: 600;
-}
-.btn-reset-action:hover { text-decoration: underline; }
-
-.presets-wrapper {
-  position: relative;
-  display: flex;
-  align-items: center;
-  gap: 6px;
   width: 100%;
-  min-width: 0;
 }
-.presets-nav-btn {
+.goal-track {
+  flex: 1;
+  height: 8px;
+  background: rgba(148, 163, 184, 0.15);
+  border-radius: 999px;
+  overflow: hidden;
+}
+.goal-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #f43f5e 0%, var(--accent) 100%);
+  border-radius: 999px;
+  transition: width 0.35s ease;
+}
+.goal-heart-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   width: 26px;
   height: 26px;
   border-radius: 50%;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  color: var(--text-sub);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
+  background: rgba(244, 63, 94, 0.12);
+  border: 1px solid rgba(244, 63, 94, 0.28);
+  color: #f43f5e;
   flex-shrink: 0;
-  padding: 0;
-  transition: all 0.15s ease;
-  user-select: none;
-  -webkit-user-select: none;
+  transition: all 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+  box-shadow: 0 1px 4px rgba(244, 63, 94, 0.15);
 }
-.presets-nav-btn:hover {
-  background: var(--surface-active);
-  border-color: var(--accent);
-  color: var(--text);
-  transform: scale(1.08);
-}
-.presets-nav-btn:active {
-  transform: scale(0.96);
-}
-@media (pointer: coarse) {
-  .presets-nav-btn { display: none !important; }
+.goal-card:hover .goal-heart-btn {
+  transform: scale(1.18);
+  background: rgba(244, 63, 94, 0.22);
+  border-color: rgba(244, 63, 94, 0.55);
+  box-shadow: 0 0 12px rgba(244, 63, 94, 0.45);
 }
 
-.presets-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  overflow-x: auto;
-  overflow-y: hidden;
-  padding-bottom: 4px;
-  scrollbar-width: thin;
-  scrollbar-color: var(--border) transparent;
-  width: 100%;
-  min-width: 0;
-  scroll-behavior: smooth;
-  -webkit-overflow-scrolling: touch;
-  touch-action: pan-x pan-y;
-  cursor: grab;
-  user-select: none;
-  -webkit-user-select: none;
-}
-.presets-row.grabbing {
-  cursor: grabbing;
-  scroll-behavior: auto;
-}
-.presets-row::-webkit-scrollbar {
-  height: 4px;
-}
-.presets-row::-webkit-scrollbar-track {
-  background: transparent;
-}
-.presets-row::-webkit-scrollbar-thumb {
-  background: var(--border);
-  border-radius: 999px;
-}
-.presets-row::-webkit-scrollbar-thumb:hover {
-  background: var(--text-dim);
-}
-
-.preset-btn {
-  font-size: 11.5px;
-  font-weight: 500;
-  padding: 4px 11px;
-  border-radius: 999px;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  color: var(--text-sub);
-  cursor: pointer;
-  white-space: nowrap;
-  flex-shrink: 0;
-  transition: all 0.15s ease;
-  user-select: none;
-  -webkit-user-select: none;
-}
-.presets-row.grabbing .preset-btn {
-  cursor: grabbing;
-}
-.preset-btn:hover { color: var(--text); border-color: var(--border-focus); }
-.preset-btn.active {
-  background: var(--surface-active);
-  color: var(--text);
-  border-color: var(--accent);
-  font-weight: 600;
-}
-.search-input {
-  width: 100%;
-  font: inherit;
-  font-size: 13px;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
-  padding: 8px 12px;
-  outline: none;
-  box-sizing: border-box;
-}
-.search-input:focus { border-color: var(--accent); }
-
-/* Sources Grid (Strict 2 columns on mobile) */
-.sources-section-hdr {
-  display: flex;
-  align-items: flex-end;
-  justify-content: space-between;
-  gap: 10px;
-  margin-top: 0.1rem;
-}
-.sources-section-title {
-  font-size: 1.1rem;
-  font-weight: 800;
-  color: var(--text);
-  letter-spacing: -0.3px;
-  display: flex;
-  align-items: center;
-  gap: 7px;
-}
-.tab-badge {
-  font-size: 10.5px;
-  padding: 2px 7px;
-  border-radius: 999px;
-  background: var(--accent-glow);
-  color: var(--accent);
-  font-weight: 700;
-}
-.btn-customize-cta {
-  font-size: 12px;
-  color: var(--accent);
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 7px;
-  padding: 6px 12px;
-  cursor: pointer;
-  font-weight: 600;
-  white-space: nowrap;
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-}
-.btn-customize-cta:hover { background: var(--surface-active); border-color: var(--accent); }
-
-.sources-grid {
+/* Stat Cards (3 stacked metric cards matching pengu.uk) */
+.stats-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
-  gap: 12px;
-  width: 100%;
-  min-width: 0;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
 }
-@media (max-width: 680px) {
-  .sources-grid {
+@media (max-width: 640px) {
+  .stats-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     gap: 8px;
   }
 }
-
-/* Cards */
-.provider-card, .overview-source-card {
+.stat-card {
   background: var(--surface-card);
   border: 1px solid var(--border);
-  border-radius: 11px;
-  padding: 12px 13px;
-  cursor: pointer;
-  transition: all 0.15s ease;
+  border-radius: var(--card-radius);
+  padding: 12px 14px;
   display: flex;
   flex-direction: column;
-  gap: 7px;
-  user-select: none;
-  min-width: 0;
+  gap: 3px;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.05);
+}
+@media (max-width: 520px) {
+  .stat-card { padding: 9px 10px; }
+}
+.stat-lbl {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-dim);
+}
+.stat-val {
+  font-size: 24px;
+  font-weight: 800;
+  color: var(--text);
+  line-height: 1.15;
+}
+@media (max-width: 520px) {
+  .stat-val { font-size: 19px; }
+}
+.stat-sub {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  white-space: nowrap;
   overflow: hidden;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+  text-overflow: ellipsis;
 }
-@media (max-width: 680px) {
-  .provider-card, .overview-source-card {
-    padding: 10px 10px;
-    gap: 6px;
-    border-radius: 9px;
-  }
+
+/* THE HERO CTA INSTALL CARD (Centerpiece matching pengu.uk) */
+.install-hero-card {
+  background: var(--surface-card);
+  border: 1.5px solid var(--border);
+  border-radius: var(--card-radius);
+  padding: 18px 18px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 13px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.14);
 }
-.provider-card:hover, .overview-source-card:hover {
-  border-color: var(--border-focus);
-  transform: translateY(-2px);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
-}
-.provider-card.selected {
-  border-color: var(--accent);
-  background: var(--surface-active);
-  box-shadow: 0 4px 14px var(--accent-glow);
-}
-.p-top-row {
+.install-hero-hdr {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  width: 100%;
+  gap: 8px;
+}
+.install-hero-tag {
+  display: flex;
+  align-items: center;
   gap: 6px;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-dim);
 }
-.p-avatar {
-  width: 30px;
-  height: 30px;
-  border-radius: 7px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 13px;
-  font-weight: 800;
-  color: var(--accent);
-  flex-shrink: 0;
-}
-.p-icon-img {
-  width: 30px;
-  height: 30px;
-  border-radius: 7px;
-  object-fit: cover;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  flex-shrink: 0;
-}
-.chk {
-  width: 18px;
-  height: 18px;
-  border-radius: 50%;
-  border: 1.5px solid var(--border-focus);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex: 0 0 18px;
-  transition: all 0.12s ease;
-  background: transparent;
-}
-.provider-card.selected .chk {
-  background: var(--accent);
-  border-color: var(--accent);
-}
-.chk-svg { display: none; stroke: #ffffff; }
-.provider-card.selected .chk-svg { display: block; }
-
-.oc-status-pill {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 10px;
-  font-weight: 600;
-  color: var(--green);
-  background: var(--green-bg);
-  padding: 2px 6px;
+.install-mode-badge {
+  font-size: 10.5px;
+  font-weight: 700;
+  padding: 2px 8px;
   border-radius: 999px;
-  border: 1px solid rgba(16, 185, 129, 0.25);
-  flex-shrink: 0;
+  background: var(--accent-glow);
+  color: var(--accent);
+  border: 1px solid rgba(92, 112, 214, 0.3);
 }
 
-.p-main-info {
+.install-status-row {
   display: flex;
   flex-direction: column;
-  gap: 1px;
-  min-width: 0;
+  gap: 2px;
+}
+.install-ready-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.install-sync-status {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--green);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+/* THE MASSIVE PRIMARY CTA BUTTON */
+.btn-hero-install {
   width: 100%;
+  height: 48px;
+  background: var(--accent);
+  color: #ffffff !important;
+  font-size: 15px;
+  font-weight: 700;
+  border-radius: 10px;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  text-decoration: none;
+  transition: all 0.18s ease;
+  box-shadow: 0 4px 16px var(--accent-glow);
+}
+.btn-hero-install:hover {
+  background: var(--accent-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 6px 22px var(--accent-glow);
+}
+.btn-hero-install:active { transform: translateY(0); }
+
+/* SECONDARY BUTTON ROW: Copy Addon URL (Wide) + Let Devs Choose Button on side */
+.install-btn-row {
+  display: flex;
+  gap: 8px;
+  width: 100%;
+}
+.btn-hero-copy {
+  flex: 1;
+  height: 42px;
+  background: var(--surface);
+  border: 1.5px solid var(--border);
+  border-radius: 9px;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  transition: all 0.15s ease;
+}
+.btn-hero-copy:hover {
+  background: var(--surface-active);
+  border-color: var(--border-focus);
+}
+.btn-clear {
+  flex: 0 0 auto;
+  min-width: 120px;
+  padding: 0 12px;
+  height: 42px;
+  background: var(--surface);
+  border: 1.5px solid var(--border);
+  border-radius: 9px;
+  color: var(--text-sub);
+  font-size: 12.5px;
+  font-weight: 700;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+}
+.btn-clear:hover {
+  background: var(--surface-active);
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+/* Exclude Catalogs Switch Card */
+.catalog-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  border-radius: var(--card-radius);
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.catalog-title {
+  font-size: 13.5px;
+  font-weight: 700;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.catalog-desc {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-top: 2px;
+}
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 40px;
+  height: 22px;
+  flex-shrink: 0;
+}
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider {
+  position: absolute;
+  cursor: pointer;
+  inset: 0;
+  background-color: var(--code-bg);
+  border: 1.5px solid var(--border);
+  transition: 0.2s;
+  border-radius: 999px;
+}
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 14px;
+  width: 14px;
+  left: 2px;
+  bottom: 2.5px;
+  background-color: var(--text-dim);
+  transition: 0.2s;
+  border-radius: 50%;
+}
+input:checked + .slider {
+  background-color: var(--accent);
+  border-color: var(--accent);
+}
+input:checked + .slider:before {
+  transform: translateX(18px);
+  background-color: #ffffff;
+}
+
+/* SOURCES SECTION (Image 2 style) */
+.sources-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 4px;
+}
+.sources-section-hdr {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.sources-big-title {
+  font-size: 20px;
+  font-weight: 800;
+  color: var(--text);
+  letter-spacing: -0.3px;
+}
+.sources-subtitle {
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.sources-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+.sources-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-sub);
+  font-family: inherit;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 5px 11px;
+  border-radius: 7px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+  line-height: 1.2;
+}
+.sources-btn:hover {
+  background: var(--surface-active);
+  border-color: var(--border-focus);
+  color: var(--text);
+}
+.sources-btn:active {
+  transform: scale(0.97);
+}
+.sources-btn.primary {
+  border-color: rgba(99, 102, 241, 0.35);
+  color: var(--accent);
+}
+.sources-btn.primary:hover {
+  background: var(--accent-glow);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.sources-btn.selected-btn {
+  background: var(--surface);
+  border-color: rgba(99, 102, 241, 0.3);
+  color: var(--text);
+}
+.sources-btn.selected-btn b {
+  color: var(--accent);
+  font-weight: 800;
+}
+.sources-btn.selected-btn.all-active {
+  background: var(--accent-glow);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+/* Providers Wrapper Card */
+.providers-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  border-radius: var(--card-radius);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.providers-top-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.providers-sub-info {
+  font-size: 11px;
+  color: var(--text-dim);
+  font-weight: 500;
+  text-transform: none;
+  letter-spacing: normal;
+}
+.providers-sub-info b {
+  color: var(--text-sub);
+}
+.providers-count-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--green);
+  background: var(--green-bg);
+  border: 1px solid rgba(16, 185, 129, 0.25);
+  padding: 3px 9px;
+  border-radius: 999px;
+  text-transform: none;
+  transition: all 0.15s ease;
+}
+.count-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+/* Presets Pill Bar (Wrapped, No Horizontal Scroll) */
+.presets-pill-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding-bottom: 2px;
+}
+.preset-pill {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-sub);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 12px;
+  border-radius: 999px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: all 0.15s ease;
+}
+.preset-pill:hover {
+  background: var(--surface-active);
+  color: var(--text);
+  border-color: var(--border-focus);
+}
+.preset-pill.active {
+  background: var(--accent-glow);
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 700;
+}
+
+/* Filter controls */
+.filters-row {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.filter-select {
+  flex: 1;
+  min-width: 130px;
+  height: 33px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 0 10px;
+  outline: none;
+  cursor: pointer;
+}
+.filter-select:focus { border-color: var(--accent); }
+
+.search-input-wrap {
+  position: relative;
+  width: 100%;
+  display: flex;
+  align-items: center;
+}
+.search-icon-svg {
+  position: absolute;
+  left: 10px;
+  color: var(--text-dim);
+  pointer-events: none;
+}
+.search-input {
+  width: 100%;
+  font-size: 12.5px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 7px 10px 7px 32px;
+  outline: none;
+}
+.search-input:focus { border-color: var(--accent); }
+
+/* Sources — responsive auto-fill grid */
+.sources-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 6px;
+  width: 100%;
+}
+
+/* Individual Provider Card - horizontal list row */
+.p-card {
+  background: var(--surface);
+  border: 1.5px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 14px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 12px;
+  user-select: none;
+  min-width: 0;
+}
+.p-card:hover {
+  border-color: var(--border-focus);
+  background: var(--surface-hover, var(--surface));
+}
+.p-card.selected {
+  border-color: var(--accent);
+  background: var(--surface-active);
+  box-shadow: 0 2px 10px var(--accent-glow);
+}
+/* Left icon block */
+.p-card-icon-col {
+  flex-shrink: 0;
+}
+/* Middle info block */
+.p-card-info-col {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.p-top-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
 }
 .p-name {
   font-weight: 700;
@@ -2646,53 +3251,136 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  line-height: 1.25;
+  flex: 1;
+  min-width: 0;
 }
-@media (max-width: 680px) { .p-name { font-size: 12px; } }
-.p-repo {
+.p-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  object-fit: contain;
+  flex-shrink: 0;
+  background: var(--bg2);
+}
+.p-icon-letter {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 6px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+/* Selection circle on the right (like pengu.uk) */
+.p-chk-circle {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1.5px solid var(--border-focus);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 20px;
+  transition: all 0.12s ease;
+  background: transparent;
+  color: transparent;
+  font-size: 10px;
+  font-weight: 800;
+}
+.p-card.selected .p-chk-circle {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #ffffff;
+}
+
+/* Card metadata line (like 4K · 1080p · Wide-Library) */
+.p-meta-line {
   font-size: 10.5px;
   color: var(--text-dim);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.p-badges-row {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-  flex-wrap: wrap;
-}
-.p-type-tag {
-  font-size: 10px;
-  font-weight: 600;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: var(--code-bg);
-  color: var(--text-sub);
-  border: 1px solid var(--border);
-  text-transform: capitalize;
-}
-.p-tag-goff {
-  font-size: 9px;
-  font-weight: 700;
-  padding: 1px 5px;
-  border-radius: 4px;
-  background: var(--amber-bg);
-  color: var(--amber);
-  border: 1px solid rgba(245, 158, 11, 0.25);
-  text-transform: uppercase;
-}
-.p-desc {
+.p-desc-line {
   font-size: 11px;
   color: var(--text-dim);
-  line-height: 1.35;
+  line-height: 1.4;
   display: -webkit-box;
   -webkit-line-clamp: 2;
   -webkit-box-orient: vertical;
   overflow: hidden;
+  margin-top: 1px;
+  opacity: 0.75;
+}
+.p-res-highlight {
+  color: var(--cyan);
+  font-weight: 700;
+}
+.p-repo-badge {
+  color: var(--text-sub);
+}
+.p-lang-badge {
+  color: var(--amber);
+  font-weight: 700;
+  text-transform: uppercase;
 }
 
-/* Modals */
+/* Per-Provider Catalog Controls */
+.p-top-right {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+.p-cat-pill {
+  font-family: inherit;
+  font-size: 9px;
+  font-weight: 800;
+  letter-spacing: 0.3px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  line-height: 1;
+  transition: all 0.15s ease;
+  user-select: none;
+  min-height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+}
+.p-cat-pill.on {
+  background: var(--green-bg);
+  color: var(--green);
+  border-color: rgba(16, 185, 129, 0.3);
+}
+.p-cat-pill.on:hover {
+  background: rgba(16, 185, 129, 0.25);
+  border-color: var(--green);
+}
+.p-cat-pill.off {
+  background: rgba(245, 158, 11, 0.15);
+  color: var(--amber);
+  border-color: rgba(245, 158, 11, 0.35);
+}
+.p-cat-pill.off:hover {
+  background: rgba(245, 158, 11, 0.25);
+  border-color: var(--amber);
+}
+.p-cat-pill.disabled {
+  background: var(--surface-active);
+  color: var(--text-dim);
+  border-color: var(--border);
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+/* Repos & Credits Modals */
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -2701,7 +3389,7 @@ body {
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 100;
+  z-index: 400;
   padding: 16px;
   opacity: 0;
   pointer-events: none;
@@ -2711,95 +3399,126 @@ body {
 .modal-box {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: var(--card-radius);
   width: 100%;
-  max-width: 520px;
-  padding: 20px;
+  max-width: 480px;
+  padding: 18px;
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.5);
-  max-height: 88vh;
+  gap: 12px;
+  max-height: 85vh;
   overflow-y: auto;
 }
-.modal-hdr {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-}
-.modal-title { font-size: 16px; font-weight: 700; color: var(--text); }
-.modal-close {
-  background: none;
-  border: none;
-  color: var(--text-dim);
-  cursor: pointer;
-  padding: 4px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  border-radius: 6px;
-}
-.modal-close:hover { color: var(--text); background: var(--surface-active); }
-.modal-hint { font-size: 12px; color: var(--text-sub); }
-.modal-input-row {
-  display: flex;
-  gap: 8px;
-}
-.modal-input {
-  flex: 1;
-  font: inherit;
-  font-size: 13px;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  color: var(--text);
-  padding: 9px 12px;
-  outline: none;
-}
-.modal-input:focus { border-color: var(--accent); }
-.btn-primary {
-  background: var(--accent);
-  color: #fff;
-  border: none;
-  border-radius: 8px;
-  padding: 9px 15px;
-  font-size: 12.5px;
-  font-weight: 700;
-  cursor: pointer;
-  transition: background 0.15s;
-  flex-shrink: 0;
-}
-.btn-primary:hover { background: var(--accent-hover); }
-.btn-primary:disabled { opacity: 0.5; cursor: default; }
-.repos-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  margin-top: 4px;
-}
+.modal-hdr { display: flex; align-items: center; justify-content: space-between; }
+.modal-title { font-size: 15px; font-weight: 700; color: var(--text); }
+.modal-close { background: none; border: none; color: var(--text-dim); cursor: pointer; padding: 4px; display: flex; }
+.repos-list { display: flex; flex-direction: column; gap: 8px; }
 .repo-card {
   background: var(--surface-card);
   border: 1px solid var(--border);
-  border-radius: 10px;
-  padding: 10px 12px;
+  border-radius: 8px;
+  padding: 9px 11px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 10px;
 }
-.repo-info { min-width: 0; flex: 1; }
-.repo-name { font-size: 13px; font-weight: 700; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.repo-url { font-size: 10.5px; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.repo-badge {
-  font-size: 10.5px;
+
+/* Authors & Open Source Credits Hub */
+.credits-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.author-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 0.15s ease;
+}
+.author-card:hover {
+  border-color: var(--border-focus);
+}
+.author-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.author-info-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.author-avatar {
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  object-fit: cover;
+  background: var(--surface-active);
+  flex-shrink: 0;
+  border: 1px solid var(--border);
+}
+.author-name {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.author-badge {
+  font-size: 10px;
   font-weight: 700;
   padding: 2px 7px;
   border-radius: 999px;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  color: var(--text-sub);
+  background: var(--accent-glow);
+  color: var(--accent);
+  border: 1px solid rgba(139, 92, 246, 0.3);
   flex-shrink: 0;
 }
+.author-desc {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+.author-links-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.author-link-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 4px 9px;
+  border-radius: 6px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-sub);
+  text-decoration: none;
+  transition: all 0.15s ease;
+}
+.author-link-btn:hover {
+  background: var(--surface-active);
+  border-color: var(--border-focus);
+  color: var(--text);
+}
+.author-link-btn.gh:hover { color: #f1f4fa; border-color: #64748b; background: rgba(255, 255, 255, 0.08); }
+.author-link-btn.dc { color: #5865f2; border-color: rgba(88, 101, 242, 0.28); background: rgba(88, 101, 242, 0.06); }
+.author-link-btn.dc:hover { color: #fff; border-color: #5865f2; background: #5865f2; }
+.author-link-btn.tg { color: #229ed9; border-color: rgba(34, 158, 217, 0.28); background: rgba(34, 158, 217, 0.06); }
+.author-link-btn.tg:hover { color: #fff; border-color: #229ed9; background: #229ed9; }
+.author-link-btn.heart { color: #f43f5e; border-color: rgba(244, 63, 94, 0.28); background: rgba(244, 63, 94, 0.05); }
+.author-link-btn.heart:hover { color: #fff; border-color: #f43f5e; background: #f43f5e; }
 
 /* Toast */
 .toast {
@@ -2810,74 +3529,35 @@ body {
   background: var(--surface-card);
   border: 1px solid var(--border-focus);
   color: var(--text);
-  font-size: 12.5px;
+  font-size: 12px;
   font-weight: 600;
-  padding: 9px 18px;
-  border-radius: 10px;
+  padding: 8px 16px;
+  border-radius: 8px;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
   opacity: 0;
   pointer-events: none;
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
-  z-index: 200;
+  z-index: 500;
   white-space: nowrap;
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
-.empty {
-  grid-column: 1 / -1;
-  text-align: center;
-  padding: 2rem 1rem;
-  color: var(--text-dim);
-  font-size: 13px;
-}
+.empty { grid-column: 1 / -1; text-align: center; padding: 2rem 1rem; color: var(--text-dim); font-size: 12.5px; }
 
 /* Page Footer */
 .page-footer {
-  margin-top: 1.5rem;
-  padding: 1.25rem 0.5rem 0;
+  margin-top: 1rem;
+  padding-top: 1rem;
   border-top: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: center;
-  flex-wrap: wrap;
-  gap: 8px 14px;
-  font-size: 12.5px;
+  gap: 8px;
+  font-size: 12px;
   color: var(--text-dim);
   text-align: center;
+  flex-wrap: wrap;
 }
-.footer-author-link {
-  color: var(--text);
-  font-weight: 600;
-  text-decoration: none;
-  border-bottom: 1px dashed var(--accent);
-  padding-bottom: 1px;
-  transition: all 0.15s ease;
-}
-.footer-author-link:hover {
-  color: var(--accent);
-  border-bottom-style: solid;
-}
-.footer-credit {
-  color: var(--text-sub);
-  font-weight: 600;
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  vertical-align: middle;
-  transform: translateY(1.5px);
-}
-.discord-icon {
-  color: #5865f2;
-  display: inline-block;
-  flex-shrink: 0;
-}
-.footer-sep {
-  color: var(--border-focus);
-}
-.heart-icon {
-  display: inline-block;
-  color: #f43f5e;
-  margin: 0 1px;
-}
+.footer-author-link { color: var(--text); font-weight: 600; text-decoration: none; border-bottom: 1px dashed var(--accent); }
 </style>
 </head>
 <body>
@@ -2886,249 +3566,345 @@ body {
   <!-- HEADER -->
   <header class="hdr">
     <div class="brand-wrap">
-      <div class="brand-logo-container">
-        <img src="/logo.png" alt="CNCVerse Logo" class="brand-logo" onerror="this.src='https://raw.githubusercontent.com/NivinCNC/CNCVerse-Cloud-Stream-Extension/refs/heads/builds/cnc.png'">
+      <div class="logo-box">
+        <img src="/logo.png" alt="CNCVerse" style="width:32px;height:32px;border-radius:8px;object-fit:contain;" onerror="this.style.display='none'">
       </div>
       <h1 class="brand-title">CNCVerse Bridge</h1>
     </div>
     <div class="hdr-actions">
-      <button class="btn-hdr" onclick="openReposModal()" title="Extension Repositories">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></svg>
-        <span class="btn-hdr-text">Repos</span>
-        <span class="hdr-badge" id="hdr-repo-count">0</span>
-      </button>
-      <a class="btn-hdr" href="https://t.me/cncverse" target="_blank" rel="noopener" title="Telegram Community">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 2 11 13"/><path d="M22 2 15 22l-4-9-9-4Z"/></svg>
-      </a>
-      <button class="btn-hdr" onclick="toggleTheme()" id="theme-btn" title="Toggle theme">
-        <svg id="theme-icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+      <button class="btn-icon-hdr btn-burger" onclick="toggleDrawer(true)" title="Menu &amp; Links">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
       </button>
     </div>
   </header>
 
-  <!-- DONATION GOAL BAR -->
-  <div class="goal-card" id="goal-card" title="CNCVerse Community Goal">
-    <div class="goal-body">
-      <div class="goal-top">
-        <div class="goal-text" id="goal-text">&#36;0 raised of &#36;100 goal</div>
-        <div class="goal-pct" id="goal-pct">0%</div>
-      </div>
+  <!-- DONATION GOAL BAR (pengu.uk top bar - click to donate) -->
+  <a class="goal-card" id="goal-card" title="Click to view &amp; support CNCVerse Community Goal" href="https://cncverse.pages.dev" target="_blank" rel="noopener">
+    <div class="goal-top">
+      <div class="goal-text" id="goal-text">&#36;0 raised of &#36;100 goal</div>
+      <div class="goal-pct" id="goal-pct">0%</div>
+    </div>
+    <div class="goal-bar-row">
       <div class="goal-track">
         <div class="goal-fill" id="goal-fill" style="width: 0%;"></div>
       </div>
+      <span class="goal-heart-btn" title="Support CNCVerse Community Goal">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+      </span>
     </div>
-    <a class="goal-donate-btn" href="https://cncverse.pages.dev" target="_blank" rel="noopener">
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
-      <span>Donate</span>
-    </a>
+  </a>
+
+  <!-- 4 METRIC STATS CARDS (REPOSITORIES, SOURCES, QUALITIES, SYNC) -->
+  <div class="stats-grid">
+    <div class="stat-card" onclick="openReposModal()" style="cursor:pointer;" title="Click to view installed repositories &amp; sources">
+      <div class="stat-lbl">REPOSITORIES</div>
+      <div class="stat-val" id="st-repos-count">0</div>
+      <div class="stat-sub">Installed Repos</div>
+    </div>
+    <div class="stat-card" onclick="scrollToSources()" style="cursor:pointer;" title="Click to view &amp; customize Sources">
+      <div class="stat-lbl">SOURCES</div>
+      <div class="stat-val" id="st-stream-count">0</div>
+      <div class="stat-sub" id="st-total-count">0 available</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-lbl">QUALITIES</div>
+      <div class="stat-val">4K &rarr; 360p</div>
+      <div class="stat-sub">Ultra HD to SD</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-lbl">SYNC</div>
+      <div class="stat-val" id="stat-mode-val">Dev Choice</div>
+      <div class="stat-sub" id="stat-sync-sub">Auto-sync on</div>
+    </div>
   </div>
 
-  <!-- 2-CARD MODE SELECTOR -->
-  <nav class="nav-cards">
-    <div class="nav-card active" id="nav-card-overview" onclick="switchTab('overview')">
-      <div class="nav-card-top">
-        <div class="nav-card-icon">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-        </div>
-        <span class="nav-card-badge">Official Addon</span>
+  <!-- THE MAIN HERO INSTALL CARD (No manifest url displayed, embedded inside buttons) -->
+  <div class="install-hero-card">
+    <div class="install-hero-hdr">
+      <div class="install-hero-tag">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+        <span>INSTALL CNCVERSE BRIDGE</span>
       </div>
-      <div class="nav-card-title">Global Manifest</div>
-      <div class="nav-card-desc">Direct access to all globally enabled streams</div>
+      <span class="install-mode-badge" id="addon-mode-badge">Dev Choice (Default)</span>
     </div>
 
-    <div class="nav-card" id="nav-card-customize" onclick="switchTab('customize')">
-      <div class="nav-card-top">
-        <div class="nav-card-icon">
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
-        </div>
-        <span class="nav-card-badge">Personal Profile</span>
-      </div>
-      <div class="nav-card-title">Customize Sources</div>
-      <div class="nav-card-desc">Filter providers, exclude catalogs, curate manifest</div>
-    </div>
-  </nav>
-
-  <!-- TAB 1: OVERVIEW & GLOBAL MANIFEST -->
-  <main class="tab-panel active" id="panel-overview">
-    <div class="hero-card">
-      <div class="hero-top">
-        <div class="hero-status">
-          <span class="status-dot"></span>
-          <span>Online</span>
-        </div>
-      </div>
-
-      <div class="hero-desc">
-        All enabled CloudStream extensions in a single unified Stremio addon.
-      </div>
-
-      <a id="install-btn-overview" class="btn-install" href="#">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-        Install Addon
-      </a>
-
-      <div class="manifest-input-group">
-        <span class="manifest-tag">URL</span>
-        <input type="text" id="manifest-url-overview" class="manifest-input" readonly value="Loading manifest URL..." onclick="this.select()">
-        <button class="btn-copy-manifest" onclick="cpManifest(false, this)" title="Copy Manifest URL">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-          <span class="copy-lbl">Copy</span>
-        </button>
+    <div class="install-status-row">
+      <div class="install-ready-title" id="install-ready-title">Developer's choice ready to install.</div>
+      <div class="install-sync-status">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+        <span id="sync-status-text">All changes auto-sync</span>
       </div>
     </div>
 
-    <!-- BRIDGE SPECIFICATIONS -->
-    <div class="features-card">
-      <div class="features-title">BRIDGE SPECIFICATIONS</div>
-      <div class="features-grid">
-        <div class="feature-item">
-          <span class="feat-label">Protocol</span>
-          <span class="feat-val">Direct &amp; HLS Streams</span>
-        </div>
-        <div class="feature-item">
-          <span class="feat-label">Resolution</span>
-          <span class="feat-val">4K &middot; 1080p &middot; 720p</span>
-        </div>
-        <div class="feature-item">
-          <span class="feat-label">Supported Types</span>
-          <span class="feat-val">Movies &middot; Series &middot; Anime &middot; TV</span>
-        </div>
-        <div class="feature-item">
-          <span class="feat-label">Auto Updates</span>
-          <span class="feat-val" style="color:var(--green)">Live Sync</span>
-        </div>
-      </div>
-    </div>
+    <!-- MAIN CTA BUTTON -->
+    <a id="install-btn" class="btn-hero-install" href="#">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>
+      <span id="install-btn-text">Install CNCVerse Addon</span>
+    </a>
 
-    <!-- CUSTOMIZE PROMPT BANNER -->
-    <div class="customize-prompt-card" onclick="switchTab('customize')" role="button" tabindex="0" title="Click to customize provider sources">
-      <div class="cp-content">
-        <div class="cp-icon">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/></svg>
-        </div>
-        <div class="cp-text">
-          <div class="cp-title">Customize Sources</div>
-          <div class="cp-sub">Filter providers, exclude unwanted catalogs, or create a personalized Stremio manifest.</div>
-        </div>
-      </div>
-      <div class="cp-action">
-        <span>Configure</span>
-        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg>
-      </div>
-    </div>
-
-    <!-- AVAILABLE EXTENSIONS LIST -->
-    <div class="sources-section-hdr">
-      <div class="sources-section-title">
-        Included Providers
-        <span class="tab-badge" id="overview-ext-count">0</span>
-      </div>
-      <button class="btn-customize-cta" onclick="switchTab('customize')">
-        Customize &rarr;
+    <!-- SECONDARY BUTTON ROW: Copy Addon URL -->
+    <div class="install-btn-row">
+      <button class="btn-hero-copy" onclick="copyCurrentManifest(this)" title="Copy manifest URL to clipboard">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
+        <span class="copy-lbl">Copy Addon URL</span>
       </button>
     </div>
+  </div>
 
-    <div class="sources-grid" id="overview-grid">
-      <div class="empty">Loading providers...</div>
+  <!-- SHOW CATALOGS SWITCH CARD (Positive logic & Clear Phrasing) -->
+  <div class="catalog-card">
+    <div>
+      <div class="catalog-title">
+        <span>Show Catalogs in Stremio</span>
+        <span id="catalog-mode-tag" style="font-size:10px; font-weight:700; padding:1px 6px; border-radius:4px; background:var(--green-bg); color:var(--green); border:1px solid rgba(16,185,129,0.25);">Catalogs Active</span>
+      </div>
+      <div class="catalog-desc">
+        Enable discover rows &amp; catalog shelves in Stremio. Turn off for Streams Only mode (faster loading).
+      </div>
     </div>
-  </main>
+    <label class="switch" title="Toggle Stremio catalogs">
+      <input type="checkbox" id="chk-enable-catalogs" checked onchange="toggleEnableCatalogs(this.checked)">
+      <span class="slider"></span>
+    </label>
+  </div>
 
-  <!-- TAB 2: CUSTOMIZE SOURCES -->
-  <main class="tab-panel" id="panel-customize">
-    <div class="hero-card">
-      <div class="hero-top">
-        <div class="hero-status">
-          <span class="status-dot"></span>
-          <span>Personal Profile</span>
+  <!-- STREAM QUALITY PREFERENCES CARD -->
+  <div class="quality-card" style="background:var(--surface-card); border:1px solid var(--border); border-radius:var(--card-radius); padding:14px 16px; display:flex; flex-direction:column; gap:12px;">
+    <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
+      <div>
+        <div class="catalog-title" style="font-size:14px;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="20" rx="2.18" ry="2.18"/><line x1="7" y1="2" x2="7" y2="22"/><line x1="17" y1="2" x2="17" y2="22"/><line x1="2" y1="12" x2="22" y2="12"/><line x1="2" y1="7" x2="7" y2="7"/><line x1="2" y1="17" x2="7" y2="17"/><line x1="17" y1="17" x2="22" y2="17"/><line x1="17" y1="7" x2="22" y2="7"/></svg>
+          <span>Stream Quality Filters</span>
+          <span id="quality-filter-tag" style="font-size:10px; font-weight:700; padding:1px 6px; border-radius:4px; background:var(--green-bg); color:var(--green); border:1px solid rgba(16,185,129,0.25);">All Qualities</span>
+        </div>
+        <div class="catalog-desc">
+          Choose which video qualities Stremio will display. Unchecked qualities will be filtered out.
         </div>
       </div>
-
-      <div class="hero-desc">
-        Select which providers appear in your addon. Your picks are saved on this server and follow your profile link.
-      </div>
-
-      <a id="install-btn-custom" class="btn-install" href="#">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
-        Install Addon
-      </a>
-
-      <div class="manifest-input-group">
-        <span class="manifest-tag">Profile URL</span>
-        <input type="text" id="manifest-url-custom" class="manifest-input" readonly value="Loading personal manifest URL..." onclick="this.select()">
-        <button class="btn-copy-manifest" onclick="cpManifest(true, this)" title="Copy Personal Manifest URL">
-          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>
-          <span class="copy-lbl">Copy</span>
-        </button>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <span style="font-size:12px; font-weight:700; color:var(--text-sub);">Max per tier:</span>
+        <select id="sel-max-streams" onchange="onQualityChange()" style="background:var(--surface); border:1.5px solid var(--border); border-radius:7px; color:var(--text); font-size:12px; font-weight:600; padding:4px 8px; outline:none; cursor:pointer;">
+          <option value="0">All streams</option>
+          <option value="1">1 link (Fastest)</option>
+          <option value="2">2 links (Clean)</option>
+          <option value="3">3 links</option>
+          <option value="5">5 links</option>
+        </select>
       </div>
     </div>
 
-    <!-- FILTER & SEARCH CONTROLS -->
-    <div class="customizer-bar">
-      <div class="customizer-hdr">
+    <!-- Quality Checkbox Pills -->
+    <div style="display:flex; flex-wrap:wrap; gap:8px;">
+      <label style="cursor:pointer; display:inline-flex; align-items:center; gap:6px; background:var(--surface); border:1.5px solid var(--border); border-radius:8px; padding:6px 12px; font-size:12.5px; font-weight:700; color:var(--text); user-select:none; transition:all 0.15s ease;">
+        <input type="checkbox" id="q-2160p" value="2160p" checked onchange="onQualityChange()" style="accent-color:var(--accent); cursor:pointer;">
+        <span>4K (2160p)</span>
+      </label>
+      <label style="cursor:pointer; display:inline-flex; align-items:center; gap:6px; background:var(--surface); border:1.5px solid var(--border); border-radius:8px; padding:6px 12px; font-size:12.5px; font-weight:700; color:var(--text); user-select:none; transition:all 0.15s ease;">
+        <input type="checkbox" id="q-1080p" value="1080p" checked onchange="onQualityChange()" style="accent-color:var(--accent); cursor:pointer;">
+        <span>1080p FHD</span>
+      </label>
+      <label style="cursor:pointer; display:inline-flex; align-items:center; gap:6px; background:var(--surface); border:1.5px solid var(--border); border-radius:8px; padding:6px 12px; font-size:12.5px; font-weight:700; color:var(--text); user-select:none; transition:all 0.15s ease;">
+        <input type="checkbox" id="q-720p" value="720p" checked onchange="onQualityChange()" style="accent-color:var(--accent); cursor:pointer;">
+        <span>720p HD</span>
+      </label>
+      <label style="cursor:pointer; display:inline-flex; align-items:center; gap:6px; background:var(--surface); border:1.5px solid var(--border); border-radius:8px; padding:6px 12px; font-size:12.5px; font-weight:700; color:var(--text); user-select:none; transition:all 0.15s ease;">
+        <input type="checkbox" id="q-480p" value="480p" checked onchange="onQualityChange()" style="accent-color:var(--accent); cursor:pointer;">
+        <span>480p / SD</span>
+      </label>
+      <label style="cursor:pointer; display:inline-flex; align-items:center; gap:6px; background:var(--surface); border:1.5px solid var(--border); border-radius:8px; padding:6px 12px; font-size:12.5px; font-weight:700; color:var(--text); user-select:none; transition:all 0.15s ease;">
+        <input type="checkbox" id="q-360p" value="360p" checked onchange="onQualityChange()" style="accent-color:var(--accent); cursor:pointer;">
+        <span>360p</span>
+      </label>
+      <label style="cursor:pointer; display:inline-flex; align-items:center; gap:6px; background:var(--surface); border:1.5px solid var(--border); border-radius:8px; padding:6px 12px; font-size:12.5px; font-weight:700; color:var(--red); user-select:none; transition:all 0.15s ease;">
+        <input type="checkbox" id="q-exclude-cam" checked onchange="onQualityChange()" style="accent-color:var(--red); cursor:pointer;">
+        <span>Block CAM / Screeners</span>
+      </label>
+    </div>
+  </div>
+
+  <!-- SOURCES SECTION -->
+  <div class="sources-section" id="sources-section">
+    <div class="providers-card">
+      <div class="providers-top-line">
         <div>
-          <h2 class="customizer-title">Customize Providers</h2>
-          <div class="customizer-sub">Click any card to enable or disable it for your profile.</div>
+          <h2 class="sources-big-title" style="font-size:16px; margin:0 0 2px 0; display:flex; align-items:center; gap:7px;">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2"><rect x="2" y="3" width="20" height="14" rx="2" ry="2"/><line x1="8" y1="21" x2="16" y2="21"/><line x1="12" y1="17" x2="12" y2="21"/></svg>
+            <span>Sources &amp; Providers</span>
+          </h2>
+          <p class="sources-subtitle" style="margin:0; font-size:11.5px;">Select providers and resolutions. Presets configure sources instantly.</p>
         </div>
-        <div class="customizer-actions">
-          <button class="btn-reset-action" onclick="setAll(true)">Select All</button>
-          <span style="color:var(--text-dim)">&middot;</span>
-          <button class="btn-reset-action" onclick="setAll(false)">Clear All</button>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <div class="providers-count-pill" id="providers-count-pill">
+            <span class="count-dot"></span>
+            <span id="providers-count-label">0 of 0 active</span>
+          </div>
+          <button class="sources-btn" id="btn-select-all" onclick="toggleSelectAll()" title="Toggle selection of all sources">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+            <span>Toggle All</span>
+          </button>
+          <button class="sources-btn" onclick="setAll(false)" title="Clear all selected providers">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            <span>Clear All</span>
+          </button>
         </div>
       </div>
 
-      <div class="presets-wrapper">
-        <button class="presets-nav-btn prev" id="presets-prev" onclick="scrollPresets(-1)" aria-label="Previous filters" style="display:none;" type="button">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"></polyline></svg>
-        </button>
-        <div class="presets-row" id="presets-row">
-          <button class="preset-btn active" data-filter="all" onclick="applyFilter('all', this)">All Sources</button>
-        </div>
-        <button class="presets-nav-btn next" id="presets-next" onclick="scrollPresets(1)" aria-label="Next filters" style="display:none;" type="button">
-          <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"></polyline></svg>
-        </button>
+      <!-- Presets Pill Bar (Wrapped, No Horizontal Scroll) -->
+      <div class="presets-pill-bar" id="presets-row">
+        <button class="preset-pill active" data-preset="dev_choice" onclick="applyPreset('dev_choice', this)">Developer's Choice</button>
+        <button class="preset-pill" data-preset="all" onclick="applyPreset('all', this)">All Sources</button>
+        <button class="preset-pill" data-preset="movies_tv" onclick="applyPreset('movies_tv', this)">Movies &amp; Series</button>
+        <button class="preset-pill" data-preset="live_tv" onclick="applyPreset('live_tv', this)">Live TV</button>
+        <button class="preset-pill" data-preset="live_sports" onclick="applyPreset('live_sports', this)">Live Sports</button>
+        <button class="preset-pill" data-preset="anime" onclick="applyPreset('anime', this)">Anime</button>
       </div>
 
-      <input type="text" class="search-input" id="ext-search" placeholder="Search providers by name, repo, or content tag..." oninput="renderCards()">
-    </div>
+      <!-- Filter Dropdowns (Scales dynamically to any number of repos, types & languages) -->
+      <div class="filters-row">
+        <select class="filter-select" id="repo-filter" onchange="onRepoFilterChange(this.value)">
+          <option value="">All Repositories</option>
+        </select>
+        <select class="filter-select" id="type-filter" onchange="onTypeFilterChange(this.value)">
+          <option value="">All Content Types</option>
+        </select>
+        <select class="filter-select" id="lang-filter" onchange="onLangFilterChange(this.value)">
+          <option value="">All Languages</option>
+        </select>
+      </div>
 
-    <div class="sources-grid" id="sources-grid">
-      <div class="empty">Loading provider sources...</div>
+      <!-- Real-time Search Input -->
+      <div class="search-input-wrap">
+        <svg class="search-icon-svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        <input type="text" class="search-input" id="ext-search" placeholder="Search providers by name, repo, language, or tags..." oninput="renderCards()">
+      </div>
+
+      <!-- 2-Column Sources Grid (Strict 2 columns on mobile matching pengu.uk) -->
+      <div class="sources-grid" id="sources-grid">
+        <div class="empty">Loading provider sources...</div>
+      </div>
     </div>
-  </main>
+  </div>
 
   <!-- FOOTER -->
-  <footer class="page-footer">
-    <span>Made with <span class="heart-icon">❤️</span> By <a href="https://t.me/NivinCNC" target="_blank" rel="noopener" class="footer-author-link">NivinCNC</a></span>
-    <span class="footer-sep">&bull;</span>
-    <span>UI By <span class="footer-credit"><svg class="discord-icon" width="13" height="13" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.929 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.894.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>sleepycat555</span></span>
+  <footer class="page-footer" id="page-footer" style="${if (getFooterCredits().isEmpty()) "display:none;" else ""}">
+    ${buildFooterHtml()}
   </footer>
 </div>
 
-<!-- REPOSITORIES MODAL -->
+<!-- INSTALLED REPOSITORIES MODAL -->
 <div class="modal-overlay" id="repos-modal" onclick="if(event.target===this)closeReposModal()">
-  <div class="modal-box">
+  <div class="modal-box" style="max-width:580px;">
     <div class="modal-hdr">
-      <div class="modal-title">Extension Repositories</div>
+      <div class="modal-title" style="display:flex;align-items:center;gap:8px;">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+        <span>Installed Repositories</span>
+        <span id="repos-count-badge" style="font-size:11px; padding:2px 8px; border-radius:999px; background:var(--accent-glow); color:var(--accent); border:1px solid rgba(139,92,246,0.3); font-weight:700;">0 Repos</span>
+      </div>
       <button class="modal-close" onclick="closeReposModal()" title="Close">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
       </button>
     </div>
-    <div class="modal-hint">Extension repositories active on this bridge. Contact admin to add new repositories.</div>
-    <div class="modal-input-row" onclick="addRepo()" style="cursor:pointer">
-      <input type="text" id="repo-input" class="modal-input" placeholder="Contact admin to add repo" readonly style="cursor:pointer" onclick="addRepo()">
-      <button class="btn-primary" id="repo-add-btn" onclick="addRepo()">Add</button>
+    <div style="font-size:12px; color:var(--text-sub); line-height:1.5; padding:10px 13px; background:rgba(139,92,246,0.06); border:1px solid rgba(139,92,246,0.18); border-radius:9px; display:flex; align-items:flex-start; gap:9px;">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="#f43f5e" style="flex-shrink:0; margin-top:2px;"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+      <div>All media streaming is powered by open-source CloudStream repository maintainers. <strong style="color:var(--text);">Please check out their original repositories and support them!</strong></div>
     </div>
-    <div class="repos-list" id="repos-list">
-      <div class="empty" style="padding:16px">Loading repositories...</div>
+    <div class="credits-list" id="repos-list">
+      <!-- Dynamically filled by renderReposModal() -->
     </div>
   </div>
 </div>
+
+<!-- DEVELOPER & CONTRIBUTOR CREDITS MODAL -->
+<div class="modal-overlay" id="credits-modal" onclick="if(event.target===this)closeCreditsModal()">
+  <div class="modal-box" style="max-width:540px;">
+    <div class="modal-hdr">
+      <div class="modal-title" style="display:flex;align-items:center;gap:8px;">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span>Developer Credits</span>
+      </div>
+      <button class="modal-close" onclick="closeCreditsModal()" title="Close">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+      </button>
+    </div>
+    <div style="font-size:12px; color:var(--text-sub); line-height:1.5; padding:10px 13px; background:rgba(139,92,246,0.06); border:1px solid rgba(139,92,246,0.18); border-radius:9px;">
+      The core architects and developers behind CNCVerse Bridge.
+    </div>
+    <div class="credits-list" id="credits-list">
+      <!-- Dynamically filled by renderCreditsModal() -->
+    </div>
+  </div>
+</div>
+
+<!-- SLIDE-OVER DRAWER -->
+<div class="drawer-backdrop" id="drawer-backdrop" onclick="toggleDrawer(false)"></div>
+<aside class="drawer" id="drawer">
+  <div class="drawer-hdr">
+    <div style="display:flex;align-items:center;gap:8px;">
+      <div class="logo-box" style="width:28px;height:28px;">
+        <img src="/logo.png" alt="CNCVerse" style="width:28px;height:28px;border-radius:6px;object-fit:contain;" onerror="this.style.display='none'">
+      </div>
+      <span class="drawer-title">CNCVerse Bridge</span>
+    </div>
+    <button class="drawer-close" onclick="toggleDrawer(false)" title="Close Menu">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+    </button>
+  </div>
+  <div class="drawer-menu">
+    <div class="drawer-section-label">COMMUNITY &amp; SOURCES</div>
+    <button class="drawer-btn" onclick="openReposModal(); toggleDrawer(false);">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
+        <span>Installed Repositories</span>
+      </div>
+    </button>
+    <button class="drawer-btn" onclick="openCreditsModal(); toggleDrawer(false);">
+      <div style="display:flex;align-items:center;gap:10px;color:var(--accent);">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span>Developer Credits</span>
+      </div>
+    </button>
+    <a class="drawer-btn" href="https://t.me/cncverse" target="_blank" rel="noopener">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 0 0-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.95-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.36.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .38z"/></svg>
+        <span>Telegram Community</span>
+      </div>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+    </a>
+    <a class="drawer-btn" href="https://cncverse.pages.dev" target="_blank" rel="noopener">
+      <div style="display:flex;align-items:center;gap:10px;color:#f43f5e;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
+        <span style="font-weight:700;">Donate &amp; Support Goal</span>
+      </div>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+    </a>
+
+    <div class="drawer-section-label" style="margin-top:10px;">PREFERENCES &amp; TOOLS</div>
+    <button class="drawer-btn" onclick="toggleTheme();">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>
+        <span>Toggle Dark / Light</span>
+      </div>
+    </button>
+    <a class="drawer-btn" href="/admin" target="_blank" rel="noopener">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+        <span>Admin Panel</span>
+      </div>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+    </a>
+  </div>
+  <div style="margin-top:auto; font-size:11px; color:var(--text-dim); text-align:center; padding-top:12px; border-top:1px solid var(--border);">
+    <div>CNCVerse Bridge v2.5</div>
+    <div>Stremio Addon Gateway</div>
+  </div>
+</aside>
 
 <div class="toast" id="toast"></div>
 
 <script>
 "use strict";
 
+/* Theme Handling */
 function applyTheme(t) {
   document.documentElement.setAttribute("data-theme", t);
   localStorage.setItem("cnc_theme", t);
@@ -3147,76 +3923,687 @@ function toggleTheme() {
 }
 applyTheme(localStorage.getItem("cnc_theme") || "dark");
 
-function dismissAnnouncement() {
-  var el = document.getElementById("top-announcement");
-  if (el) {
-    el.style.opacity = "0";
-    setTimeout(function() { el.style.display = "none"; }, 200);
-    localStorage.setItem("cnc_announcement_dismissed", "1");
+/* Slide-Over Drawer */
+function toggleDrawer(open) {
+  var d = document.getElementById("drawer");
+  var b = document.getElementById("drawer-backdrop");
+  if (!d || !b) return;
+  if (open) {
+    d.classList.add("open");
+    b.classList.add("open");
+  } else {
+    d.classList.remove("open");
+    b.classList.remove("open");
   }
 }
-if (localStorage.getItem("cnc_announcement_dismissed") === "1") {
-  var ann = document.getElementById("top-announcement");
-  if (ann) ann.style.display = "none";
+
+/* Per-Plugin Catalog Toggle */
+function toggleCatalog(internalName) {
+  ensureProfileCustomized();
+  if (pData._dc.has(internalName)) {
+    pData._dc.delete(internalName);
+    toast("Catalog enabled for this source");
+  } else {
+    pData._dc.add(internalName);
+    toast("Catalog hidden (Streams active)");
+  }
+  saveProfileState();
 }
 
-var PK = "cnc_pid";
-var pid = localStorage.getItem(PK);
-if (!pid) {
-  pid = "p" + Math.random().toString(36).substr(2, 14) + Date.now().toString(36);
-  localStorage.setItem(PK, pid);
-}
-var pData = { disabledExtensions: [], enabledExtensions: [] };
-pData._d = new Set();
-pData._e = new Set();
+/* Profile & Storage */
+var pid = (function(){
+  var m = window.location.pathname.match(/\/u\/([^\/]+)/);
+  if (m && m[1]) {
+    localStorage.setItem("stremio_profile_id", m[1]);
+    localStorage.setItem("cnc_customized_" + m[1], "true");
+    return m[1];
+  }
+  var k = "stremio_profile_id";
+  var s = localStorage.getItem(k);
+  if (!s || s.length < 8) {
+    s = "p_" + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6);
+    localStorage.setItem(k, s);
+  }
+  return s;
+})();
+
 var exts = [];
 var repos = [];
-var currentFilter = "all";
-var activeTab = "overview";
+var pData = {
+  profileId: pid,
+  disabledExtensions: [],
+  enabledExtensions: [],
+  disableCatalogs: false,
+  disabledCatalogs: [],
+  _d: new Set(),
+  _e: new Set(),
+  _dc: new Set()
+};
 
-function switchTab(tab) {
-  activeTab = tab;
-  document.getElementById("nav-card-overview").classList.toggle("active", tab === "overview");
-  document.getElementById("nav-card-customize").classList.toggle("active", tab === "customize");
-  document.getElementById("panel-overview").classList.toggle("active", tab === "overview");
-  document.getElementById("panel-customize").classList.toggle("active", tab === "customize");
-  if (tab === "customize") {
-    var searchInput = document.getElementById("ext-search");
-    if (searchInput) searchInput.focus();
-    setTimeout(function() {
-      updatePresetsNav();
-    }, 20);
+var currentRepo = "";
+var currentType = "";
+var currentLang = "";
+var currentManifestUrl = "";
+
+var LANG_MAP = {
+  "en": "English",
+  "hi": "Hindi",
+  "ta": "Tamil",
+  "te": "Telugu",
+  "ml": "Malayalam",
+  "kn": "Kannada",
+  "bn": "Bengali",
+  "mr": "Marathi",
+  "es": "Spanish",
+  "fr": "French",
+  "de": "German",
+  "it": "Italian",
+  "pt": "Portuguese",
+  "ru": "Russian",
+  "ar": "Arabic",
+  "ja": "Japanese",
+  "ko": "Korean",
+  "zh": "Chinese",
+  "multi": "Multi",
+  "universal": "Universal"
+};
+
+/* Unified Mode Check */
+function isProfileCustomized() {
+  if (localStorage.getItem("cnc_customized_" + pid) === "true") return true;
+  if (pData._d.size > 0 || pData._e.size > 0 || pData._dc.size > 0 || pData.disableCatalogs) return true;
+  return false;
+}
+
+function markProfileCustomized() {
+  var wasCustom = isProfileCustomized();
+  localStorage.setItem("cnc_customized_" + pid, "true");
+  if (!wasCustom) {
+    toast("Switched to Personal Profile");
   }
 }
 
+function ensureProfileCustomized() {
+  if (!isProfileCustomized()) {
+    markProfileCustomized();
+    pData._d.clear();
+    pData._e.clear();
+    pData._dc.clear();
+  }
+}
+
+function isExtActive(e) {
+  if (!isProfileCustomized()) {
+    // Default Developer's Choice: all globally enabled extensions
+    return !!e.enabled;
+  }
+  if (e.enabled) {
+    return !pData._d.has(e.internalName);
+  } else {
+    return pData._e.has(e.internalName);
+  }
+}
+
+/* Numbered Order Map for Selected Indicators */
+function getActiveOrderMap() {
+  var activeList = exts.filter(function(e){ return isExtActive(e); });
+  var map = {};
+  for (var i = 0; i < activeList.length; i++) {
+    map[activeList[i].internalName] = i + 1;
+  }
+  return map;
+}
+
+/* URLs & Manifests (Permanent profile URL for seamless live sync) */
 function updateUrls() {
   var h = window.location.host;
   var proto = window.location.protocol;
-  var gUrl = proto + "//" + h + "/manifest.json";
-  var pUrl = proto + "//" + h + "/u/" + encodeURIComponent(pid) + "/manifest.json";
+  var isCustom = isProfileCustomized();
 
-  var gStremio = "stremio://" + h + "/manifest.json";
-  var pStremio = "stremio://" + h + "/u/" + encodeURIComponent(pid) + "/manifest.json";
+  var manifestPath = "/u/" + encodeURIComponent(pid) + "/manifest.json";
+  currentManifestUrl = proto + "//" + h + manifestPath;
+  var stremioUrl = currentManifestUrl.replace(/^https?:\/\//, "stremio://");
 
-  var gInp = document.getElementById("manifest-url-overview");
-  var pInp = document.getElementById("manifest-url-custom");
-  if (gInp) gInp.value = gUrl;
-  if (pInp) pInp.value = pUrl;
+  var installBtn = document.getElementById("install-btn");
+  if (installBtn) installBtn.href = stremioUrl;
 
-  var gBtn = document.getElementById("install-btn-overview");
-  var pBtn = document.getElementById("install-btn-custom");
-  if (gBtn) gBtn.href = gStremio;
-  if (pBtn) pBtn.href = pStremio;
+  var installBtnText = document.getElementById("install-btn-text");
+  if (installBtnText) {
+    installBtnText.textContent = isCustom ? "Install Personal Addon" : "Install CNCVerse Addon";
+  }
+
+  var webBtn = document.getElementById("drawer-web-btn");
+  if (webBtn) webBtn.href = "https://web.stremio.com/#/addons?addon=" + encodeURIComponent(currentManifestUrl);
+
+  var modeBadge = document.getElementById("addon-mode-badge");
+  var readyTitle = document.getElementById("install-ready-title");
+  var syncStatusText = document.getElementById("sync-status-text");
+  var statModeVal = document.getElementById("stat-mode-val");
+
+  if (modeBadge) {
+    if (isCustom) {
+      modeBadge.textContent = "Personal Profile";
+      modeBadge.style.color = "var(--green)";
+      modeBadge.style.background = "var(--green-bg)";
+      modeBadge.style.borderColor = "rgba(16,185,129,0.25)";
+    } else {
+      modeBadge.textContent = "Dev Choice (Default)";
+      modeBadge.style.color = "var(--accent)";
+      modeBadge.style.background = "var(--accent-glow)";
+      modeBadge.style.borderColor = "rgba(139,92,246,0.3)";
+    }
+  }
+  if (readyTitle) {
+    readyTitle.textContent = isCustom ? "Personal configuration ready." : "Developer's choice ready to install.";
+  }
+  if (syncStatusText) {
+    syncStatusText.textContent = isCustom ? "All changes auto-sync to your addon" : "Default configuration active (auto-sync enabled)";
+  }
+  if (statModeVal) {
+    statModeVal.innerHTML = isCustom ? "Saved &#10003;" : "Dev Choice";
+  }
 }
 
+function copyCurrentManifest(btn) {
+  var url = currentManifestUrl || (window.location.protocol + "//" + window.location.host + "/u/" + encodeURIComponent(pid) + "/manifest.json");
+
+  function onDone() {
+    if (btn) {
+      var lbl = btn.querySelector(".copy-lbl");
+      if (lbl) {
+        var orig = lbl.textContent;
+        lbl.textContent = "Copied!";
+        btn.style.color = "var(--green)";
+        btn.style.borderColor = "var(--green)";
+        setTimeout(function(){
+          lbl.textContent = orig;
+          btn.style.color = "";
+          btn.style.borderColor = "";
+        }, 1800);
+      }
+    }
+    toast(isProfileCustomized() ? "Copied Personal Addon URL!" : "Copied CNCVerse Addon URL!");
+  }
+
+  function fallbackCopy(url) {
+    var ta = document.createElement("textarea");
+    ta.value = url; ta.style.position = "fixed"; ta.style.opacity = "0";
+    document.body.appendChild(ta); ta.focus(); ta.select();
+    try { document.execCommand("copy"); onDone(); } catch(e) {}
+    document.body.removeChild(ta);
+  }
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(onDone).catch(function(){ fallbackCopy(url); });
+  } else {
+    fallbackCopy(url);
+  }
+}
+
+/* Feature 3: Positive Catalogs Toggle */
+function toggleEnableCatalogs(enable) {
+  ensureProfileCustomized();
+  pData.disableCatalogs = !enable;
+  updateCatalogStatusUI();
+  updateUrls();
+
+  fetch("/api/profile/" + encodeURIComponent(pid) + "/catalogs", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ disableCatalogs: !enable })
+  }).then(function(r){ return r.json(); })
+    .then(function(p){
+      pData.disableCatalogs = p.disableCatalogs || false;
+      updateCatalogStatusUI();
+      updateUrls();
+      toast(enable ? "Catalogs enabled in Stremio" : "Catalogs hidden (Streams Only mode)");
+    })
+    .catch(function(e){ toast("Error: " + e.message); });
+}
+
+function updateCatalogStatusUI() {
+  var chk = document.getElementById("chk-enable-catalogs");
+  if (chk) chk.checked = !pData.disableCatalogs;
+
+  var tag = document.getElementById("catalog-mode-tag");
+  if (tag) {
+    if (pData.disableCatalogs) {
+      tag.textContent = "Streams Only";
+      tag.style.background = "var(--amber-bg)";
+      tag.style.color = "var(--amber)";
+      tag.style.borderColor = "rgba(245, 158, 11, 0.25)";
+    } else {
+      tag.textContent = "Catalogs Active";
+      tag.style.background = "var(--green-bg)";
+      tag.style.color = "var(--green)";
+      tag.style.borderColor = "rgba(16, 185, 129, 0.25)";
+    }
+  }
+}
+
+/* Feature 4: Curated Presets */
+function applyPreset(preset, btn) {
+  if (preset === "dev_choice") {
+    resetToDevChoice();
+    return;
+  }
+
+  ensureProfileCustomized();
+
+  var targetInternals = [];
+
+  if (preset === "all") {
+    targetInternals = exts.map(function(e){ return e.internalName; });
+    toast("All sources enabled");
+  } else if (preset === "live_sports") {
+    targetInternals = exts.filter(function(e) {
+      var types = (e.types || []).join(" ").toLowerCase();
+      var n = (e.name + " " + e.internalName).toLowerCase();
+      return types.indexOf("live") >= 0 || n.indexOf("sport") >= 0 || n.indexOf("streamed") >= 0 || n.indexOf("daddy") >= 0;
+    }).map(function(e){ return e.internalName; });
+    toast("Live Sports applied");
+  } else if (preset === "live_tv") {
+    targetInternals = exts.filter(function(e) {
+      var types = (e.types || []).join(" ").toLowerCase();
+      return types.indexOf("tv") >= 0 || types.indexOf("live") >= 0;
+    }).map(function(e){ return e.internalName; });
+    toast("Live TV applied");
+  } else if (preset === "movies_tv") {
+    targetInternals = exts.filter(function(e) {
+      var types = (e.types || []).join(" ").toLowerCase();
+      return types.indexOf("movie") >= 0 || types.indexOf("series") >= 0;
+    }).map(function(e){ return e.internalName; });
+    toast("Movies & Series applied");
+  } else if (preset === "anime") {
+    targetInternals = exts.filter(function(e) {
+      var types = (e.types || []).join(" ").toLowerCase();
+      var n = (e.name + " " + e.internalName).toLowerCase();
+      return types.indexOf("anime") >= 0 || n.indexOf("anime") >= 0 || n.indexOf("gogo") >= 0 || n.indexOf("ani") >= 0;
+    }).map(function(e){ return e.internalName; });
+    toast("Anime applied");
+  }
+
+  pData._d.clear();
+  pData._e.clear();
+
+  exts.forEach(function(e){
+    var want = targetInternals.indexOf(e.internalName) >= 0;
+    if (e.enabled) {
+      if (!want) pData._d.add(e.internalName);
+    } else {
+      if (want) pData._e.add(e.internalName);
+    }
+  });
+
+  var buttons = document.querySelectorAll("#presets-row .preset-pill");
+  buttons.forEach(function(b){ b.classList.remove("active"); });
+  if (btn) btn.classList.add("active");
+
+  saveProfileState();
+}
+
+function resetToDevChoice() {
+  localStorage.removeItem("cnc_customized_" + pid);
+  pData._d.clear();
+  pData._e.clear();
+  pData._dc.clear();
+  pData.disableCatalogs = false;
+
+  var buttons = document.querySelectorAll("#presets-row .preset-pill");
+  buttons.forEach(function(b){ b.classList.remove("active"); });
+  var devBtn = document.querySelector('[data-preset="dev_choice"]');
+  currentRepo = "";
+  currentType = "";
+  currentLang = "";
+  var rSel = document.getElementById("repo-filter"); if (rSel) rSel.value = "";
+  var tSel = document.getElementById("type-filter"); if (tSel) tSel.value = "";
+  var lSel = document.getElementById("lang-filter"); if (lSel) lSel.value = "";
+  var sInp = document.getElementById("ext-search"); if (sInp) sInp.value = "";
+
+  updateCatalogStatusUI();
+  updateMetrics();
+  renderCards();
+  updateUrls();
+
+  toast("Reset to Developer's Choice");
+
+  // Clear profile overrides on server
+  fetch("/api/profile/" + encodeURIComponent(pid) + "/set", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ disabledExtensions: [], enabledExtensions: [], disabledCatalogs: [], disableCatalogs: false })
+  }).catch(function(){});
+}
+
+function onRepoFilterChange(val) {
+  currentRepo = val || "";
+  renderCards();
+}
+
+function onTypeFilterChange(val) {
+  currentType = val || "";
+  renderCards();
+}
+
+function onLangFilterChange(val) {
+  currentLang = val || "";
+  renderCards();
+}
+
+function setAll(enable) {
+  ensureProfileCustomized();
+  var matching = getFilteredExtensions();
+  matching.forEach(function(e){
+    if (enable) {
+      pData._d.delete(e.internalName);
+      if (!e.enabled) pData._e.add(e.internalName);
+    } else {
+      pData._e.delete(e.internalName);
+      if (e.enabled) pData._d.add(e.internalName);
+    }
+  });
+  var devBtn = document.querySelector('[data-preset="dev_choice"]');
+  if (devBtn) devBtn.classList.remove("active");
+  toast(enable ? ("Enabled " + matching.length + " sources") : ("Cleared " + matching.length + " sources"));
+  saveProfileState();
+}
+
+function toggleSelectAll() {
+  var matching = getFilteredExtensions();
+  if (!matching.length) return;
+  var allSelected = matching.every(function(e){ return isExtActive(e); });
+  setAll(!allSelected);
+}
+
+function toggleCard(name) {
+  name = decodeURIComponent(name.replace(/%27/g, "'"));
+  var ext = exts.find(function(e){ return e.internalName === name; });
+  if (!ext) return;
+
+  ensureProfileCustomized();
+
+  var willBeActive = !isExtActive(ext);
+  if (ext.enabled) {
+    if (willBeActive) pData._d.delete(name); else pData._d.add(name);
+  } else {
+    if (willBeActive) pData._e.add(name); else pData._e.delete(name);
+  }
+
+  var devBtn = document.querySelector('[data-preset="dev_choice"]');
+  if (devBtn) devBtn.classList.remove("active");
+
+  renderCards();
+  updateMetrics();
+  updateUrls();
+  saveProfileDebounced();
+}
+
+var saveTimer = null;
+function saveProfileDebounced() {
+  if (saveTimer) clearTimeout(saveTimer);
+  saveTimer = setTimeout(function(){ saveProfileState(); }, 350);
+}
+
+function saveProfileState() {
+  updateMetrics();
+  renderCards();
+  updateUrls();
+
+  var payload = {
+    disabledExtensions: Array.from(pData._d),
+    enabledExtensions: Array.from(pData._e),
+    disabledCatalogs: Array.from(pData._dc),
+    disableCatalogs: pData.disableCatalogs
+  };
+
+  fetch("/api/profile/" + encodeURIComponent(pid) + "/set", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  }).then(function(r){ return r.json(); })
+    .then(function(p){
+      pData.disabledExtensions = p.disabledExtensions || [];
+      pData.enabledExtensions = p.enabledExtensions || [];
+      pData.disabledCatalogs = p.disabledCatalogs || [];
+      pData._d = new Set(pData.disabledExtensions);
+      pData._e = new Set(pData.enabledExtensions);
+      pData._dc = new Set(pData.disabledCatalogs);
+      pData.disableCatalogs = p.disableCatalogs || false;
+      updateMetrics();
+      renderCards();
+      updateUrls();
+    })
+    .catch(function(e){ toast("Sync error: " + e.message); });
+}
+
+function getFilteredExtensions() {
+  var q = (document.getElementById("ext-search") ? document.getElementById("ext-search").value : "").trim().toLowerCase();
+
+  return exts.filter(function(e){
+    if (q) {
+      var n = (e.name || "").toLowerCase();
+      var iname = (e.internalName || "").toLowerCase();
+      var r = (e.repoName || "").toLowerCase();
+      var l = (e.lang || "").toLowerCase();
+      var lname = (LANG_MAP[l] || "").toLowerCase();
+      var types = (e.types || []).join(" ").toLowerCase();
+
+      var match = (n.indexOf(q) >= 0) || (iname.indexOf(q) >= 0) || (r.indexOf(q) >= 0) || (l.indexOf(q) >= 0) || (lname.indexOf(q) >= 0) || (types.indexOf(q) >= 0);
+      if (!match) return false;
+    }
+
+    if (currentRepo) {
+      if (e.repoName !== currentRepo && e.repoUrl !== currentRepo) return false;
+    }
+
+    if (currentType) {
+      var hasType = (e.types || []).some(function(t){ return (t||"").toLowerCase() === currentType.toLowerCase(); });
+      if (!hasType) return false;
+    }
+
+    if (currentLang) {
+      var eLang = (e.lang || "en").toLowerCase();
+      if (eLang !== currentLang.toLowerCase()) return false;
+    }
+
+    return true;
+  });
+}
+
+/* Feature 6: Render Cards Matching pengu.uk 2-column cards */
+function renderCards() {
+  var custEl = document.getElementById("sources-grid");
+  if (!custEl) return;
+
+  var filtered = getFilteredExtensions();
+  var orderMap = getActiveOrderMap();
+  updateMetrics();
+
+  if (!filtered.length) {
+    custEl.innerHTML = '<div class="empty">No providers match your search or filter.</div>';
+    return;
+  }
+
+  custEl.innerHTML = filtered.map(function(e){
+    var isSelected = isExtActive(e);
+
+    // metadata text (e.g. 4K · Movies, Series · Repo · Lang)
+    var parts = [];
+    parts.push('<span class="p-res-highlight">4K</span>');
+    if (e.types && e.types.length) {
+      parts.push('<span class="p-types-badge">' + esc(e.types.join(", ")) + '</span>');
+    }
+    if (e.repoName) {
+      parts.push('<span class="p-repo-badge">' + esc(e.repoName) + '</span>');
+    }
+    var langStr = (e.lang || "en").toUpperCase();
+    parts.push('<span class="p-lang-badge">' + esc(langStr) + '</span>');
+    if (!e.enabled) {
+      parts.push('<span style="color:var(--amber); font-weight:700;">Off</span>');
+    }
+
+    var orderNum = isSelected ? (orderMap[e.internalName] || "&#10003;") : "";
+    var checkHtml = isSelected
+      ? ('<div class="p-chk-circle">' + orderNum + '</div>')
+      : '<div class="p-chk-circle"></div>';
+
+    var catBadge = "";
+    if (isSelected) {
+      if (pData.disableCatalogs) {
+        catBadge = '<span class="p-cat-pill disabled" title="All catalogs are globally disabled">CAT OFF</span>';
+      } else if (pData._dc.has(e.internalName)) {
+        catBadge = '<button type="button" class="p-cat-pill off" onclick="event.stopPropagation(); toggleCatalog(\'' + esc(e.internalName).replace(/\'/g, "%27") + '\')" title="Catalog hidden from Stremio. Click to enable.">CAT OFF</button>';
+      } else {
+        catBadge = '<button type="button" class="p-cat-pill on" onclick="event.stopPropagation(); toggleCatalog(\'' + esc(e.internalName).replace(/\'/g, "%27") + '\')" title="Catalog active in Stremio. Click to hide.">CAT ON</button>';
+      }
+    }
+
+    var rightHtml = '<div class="p-top-right">' + catBadge + checkHtml + '</div>';
+
+    var iconHtml = e.iconUrl
+      ? '<img class="p-icon" src="' + esc(e.iconUrl) + '" alt="" onerror="this.style.display=\'none\'">'
+      : '<span class="p-icon-letter">' + esc((e.name||"?").charAt(0).toUpperCase()) + '</span>';
+
+    return '<div class="p-card ' + (isSelected ? "selected" : "") + '" onclick="toggleCard(\'' + esc(e.internalName).replace(/\'/g, "%27") + '\')">' +
+      '<div class="p-card-icon-col">' + iconHtml + '</div>' +
+      '<div class="p-card-info-col">' +
+        '<div class="p-top-line">' +
+          '<span class="p-name" title="' + esc(e.name) + '">' + esc(e.name) + '</span>' +
+          rightHtml +
+        '</div>' +
+        '<div class="p-meta-line">' + parts.join(" &middot; ") + '</div>' +
+        (e.description ? '<div class="p-desc-line">' + esc(e.description) + '</div>' : '') +
+      '</div>' +
+    '</div>';
+  }).join("");
+}
+
+function populateDropdownFilters() {
+  // Repo Dropdown
+  var repoSelect = document.getElementById("repo-filter");
+  if (repoSelect && document.activeElement !== repoSelect) {
+    var repoMap = {};
+    exts.forEach(function(e){
+      var r = e.repoName || "Installed";
+      repoMap[r] = (repoMap[r] || 0) + 1;
+    });
+
+    var totalRepoCount = (repos && repos.length) ? repos.length : Object.keys(repoMap).length;
+    var rHtml = '<option value="">All Repositories (' + totalRepoCount + ' repos &middot; ' + exts.length + ' sources)</option>';
+    Object.keys(repoMap).sort().forEach(function(r){
+      var sel = (currentRepo === r) ? ' selected' : '';
+      rHtml += '<option value="' + esc(r) + '"' + sel + '>' + esc(r) + ' (' + repoMap[r] + ' sources)</option>';
+    });
+    if (repoSelect.innerHTML !== rHtml) repoSelect.innerHTML = rHtml;
+  }
+
+  // Type / Category Dropdown
+  var typeSelect = document.getElementById("type-filter");
+  if (typeSelect && document.activeElement !== typeSelect) {
+    var typeMap = {};
+    exts.forEach(function(e){
+      (e.types || []).forEach(function(t){
+        if (t) typeMap[t] = (typeMap[t] || 0) + 1;
+      });
+    });
+
+    var totalTypeCount = Object.keys(typeMap).length;
+    var tHtml = '<option value="">All Content Types (' + totalTypeCount + ' types)</option>';
+    Object.keys(typeMap).sort().forEach(function(t){
+      var sel = (currentType === t) ? ' selected' : '';
+      tHtml += '<option value="' + esc(t) + '"' + sel + '>' + esc(t) + ' (' + typeMap[t] + ' sources)</option>';
+    });
+    if (typeSelect.innerHTML !== tHtml) typeSelect.innerHTML = tHtml;
+  }
+
+  // Lang Dropdown
+  var langSelect = document.getElementById("lang-filter");
+  if (langSelect && document.activeElement !== langSelect) {
+    var langMap = {};
+    exts.forEach(function(e){
+      var l = (e.lang || "en").toLowerCase();
+      langMap[l] = (langMap[l] || 0) + 1;
+    });
+
+    var totalLangCount = Object.keys(langMap).length;
+    var lHtml = '<option value="">All Languages (' + totalLangCount + ')</option>';
+    Object.keys(langMap).sort().forEach(function(l){
+      var sel = (currentLang === l) ? ' selected' : '';
+      var disp = LANG_MAP[l] || l.toUpperCase();
+      lHtml += '<option value="' + esc(l) + '"' + sel + '>' + esc(disp) + ' (' + langMap[l] + ' sources)</option>';
+    });
+    if (langSelect.innerHTML !== lHtml) langSelect.innerHTML = lHtml;
+  }
+}
+
+function scrollToSources() {
+  var el = document.getElementById("sources-section");
+  if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function updateMetrics() {
+  var activeCount = exts.filter(function(e){ return isExtActive(e); }).length;
+  var totalSources = exts.length;
+
+  var repoMap = {};
+  exts.forEach(function(e){
+    var r = e.repoName || "Installed";
+    repoMap[r] = true;
+  });
+  var totalRepos = (repos && repos.length) ? repos.length : Object.keys(repoMap).length;
+
+  // Top stat cards
+  var reposStat = document.getElementById("st-repos-count");
+  if (reposStat) reposStat.textContent = totalRepos;
+
+  var streamCount = document.getElementById("st-stream-count");
+  if (streamCount) streamCount.textContent = activeCount;
+
+  var totalCount = document.getElementById("st-total-count");
+  if (totalCount) totalCount.textContent = totalSources + " available";
+
+  // Selected Action Button
+  var btnSelCount = document.getElementById("btn-selected-count");
+  if (btnSelCount) btnSelCount.textContent = activeCount;
+
+  var btnSelectAll = document.getElementById("btn-select-all");
+  if (btnSelectAll) {
+    if (activeCount === totalSources && totalSources > 0) {
+      btnSelectAll.classList.add("all-active");
+    } else {
+      btnSelectAll.classList.remove("all-active");
+    }
+  }
+
+  // Providers Card Top Line
+  var countLabel = document.getElementById("providers-count-label");
+  if (countLabel) {
+    countLabel.textContent = activeCount + " of " + totalSources + " active";
+  }
+
+  var countPill = document.getElementById("providers-count-pill");
+  if (countPill) {
+    if (activeCount === 0) {
+      countPill.style.color = "var(--text-dim)";
+      countPill.style.background = "var(--surface-active)";
+      countPill.style.borderColor = "var(--border)";
+    } else {
+      countPill.style.color = "var(--green)";
+      countPill.style.background = "var(--green-bg)";
+      countPill.style.borderColor = "rgba(16, 185, 129, 0.25)";
+    }
+  }
+}
+
+/* Data Loaders */
 function loadExts() {
   fetch("/api/extensions")
     .then(function(r){ if(!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
     .then(function(data){
       exts = data || [];
+      populateDropdownFilters();
       updateMetrics();
-      renderFilterChips();
       renderCards();
+      updateUrls();
     })
     .catch(function(){});
 }
@@ -3226,9 +4613,12 @@ function loadRepos() {
     .then(function(r){ if(!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
     .then(function(data){
       repos = data || [];
-      document.getElementById("hdr-repo-count").textContent = repos.length;
-      document.getElementById("st-repo-count").textContent = repos.length;
-      renderReposModal();
+      populateDropdownFilters();
+      updateMetrics();
+      var m = document.getElementById("credits-modal");
+      if (m && m.classList.contains("open")) {
+        renderCreditsModal();
+      }
     })
     .catch(function(){});
 }
@@ -3237,583 +4627,362 @@ function loadProfile() {
   fetch("/api/profile/" + encodeURIComponent(pid))
     .then(function(r){ if(!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
     .then(function(p){
-      pData = p;
-      pData._d = new Set(p.disabledExtensions || []);
-      pData._e = new Set(p.enabledExtensions || []);
-      pData._loaded = true;
+      pData.profileId = pid;
+      pData.disabledExtensions = p.disabledExtensions || [];
+      pData.enabledExtensions = p.enabledExtensions || [];
+      pData.disabledCatalogs = p.disabledCatalogs || [];
+      pData._d = new Set(pData.disabledExtensions);
+      pData._e = new Set(pData.enabledExtensions);
+      pData._dc = new Set(pData.disabledCatalogs);
+      pData.allowedResolutions = p.allowedResolutions || [];
+      pData.excludeCam = p.excludeCam || false;
+      pData.maxStreamsPerResolution = p.maxStreamsPerResolution || 0;
+
+      applyQualityPreferences(p);
+
+      if (pData._d.size > 0 || pData._e.size > 0 || pData._dc.size > 0 || pData.disableCatalogs) {
+        localStorage.setItem("cnc_customized_" + pid, "true");
+        var devBtn = document.querySelector('[data-preset="dev_choice"]');
+        if (devBtn) devBtn.classList.remove("active");
+      }
+
+      updateCatalogStatusUI();
       updateMetrics();
       renderCards();
+      updateUrls();
     })
     .catch(function(){});
 }
 
-function isExtActiveInProfile(e) {
-  if (e.enabled) {
-    return !pData._d.has(e.internalName);
+function applyQualityPreferences(p) {
+  var allowed = p.allowedResolutions || [];
+  ['2160p', '1080p', '720p', '480p', '360p'].forEach(function(res) {
+    var cb = document.getElementById('q-' + res);
+    if (cb) {
+      cb.checked = (allowed.length === 0) || (allowed.indexOf(res) !== -1);
+    }
+  });
+  var camCb = document.getElementById('q-exclude-cam');
+  if (camCb) camCb.checked = (p.excludeCam !== false);
+  var maxSel = document.getElementById('sel-max-streams');
+  if (maxSel) maxSel.value = String(p.maxStreamsPerResolution || 0);
+  updateQualityBadge();
+}
+
+function updateQualityBadge() {
+  var allowed = [];
+  ['2160p', '1080p', '720p', '480p', '360p'].forEach(function(res) {
+    var cb = document.getElementById('q-' + res);
+    if (cb && cb.checked) allowed.push(res);
+  });
+  var tag = document.getElementById('quality-filter-tag');
+  if (!tag) return;
+  if (allowed.length === 5) {
+    tag.textContent = "All Qualities";
+    tag.style.background = "var(--green-bg)";
+    tag.style.color = "var(--green)";
+    tag.style.borderColor = "rgba(16,185,129,0.25)";
+  } else if (allowed.length === 0) {
+    tag.textContent = "None Selected";
+    tag.style.background = "var(--red-bg)";
+    tag.style.color = "var(--red)";
+    tag.style.borderColor = "rgba(244,63,94,0.25)";
   } else {
-    return pData._e.has(e.internalName);
+    tag.textContent = allowed.join(', ');
+    tag.style.background = "var(--cyan-bg)";
+    tag.style.color = "var(--cyan)";
+    tag.style.borderColor = "rgba(6,182,212,0.25)";
   }
 }
 
-function updateMetrics() {
-  var globalCount = exts.filter(function(e){ return e.enabled; }).length;
-  var customCount = exts.filter(function(e){ return isExtActiveInProfile(e); }).length;
-
-  var stExt = document.getElementById("st-ext-count");
-  if (stExt) stExt.textContent = globalCount;
-
-  var ovBadge = document.getElementById("overview-ext-count");
-  if (ovBadge) ovBadge.textContent = globalCount;
-
-  var customBadge = document.getElementById("custom-active-count");
-  if (customBadge) customBadge.textContent = customCount + " of " + exts.length + " Sources Active";
-}
-
-function getExtTypes(e) {
-  var result = [];
-  var rawList = e.types || [];
-  for (var i = 0; i < rawList.length; i++) {
-    var raw = rawList[i];
-    if (!raw) continue;
-    var parts = String(raw).split(",");
-    for (var j = 0; j < parts.length; j++) {
-      var t = parts[j].trim();
-      if (t && t !== "All" && result.indexOf(t) < 0) {
-        result.push(t);
-      }
-    }
-  }
-  if (result.length === 0) {
-    result.push("Others");
-  }
-  return result;
-}
-
-function getAvailableTypes() {
-  var set = new Set();
-  for (var i = 0; i < exts.length; i++) {
-    var types = getExtTypes(exts[i]);
-    for (var j = 0; j < types.length; j++) {
-      set.add(types[j]);
-    }
-  }
-  return set;
-}
-
-var PREFERRED_ORDER = [
-  "Movie", "TvSeries", "Anime", "AnimeMovie", "Live", "AsianDrama",
-  "Cartoon", "Documentary", "OVA", "Torrent", "Music", "Audio", "NSFW", "Others"
-];
-
-var TYPE_LABELS = {
-  "Movie": "Movies",
-  "TvSeries": "Series",
-  "Anime": "Anime",
-  "AnimeMovie": "Anime Movie",
-  "Live": "Live TV",
-  "AsianDrama": "Asian Drama",
-  "Cartoon": "Cartoons",
-  "Documentary": "Documentary",
-  "OVA": "OVA",
-  "Torrent": "Torrents",
-  "Music": "Music",
-  "Audio": "Audio",
-  "NSFW": "NSFW",
-  "Others": "Others"
-};
-
-function renderFilterChips() {
-  var row = document.getElementById("presets-row");
-  if (!row) return;
-
-  var available = getAvailableTypes();
-  if (currentFilter !== "all" && !available.has(currentFilter)) {
-    currentFilter = "all";
-  }
-
-  var ordered = [];
-  for (var k = 0; k < PREFERRED_ORDER.length; k++) {
-    var pt = PREFERRED_ORDER[k];
-    if (available.has(pt)) {
-      ordered.push(pt);
-      available.delete(pt);
-    }
-  }
-  var remaining = Array.from(available).sort();
-  for (var r = 0; r < remaining.length; r++) {
-    ordered.push(remaining[r]);
-  }
-
-  var html = '<button class="preset-btn' + (currentFilter === "all" ? " active" : "") + '" data-filter="all" onclick="applyFilter(\'all\', this)">All Sources</button>';
-
-  for (var i = 0; i < ordered.length; i++) {
-    var t = ordered[i];
-    var label = TYPE_LABELS[t] || t;
-    var isActive = (currentFilter === t);
-    html += '<button class="preset-btn' + (isActive ? " active" : "") + '" data-filter="' + esc(t) + '" onclick="applyFilter(\'' + esc(t) + '\', this)">' + esc(label) + '</button>';
-  }
-
-  if (row.innerHTML !== html) {
-    var prevScroll = row.scrollLeft;
-    row.innerHTML = html;
-    row.scrollLeft = prevScroll;
-  }
-  initPresetsDrag();
-  updatePresetsNav();
-}
-
-function applyFilter(f, btn) {
-  currentFilter = f;
-  var btns = document.querySelectorAll(".preset-btn");
-  var activeBtn = null;
-  for (var i = 0; i < btns.length; i++) btns[i].classList.remove("active");
-  if (btn) {
-    btn.classList.add("active");
-    activeBtn = btn;
-  } else {
-    for (var j = 0; j < btns.length; j++) {
-      if (btns[j].getAttribute("data-filter") === f) {
-        btns[j].classList.add("active");
-        activeBtn = btns[j];
-      }
-    }
-  }
-  if (activeBtn && activeBtn.scrollIntoView) {
-    activeBtn.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
-  }
-  updatePresetsNav();
-  renderCards();
-}
-
-function scrollPresets(dir) {
-  var row = document.getElementById("presets-row");
-  if (!row) return;
-  row.scrollBy({ left: dir * 220, behavior: "smooth" });
-  setTimeout(updatePresetsNav, 320);
-}
-
-function updatePresetsNav() {
-  var row = document.getElementById("presets-row");
-  var prev = document.getElementById("presets-prev");
-  var next = document.getElementById("presets-next");
-  if (!row || !prev || !next) return;
-  if (row.clientWidth === 0) return;
-  var maxScroll = row.scrollWidth - row.clientWidth;
-  if (maxScroll <= 2) {
-    prev.style.display = "none";
-    next.style.display = "none";
-    return;
-  }
-  prev.style.display = (row.scrollLeft > 4) ? "flex" : "none";
-  next.style.display = (row.scrollLeft < maxScroll - 4) ? "flex" : "none";
-}
-
-function initPresetsDrag() {
-  var row = document.getElementById("presets-row");
-  if (!row || row._dragInited) return;
-  row._dragInited = true;
-
-  var isDown = false;
-  var startX = 0;
-  var scrollLeft = 0;
-  var hasMoved = false;
-
-  row.addEventListener("mousedown", function(e) {
-    if (e.button !== 0) return;
-    isDown = true;
-    hasMoved = false;
-    startX = e.pageX - row.offsetLeft;
-    scrollLeft = row.scrollLeft;
-    row.classList.add("grabbing");
+function onQualityChange() {
+  var allowed = [];
+  ['2160p', '1080p', '720p', '480p', '360p'].forEach(function(res) {
+    var cb = document.getElementById('q-' + res);
+    if (cb && cb.checked) allowed.push(res);
   });
+  var excludeCam = document.getElementById('q-exclude-cam') ? document.getElementById('q-exclude-cam').checked : false;
+  var maxStreams = parseInt(document.getElementById('sel-max-streams') ? document.getElementById('sel-max-streams').value : '0', 10);
 
-  window.addEventListener("mouseup", function() {
-    if (isDown) {
-      isDown = false;
-      row.classList.remove("grabbing");
-      setTimeout(function() { hasMoved = false; }, 60);
-    }
-  });
+  updateQualityBadge();
 
-  window.addEventListener("mousemove", function(e) {
-    if (!isDown) return;
-    var x = e.pageX - row.offsetLeft;
-    var walk = (x - startX);
-    if (Math.abs(walk) > 4) {
-      hasMoved = true;
-    }
-    if (hasMoved) {
-      e.preventDefault();
-      row.scrollLeft = scrollLeft - walk;
-      updatePresetsNav();
-    }
-  });
-
-  row.addEventListener("dragstart", function(e) {
-    e.preventDefault();
-  });
-
-  row.addEventListener("click", function(e) {
-    if (hasMoved) {
-      e.preventDefault();
-      e.stopPropagation();
-      hasMoved = false;
-    }
-  }, true);
-
-  row.addEventListener("wheel", function(e) {
-    if (e.deltaY !== 0) {
-      var maxScroll = row.scrollWidth - row.clientWidth;
-      if (maxScroll > 0) {
-        var canScroll = (e.deltaY > 0 && row.scrollLeft < maxScroll - 1) || (e.deltaY < 0 && row.scrollLeft > 1);
-        if (canScroll) {
-          e.preventDefault();
-          row.scrollLeft += (e.deltaY * 0.9);
-          updatePresetsNav();
-        }
-      }
-    }
-  }, { passive: false });
-
-  row.addEventListener("scroll", updatePresetsNav);
-  window.addEventListener("resize", updatePresetsNav);
-}
-
-function renderCards() {
-  var q = (document.getElementById("ext-search") ? document.getElementById("ext-search").value : "").toLowerCase().trim();
-
-  // 1. Overview Grid (Globally enabled only)
-  var ovEl = document.getElementById("overview-grid");
-  if (ovEl) {
-    var ovExts = exts.filter(function(e){ return e.enabled; });
-    if (!ovExts.length) {
-      ovEl.innerHTML = '<div class="empty">No extensions enabled globally.</div>';
-    } else {
-      ovEl.innerHTML = ovExts.map(function(e){
-        var initial = (e.name || "?").charAt(0).toUpperCase();
-        var iconHtml = e.iconUrl
-          ? '<img class="p-icon-img" src="' + esc(e.iconUrl) + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" alt=""><div class="p-avatar" style="display:none">' + esc(initial) + '</div>'
-          : '<div class="p-avatar">' + esc(initial) + '</div>';
-
-        var typeBadges = getExtTypes(e).map(function(t){
-          return '<span class="p-type-tag">' + esc(TYPE_LABELS[t] || t) + '</span>';
-        }).join("");
-
-        return '<div class="overview-source-card" onclick="switchTab(\'customize\')">' +
-          '<div class="p-top-row">' +
-            iconHtml +
-            '<span class="oc-status-pill"><span class="status-dot"></span>Active</span>' +
-          '</div>' +
-          '<div class="p-main-info">' +
-            '<div class="p-name" title="' + esc(e.name) + '">' + esc(e.name) + '</div>' +
-            '<div class="p-repo">' + esc(e.repoName || "Installed") + '</div>' +
-          '</div>' +
-          '<div class="p-badges-row">' + typeBadges + '</div>' +
-          (e.description ? '<div class="p-desc">' + esc(e.description) + '</div>' : '') +
-        '</div>';
-      }).join("");
-    }
-  }
-
-  // 2. Customize Grid (Interactive with checkboxes)
-  var custEl = document.getElementById("sources-grid");
-  if (custEl) {
-    var filtered = exts.filter(function(e){
-      if (q) {
-        var matchName = (e.name || "").toLowerCase().indexOf(q) >= 0;
-        var matchRepo = (e.repoName || "").toLowerCase().indexOf(q) >= 0;
-        var matchDesc = (e.description || "").toLowerCase().indexOf(q) >= 0;
-        if (!matchName && !matchRepo && !matchDesc) return false;
-      }
-      if (currentFilter !== "all") {
-        var types = getExtTypes(e);
-        if (types.indexOf(currentFilter) < 0) return false;
-      }
-      return true;
-    });
-
-    if (!filtered.length) {
-      custEl.innerHTML = '<div class="empty">No extensions match your filter.</div>';
-    } else {
-      custEl.innerHTML = filtered.map(function(e){
-        var isSelected = isExtActiveInProfile(e);
-        var initial = (e.name || "?").charAt(0).toUpperCase();
-
-        var iconHtml = e.iconUrl
-          ? '<img class="p-icon-img" src="' + esc(e.iconUrl) + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" alt=""><div class="p-avatar" style="display:none">' + esc(initial) + '</div>'
-          : '<div class="p-avatar">' + esc(initial) + '</div>';
-
-        var chkHtml = '<div class="chk"><svg class="chk-svg" width="10" height="8" viewBox="0 0 10 8" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M1 4.2L3.5 6.7L9 1.2"/></svg></div>';
-
-        var typeBadges = getExtTypes(e).map(function(t){
-          return '<span class="p-type-tag">' + esc(TYPE_LABELS[t] || t) + '</span>';
-        }).join("");
-
-        var goffBadge = !e.enabled ? '<span class="p-tag-goff">Global Off</span>' : '';
-
-        return '<div class="provider-card ' + (isSelected ? "selected" : "") + '" onclick="toggleCard(\'' + esc(e.internalName).replace(/\'/g, "%27") + '\')">' +
-          '<div class="p-top-row">' +
-            iconHtml +
-            chkHtml +
-          '</div>' +
-          '<div class="p-main-info">' +
-            '<div class="p-name" title="' + esc(e.name) + '">' + esc(e.name) + '</div>' +
-            '<div class="p-repo">' + esc(e.repoName || "Installed") + '</div>' +
-          '</div>' +
-          '<div class="p-badges-row">' + typeBadges + goffBadge + '</div>' +
-          (e.description ? '<div class="p-desc">' + esc(e.description) + '</div>' : '') +
-        '</div>';
-      }).join("");
-    }
-  }
-}
-
-function toggleCard(name) {
-  name = decodeURIComponent(name.replace(/%27/g, "'"));
-  var ext = exts.find(function(e){ return e.internalName === name; });
-  if (!ext) return;
-
-  var willBeActive = !isExtActiveInProfile(ext);
-  if (ext.enabled) {
-    if (willBeActive) pData._d.delete(name); else pData._d.add(name);
-  } else {
-    if (willBeActive) pData._e.add(name); else pData._e.delete(name);
-  }
-
-  updateMetrics();
-  renderCards();
-  toast(ext.name + (willBeActive ? " added to" : " removed from") + " your profile");
-
-  fetch("/api/profile/" + encodeURIComponent(pid) + "/toggle", {
+  fetch("/api/profile/" + encodeURIComponent(pid) + "/quality", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ internalName: name })
+    body: JSON.stringify({
+      allowedResolutions: allowed,
+      excludeCam: excludeCam,
+      maxStreamsPerResolution: maxStreams
+    })
   }).then(function(r){ return r.json(); })
     .then(function(p){
-      pData = p;
-      pData._d = new Set(p.disabledExtensions || []);
-      pData._e = new Set(p.enabledExtensions || []);
-      updateMetrics();
-      renderCards();
+      pData.allowedResolutions = p.allowedResolutions || [];
+      pData.excludeCam = p.excludeCam || false;
+      pData.maxStreamsPerResolution = p.maxStreamsPerResolution || 0;
+      updateUrls();
+    }).catch(function(e){ console.error("Quality save error", e); });
+}
+
+function loadStats() {
+  fetch("/api/community-stats")
+    .then(function(r){ if(!r.ok) throw new Error("Proxy error"); return r.json(); })
+    .catch(function(){ return fetch("https://cncverse.pages.dev/api/stats").then(function(r){ return r.json(); }); })
+    .then(function(data){
+      if (!data) return;
+      var numRaised = (data.totalUsd !== undefined && data.totalUsd !== null) ? Number(data.totalUsd) :
+                      ((data.total_raised !== undefined && data.total_raised !== null) ? Number(data.total_raised) :
+                      ((data.totalRaised !== undefined && data.totalRaised !== null) ? Number(data.totalRaised) : 0));
+      var numTarget = (data.targetGoalUsd !== undefined && data.targetGoalUsd !== null) ? Number(data.targetGoalUsd) :
+                      ((data.monthly_target !== undefined && data.monthly_target !== null) ? Number(data.monthly_target) :
+                      ((data.monthlyTarget !== undefined && data.monthlyTarget !== null) ? Number(data.monthlyTarget) : 100));
+      var pct = (data.percent !== undefined && data.percent !== null) ? Math.round(Number(data.percent)) :
+                (numTarget > 0 ? Math.round((numRaised / numTarget) * 100) : 0);
+      var raisedStr = (numRaised % 1 === 0) ? numRaised.toString() : numRaised.toFixed(2);
+      var targetStr = (numTarget % 1 === 0) ? numTarget.toString() : numTarget.toFixed(2);
+      var dollar = String.fromCharCode(36);
+
+      var pctEl = document.getElementById("goal-pct");
+      if (pctEl) pctEl.textContent = pct + "%";
+
+      var textEl = document.getElementById("goal-text");
+      if (textEl) textEl.innerHTML = dollar + raisedStr + " raised of " + dollar + targetStr + " goal";
+
+      var fillEl = document.getElementById("goal-fill");
+      if (fillEl) fillEl.style.width = Math.min(100, Math.max(0, pct)) + "%";
     })
-    .catch(function(e){ toast("Error: " + e.message); });
+    .catch(function(){});
 }
 
-function setAll(on) {
-  // When a chip filter is active, scope to only those extensions that match it.
-  var scope = currentFilter === "all"
-    ? exts
-    : exts.filter(function(e) {
-        return getExtTypes(e).indexOf(currentFilter) >= 0;
-      });
-
-  var dis = [], en = [];
-  scope.forEach(function(e) {
-    if (!e.enabled) {
-      if (on) en.push(e.internalName);
-    } else {
-      if (!on) dis.push(e.internalName);
-    }
-  });
-
-  // Merge the scoped change into the existing profile state instead of wiping it.
-  if (on) {
-    en.forEach(function(n) { pData._e.add(n); });
-    // Restore any that were manually disabled within this scope.
-    scope.forEach(function(e) { pData._d.delete(e.internalName); });
-  } else {
-    dis.forEach(function(n) { pData._d.add(n); });
-    // Remove any manual enables within this scope.
-    scope.forEach(function(e) { pData._e.delete(e.internalName); });
-  }
-
-  var label = currentFilter === "all" ? "All" : (TYPE_LABELS[currentFilter] || currentFilter);
-  updateMetrics();
-  renderCards();
-  toast(on ? (label + " extensions enabled") : (label + " extensions cleared from profile"));
-
-  var allDis = Array.from(pData._d);
-  var allEn  = Array.from(pData._e);
-  fetch("/api/profile/" + encodeURIComponent(pid) + "/set", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ disabledExtensions: allDis, enabledExtensions: allEn })
-  }).then(function(r){ return r.json(); })
-    .then(function(p){
-      pData = p;
-      pData._d = new Set(p.disabledExtensions || []);
-      pData._e = new Set(p.enabledExtensions || []);
-      updateMetrics();
-      renderCards();
-    })
-    .catch(function(e){ toast("Error: " + e.message); });
-}
-
-function cpManifest(isCustom, btn) {
-  var h = window.location.host;
-  var base = window.location.protocol + "//" + h;
-  var path = isCustom ? ("/u/" + encodeURIComponent(pid) + "/manifest.json") : "/manifest.json";
-  var url = base + path;
-
-  function onDone() {
-    if (btn) {
-      var lbl = btn.querySelector(".copy-lbl");
-      if (lbl) {
-        var origText = lbl.textContent;
-        lbl.textContent = "Copied!";
-        btn.style.borderColor = "var(--green)";
-        btn.style.color = "var(--green)";
-        setTimeout(function(){
-          lbl.textContent = origText;
-          btn.style.borderColor = "";
-          btn.style.color = "";
-        }, 1800);
-      }
-    }
-    toast("Copied Stremio manifest URL!");
-  }
-
-  if (navigator.clipboard && navigator.clipboard.writeText) {
-    navigator.clipboard.writeText(url).then(onDone);
-    return;
-  }
-  var ta = document.createElement("textarea");
-  ta.value = url;
-  ta.style.position = "fixed";
-  ta.style.opacity = "0";
-  document.body.appendChild(ta);
-  ta.select();
-  document.execCommand("copy");
-  document.body.removeChild(ta);
-  onDone();
-}
-
-/* Repositories Modal */
+/* ── Installed Repositories Modal ─────────────────────────────────────── */
 function openReposModal() {
+  renderReposModal();
   var m = document.getElementById("repos-modal");
   if (m) m.classList.add("open");
-  renderReposModal();
 }
 function closeReposModal() {
   var m = document.getElementById("repos-modal");
   if (m) m.classList.remove("open");
 }
 function renderReposModal() {
-  var el = document.getElementById("repos-list");
-  if (!el) return;
-  if (!repos.length) {
-    el.innerHTML = '<div class="empty" style="padding:16px">No repositories connected yet.</div>';
-    return;
-  }
-  el.innerHTML = repos.map(function(r) {
-    var status = r.isLoading
-      ? '<span class="repo-badge" style="color:var(--accent)">Installing...</span>'
-      : (r.error ? '<span class="repo-badge" style="color:var(--red)">Failed</span>' : '<span class="repo-badge" style="color:var(--green)">Active</span>');
-    return '<div class="repo-card">' +
-      '<div class="repo-info">' +
-        '<div class="repo-name">' + esc(r.name || r.url) + '</div>' +
-        '<div class="repo-url" title="' + esc(r.url) + '">' + esc(r.url) + '</div>' +
-      '</div>' +
-      '<div style="display:flex;align-items:center;gap:6px">' +
-        '<span class="repo-badge">' + r.pluginCount + ' ext</span>' +
-        status +
-      '</div>' +
-    '</div>';
-  }).join("");
+  var container = document.getElementById("repos-list");
+  if (!container) return;
+  container.innerHTML = '<div class="empty"><span class="loader"></span> Loading repositories...</div>';
+
+  fetch("/api/credits")
+    .then(function(r) { return r.json(); })
+    .catch(function() { return []; })
+    .then(function(creditList) {
+      var repoMaintainers = (creditList || []).filter(function(c) {
+        return !c.isCurated || (c.repoUrl && c.repoUrl !== "");
+      });
+      // Fallback to repos array if credits endpoint returned nothing for repos
+      var list = repoMaintainers.length ? repoMaintainers : repos.map(function(r){
+        return {
+          authorName: r.name,
+          repoUrl: r.url,
+          avatarUrl: r.iconUrl,
+          description: r.description,
+          pluginCount: r.pluginCount
+        };
+      });
+
+      var countEl = document.getElementById("repos-count-badge");
+      if (countEl) countEl.textContent = list.length + (list.length === 1 ? " Repo" : " Repos");
+
+      if (!list.length) {
+        container.innerHTML = '<div class="empty">No repositories installed.</div>';
+        return;
+      }
+
+      var cards = list.map(function(c) {
+        var links = [];
+        var cleanGh = (c.githubUrl || "").trim();
+        var ghMatch = cleanGh.match(/(?:raw\.githubusercontent|github)\.com\/([^\/]+)\/([^\/]+)/i);
+        var repoRootUrl = ghMatch ? ("https://github.com/" + ghMatch[1] + "/" + ghMatch[2].replace(/\.git$/, "")) : cleanGh;
+
+        if (repoRootUrl) {
+          links.push('<a class="author-link-btn gh" href="' + esc(repoRootUrl) + '" target="_blank" rel="noopener"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg><span>GitHub</span></a>');
+        }
+        if (c.repoUrl && c.repoUrl.trim() !== repoRootUrl && c.repoUrl.trim() !== cleanGh) {
+          links.push('<a class="author-link-btn" href="' + esc(c.repoUrl.trim()) + '" target="_blank" rel="noopener"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg><span>Repository</span></a>');
+        }
+        if (c.discordUrl && c.discordUrl.trim()) {
+          var cleanDc = c.discordUrl.trim();
+          var dcLink = cleanDc.indexOf("http") === 0 ? cleanDc : ("https://discord.com/users/" + cleanDc);
+          var dcLabel = cleanDc.indexOf("http") === 0 ? "Discord" : ("@" + cleanDc);
+          var dcMatch = cleanDc.match(/(?:discord\.com\/users\/|discordapp\.com\/users\/)([^\/\?]+)/i);
+          if (dcMatch) dcLabel = "@" + dcMatch[1];
+          links.push('<a class="author-link-btn dc" href="' + esc(dcLink) + '" target="_blank" rel="noopener"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994.021-.041.001-.09-.041-.106a13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.929 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.894.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.078.078 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg><span>' + esc(dcLabel) + '</span></a>');
+        }
+        if (c.telegramUrl && c.telegramUrl.trim()) {
+          links.push('<a class="author-link-btn tg" href="' + esc(c.telegramUrl.trim()) + '" target="_blank" rel="noopener"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 0 0-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.95-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.36.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .38z"/></svg><span>Telegram</span></a>');
+        }
+        if (c.donationUrl && c.donationUrl.trim()) {
+          links.push('<a class="author-link-btn heart" href="' + esc(c.donationUrl.trim()) + '" target="_blank" rel="noopener"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg><span>Support</span></a>');
+        }
+        if (c.websiteUrl && c.websiteUrl.trim()) {
+          links.push('<a class="author-link-btn" href="' + esc(c.websiteUrl.trim()) + '" target="_blank" rel="noopener"><span>Website</span></a>');
+        }
+
+        var repoMatch = repos.find(function(r) {
+          return (r.url && c.repoUrl && r.url.trim().toLowerCase() === c.repoUrl.trim().toLowerCase());
+        });
+        var sourceCount = (c.pluginCount !== undefined && c.pluginCount !== null) ? c.pluginCount :
+                          (repoMatch ? (repoMatch.pluginCount || 0) : null);
+
+        var avatarSrc = c.avatarUrl || (repoMatch ? repoMatch.iconUrl : "");
+        var avatarHtml = avatarSrc
+          ? '<img class="author-avatar" src="' + esc(avatarSrc) + '" alt="" onerror="this.src=\'/logo.png\'">'
+          : '<div class="author-avatar" style="display:flex;align-items:center;justify-content:center;font-weight:800;color:var(--accent);">' + esc((c.authorName || "?").charAt(0).toUpperCase()) + '</div>';
+
+        var badgesHtml = '';
+        if (sourceCount !== null && sourceCount > 0) {
+          badgesHtml += '<span class="author-badge" style="background:var(--surface-active);border-color:var(--border);color:var(--accent);font-weight:700;">' + sourceCount + ' sources</span>';
+        }
+
+        return '<div class="author-card">' +
+          '<div class="author-top">' +
+            '<div class="author-info-left">' +
+              avatarHtml +
+              '<div style="min-width:0;">' +
+                '<div class="author-name">' + esc(c.authorName) + '</div>' +
+                '<div style="font-size:10.5px;color:var(--text-dim);">' + esc(c.roleBadge || "Installed Repository") + '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">' + badgesHtml + '</div>' +
+          '</div>' +
+          (c.description ? '<div class="author-desc">' + esc(c.description) + '</div>' : '') +
+          (links.length ? '<div class="author-links-row">' + links.join("") + '</div>' : '') +
+        '</div>';
+      });
+
+      container.innerHTML = cards.join("");
+    });
 }
 
-function normalizeRepoUrl(raw) {
-  raw = (raw || "").trim();
-  if (!raw) return null;
-  if (!raw.includes("/") && !raw.includes(".") && !raw.includes(":")) return raw;
-  if (!raw.includes("://") && raw.indexOf(".") < 0) {
-    var parts = raw.split("/").filter(Boolean);
-    if (parts.length === 2) return "https://raw.githubusercontent.com/" + parts[0] + "/" + parts[1] + "/builds/repo.json";
-    if (parts.length >= 3) return "https://raw.githubusercontent.com/" + parts[0] + "/" + parts[1] + "/" + parts[2] + "/repo.json";
-  }
-  if (raw.indexOf("github.com") >= 0 && raw.indexOf("raw.githubusercontent.com") < 0 && raw.indexOf(".json") < 0) {
-    var seg = raw.replace(/^https?:\/\//, "").replace(/^\/+/, "").replace(/^github\.com\//, "").split("/").filter(Boolean);
-    if (seg.length >= 2) return "https://raw.githubusercontent.com/" + seg[0] + "/" + seg[1] + "/builds/repo.json";
-  }
-  if (raw.indexOf("://") < 0) raw = "https://" + raw;
-  return raw;
+/* ── Developer Credits Modal ──────────────────────────────────────────── */
+function openCreditsModal() {
+  renderCreditsModal();
+  var m = document.getElementById("credits-modal");
+  if (m) m.classList.add("open");
 }
+function closeCreditsModal() {
+  var m = document.getElementById("credits-modal");
+  if (m) m.classList.remove("open");
+}
+function renderCreditsModal() {
+  var container = document.getElementById("credits-list");
+  if (!container) return;
+  container.innerHTML = '<div class="empty"><span class="loader"></span> Loading developer credits...</div>';
 
-function addRepo() {
-  toast("Contact admin to add repo");
+  fetch("/api/credits")
+    .then(function(r) { return r.json(); })
+    .catch(function() { return []; })
+    .then(function(list) {
+      var coreTeam = (list || []).filter(function(c) {
+        return c.isCurated && (!c.repoUrl || c.repoUrl === "");
+      });
+
+      if (!coreTeam.length) {
+        container.innerHTML = '<div class="empty">No team credits found.</div>';
+        return;
+      }
+
+      var cards = coreTeam.map(function(c) {
+        var links = [];
+        var cleanGh = (c.githubUrl || "").trim();
+        if (cleanGh) {
+          links.push('<a class="author-link-btn gh" href="' + esc(cleanGh) + '" target="_blank" rel="noopener"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg><span>GitHub</span></a>');
+        }
+        if (c.discordUrl && c.discordUrl.trim()) {
+          var cleanDc = c.discordUrl.trim();
+          var dcLink = cleanDc.indexOf("http") === 0 ? cleanDc : ("https://discord.com/users/" + cleanDc);
+          var dcLabel = cleanDc.indexOf("http") === 0 ? "Discord" : ("@" + cleanDc);
+          var dcMatch = cleanDc.match(/(?:discord\.com\/users\/|discordapp\.com\/users\/)([^\/\?]+)/i);
+          if (dcMatch) dcLabel = "@" + dcMatch[1];
+          links.push('<a class="author-link-btn dc" href="' + esc(dcLink) + '" target="_blank" rel="noopener"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994.021-.041.001-.09-.041-.106a13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.929 1.793 8.18 1.793 12.061 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.894.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.078.078 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.028zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg><span>' + esc(dcLabel) + '</span></a>');
+        }
+        if (c.telegramUrl && c.telegramUrl.trim()) {
+          links.push('<a class="author-link-btn tg" href="' + esc(c.telegramUrl.trim()) + '" target="_blank" rel="noopener"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 0 0-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.95-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.36.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .38z"/></svg><span>Telegram</span></a>');
+        }
+        if (c.donationUrl && c.donationUrl.trim()) {
+          links.push('<a class="author-link-btn heart" href="' + esc(c.donationUrl.trim()) + '" target="_blank" rel="noopener"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg><span>Support</span></a>');
+        }
+        if (c.websiteUrl && c.websiteUrl.trim()) {
+          links.push('<a class="author-link-btn" href="' + esc(c.websiteUrl.trim()) + '" target="_blank" rel="noopener"><span>Website</span></a>');
+        }
+
+        var avatarSrc = c.avatarUrl || "/logo.png";
+        var avatarHtml = '<img class="author-avatar" src="' + esc(avatarSrc) + '" alt="" onerror="this.src=\'/logo.png\'">';
+        var badgesHtml = c.roleBadge ? ('<span class="author-badge" style="background:var(--surface-active);border-color:var(--border);color:var(--accent);font-weight:700;">' + esc(c.roleBadge) + '</span>') : '';
+
+        return '<div class="author-card" style="border-color: rgba(139, 92, 246, 0.35); background: linear-gradient(180deg, var(--surface-card) 0%, rgba(139, 92, 246, 0.04) 100%);">' +
+          '<div class="author-top">' +
+            '<div class="author-info-left">' +
+              avatarHtml +
+              '<div style="min-width:0;">' +
+                '<div class="author-name">' + esc(c.authorName) + '</div>' +
+                '<div style="font-size:10.5px;color:var(--text-dim);">' + esc(c.roleBadge || "Core Developer") + '</div>' +
+              '</div>' +
+            '</div>' +
+            '<div style="display:flex;align-items:center;gap:6px;flex-shrink:0;">' + badgesHtml + '</div>' +
+          '</div>' +
+          (c.description ? '<div class="author-desc">' + esc(c.description) + '</div>' : '') +
+          (links.length ? '<div class="author-links-row">' + links.join("") + '</div>' : '') +
+        '</div>';
+      });
+
+      container.innerHTML = cards.join("");
+    });
 }
 
 function esc(s) {
   return String(s || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }
-
 function toast(msg) {
-  var el = document.getElementById("toast");
-  if (!el) return;
-  el.textContent = msg;
-  el.classList.add("show");
-  clearTimeout(el._t);
-  el._t = setTimeout(function(){ el.classList.remove("show"); }, 2400);
+  var t = document.getElementById("toast");
+  if (!t) return;
+  t.textContent = msg;
+  t.classList.add("show");
+  if (t._timer) clearTimeout(t._timer);
+  t._timer = setTimeout(function(){ t.classList.remove("show"); }, 2200);
 }
 
-function loadStats() {
-  function applyStats(data) {
-    if (!data) return;
-    var target = typeof data.targetGoalUsd === "number" ? data.targetGoalUsd : 100;
-    var total = typeof data.totalUsd === "number" ? data.totalUsd : 0;
-    var pct = typeof data.percent === "number" ? data.percent : Math.round((total / (target || 1)) * 100);
-    if (pct < 0) pct = 0;
-
-    var curSym = String.fromCharCode(36);
-    var raisedText = curSym + (total % 1 === 0 ? total.toFixed(0) : total.toFixed(2));
-    var targetText = curSym + (target % 1 === 0 ? target.toFixed(0) : target.toFixed(2));
-
-    var textEl = document.getElementById("goal-text");
-    if (textEl) {
-      textEl.innerHTML = "<b>" + esc(raisedText) + "</b> raised of <b>" + esc(targetText) + "</b> goal";
-    }
-    var pctEl = document.getElementById("goal-pct");
-    if (pctEl) {
-      pctEl.textContent = pct + "%";
-    }
-    var fillEl = document.getElementById("goal-fill");
-    if (fillEl) {
-      fillEl.style.width = Math.min(100, Math.max(0, pct)) + "%";
-    }
-    var card = document.getElementById("goal-card");
-    if (card && data.month) {
-      var note = data.month + " Goal";
-      if (data.supporterCount) note += " · " + data.supporterCount + " supporters";
-      card.setAttribute("title", note);
-    }
-  }
-
-  fetch("https://cncverse.pages.dev/api/stats")
-    .then(function(r) {
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return r.json();
-    })
-    .then(function(data) {
-      applyStats(data);
-    })
-    .catch(function() {
-      fetch("/api/community-stats")
-        .then(function(r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
-        .then(function(data) { applyStats(data); })
-        .catch(function() {});
+function loadFooterCredits() {
+  fetch("/api/footer-credits")
+    .then(function(r) { return r.json(); })
+    .catch(function() { return []; })
+    .then(function(items) {
+      var el = document.getElementById("page-footer");
+      if (!el) return;
+      if (!items || !items.length) {
+        el.innerHTML = "";
+        el.style.display = "none";
+        return;
+      }
+      el.style.display = "flex";
+      var parts = items.map(function(item) {
+        var linkHtml = item.url ? ('<a href="' + esc(item.url) + '" target="_blank" rel="noopener" class="footer-author-link" style="font-weight:700;">' + esc(item.name) + '</a>') : ('<span class="footer-author-name" style="font-weight:700;">' + esc(item.name) + '</span>');
+        return item.label ? ('<span>' + esc(item.label) + ' ' + linkHtml + '</span>') : ('<span>' + linkHtml + '</span>');
+      });
+      el.innerHTML = parts.join(' <span class="footer-sep">&middot;</span> ');
     });
 }
 
-initPresetsDrag();
 updateUrls();
 loadExts();
 loadRepos();
 loadProfile();
 loadStats();
-setInterval(function(){ loadExts(); loadRepos(); }, 15000);
+loadFooterCredits();
+
+setInterval(function(){ loadExts(); loadRepos(); loadFooterCredits(); }, 15000);
+setInterval(function(){ loadStats(); }, 60000);
 </script>
 </body>
-</html>"""
+</html>
+
+"""
     }
 }
 

@@ -464,7 +464,7 @@ object StreamVariables {
             "stream.streamtype" to streamTypeFrom(info, stream),
             "stream.size" to sizeFrom(resolution, linkText, releaseText),
             "stream.languages" to languages,
-            "stream.subtitles" to stream.subtitles?.map { it.lang }?.filter { it.isNotBlank() }?.distinct().orEmpty(),
+            "stream.subtitles" to cleanSubtitles(stream.subtitles),
             "stream.seasonepisode" to seasonEpisode,
             "stream.season" to season?.toLong(),
             "stream.episode" to episode?.toLong(),
@@ -480,11 +480,33 @@ object StreamVariables {
             "stream.title" to stream.title,
         )
     }
+
+    private fun cleanSubtitles(subs: List<com.cncverse.stremiobridge.model.StremioSubtitle>?): List<String> {
+        if (subs.isNullOrEmpty()) return emptyList()
+        // Strip parenthetical audio suffixes like " (Original Audio)", " (Tamil Audio)", " (Hindi Audio)"
+        val cleaned = subs.mapNotNull { sub ->
+            val lang = sub.lang.replace(Regex("""\s*\(.*?\)\s*"""), "").trim()
+            lang.takeIf { it.isNotBlank() }
+        }.distinct()
+
+        if (cleaned.isEmpty()) return emptyList()
+        if (cleaned.size <= 3) return cleaned
+        return cleaned.take(3) + "+${cleaned.size - 3} more"
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration + applying to responses
 // ─────────────────────────────────────────────────────────────────────────────
+
+@Serializable
+data class FormatterPreset(
+    val id: String,
+    val title: String,
+    val description: String,
+    val nameTemplate: String,
+    val descriptionTemplate: String,
+)
 
 @Serializable
 data class StreamFormatterConfig(
@@ -496,17 +518,61 @@ data class StreamFormatterConfig(
 object StreamFormatter {
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true; prettyPrint = true }
 
-    /** The PenguPlay example, offered as a one-click preset in the admin panel. */
+    val PRESETS = listOf(
+        FormatterPreset(
+            id = "cncverse",
+            title = "🌀 CNCVerse Modern",
+            description = "Balanced with resolution badges, specs, source, and compact audio/subs.",
+            nameTemplate = "🌀 CNCVerse {stream.resolution::=2160p[\"❄️ 4K\"||\"{stream.resolution::=1080p[\"🧊 {stream.resolution::default('Auto')}\"||\"🎬 {stream.resolution::default('Auto')}\"]}\"]} • {addon.name}",
+            descriptionTemplate = "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('CNCVerse stream')}\"]}\n" +
+                "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
+                "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::default('Auto')} • {stream.streamType::default('HLS')}\"]}\n" +
+                "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}\n" +
+                "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}\n" +
+                "{stream.languages::exists[\"🎧 Audio: {stream.languages::join(', ')}\"||\"\"]}\n" +
+                "{stream.subtitles::exists[\"💬 Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
+        ),
+        FormatterPreset(
+            id = "torrentio",
+            title = "⚡ Torrentio Minimalist",
+            description = "Ultra-compact 2-line layout inspired by Torrentio and Cyberflix.",
+            nameTemplate = "[CNC] {stream.resolution::default('HD')} • {addon.name}",
+            descriptionTemplate = "{metadata.title}{stream.seasonEpisode::exists[\" - {stream.seasonEpisode::join('')}\"||\"\"]}\n" +
+                "{stream.specs::join(' ')}{stream.size::>0[\" | {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}{stream.source::exists[\" | {stream.source}\"||\"\"]}\n" +
+                "Audio: {stream.languages::default('Multi')}{stream.subtitles::exists[\" | Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
+        ),
+        FormatterPreset(
+            id = "mediafusion",
+            title = "💎 MediaFusion Pro",
+            description = "Detailed specifications with HDR/DV tags, codecs, and server tags.",
+            nameTemplate = "⚡ CNCVerse | {stream.resolution::=2160p[\"💎 4K UHD\"||\"📺 {stream.resolution::default('FHD')}\"]} | {addon.name}",
+            descriptionTemplate = "🎬 {metadata.title}{stream.seasonEpisode::exists[\" [{stream.seasonEpisode::join('')}]\"||\"\"]}\n" +
+                "⚙️ Specs: {stream.specs::join(' • ')}\n" +
+                "📦 Size: {stream.size::>0[\"{stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"Direct Stream\"]} • Host: {addon.name}\n" +
+                "🔊 Audio: {stream.languages::default('Original')}\n" +
+                "{stream.subtitles::exists[\"📝 Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
+        ),
+        FormatterPreset(
+            id = "essentials",
+            title = "🎯 Pure Essentials",
+            description = "Clean essentials without emojis or redundant lines.",
+            nameTemplate = "{stream.resolution::default('Auto')} • {stream.streamType::default('Direct')} • {addon.name}",
+            descriptionTemplate = "{metadata.title}{stream.seasonEpisode::exists[\" • {stream.seasonEpisode::join('')}\"||\"\"]}\n" +
+                "{stream.specs::join(' • ')}\n" +
+                "{stream.size::>0[\"Size: {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')} • \"||\"\"]}Audio: {stream.languages::default('Default')}"
+        )
+    )
+
     const val PRESET_NAME =
-        "🐧 PenguPlay {stream.resolution::=2160p[\"❄️ 4K\"||\"{stream.resolution::=1080p[\"🧊 {stream.resolution::default('Auto')}\"||\"🐧 {stream.resolution::default('Auto')}\"]}\"]} • {addon.name}"
+        "🌀 CNCVerse {stream.resolution::=2160p[\"❄️ 4K\"||\"{stream.resolution::=1080p[\"🧊 {stream.resolution::default('Auto')}\"||\"🎬 {stream.resolution::default('Auto')}\"]}\"]} • {addon.name}"
     const val PRESET_DESCRIPTION =
-        "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('PenguPlay stream')}\"]}\n" +
+        "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('CNCVerse stream')}\"]}\n" +
         "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
-        "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::=2160p[\"4K\"||\"{stream.resolution::default('Auto')}\"]} • {stream.streamType::default('HLS')}\"]}\n" +
+        "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::default('Auto')} • {stream.streamType::default('HLS')}\"]}\n" +
         "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}\n" +
         "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}\n" +
         "{stream.languages::exists[\"🎧 Audio: {stream.languages::join(', ')}\"||\"\"]}\n" +
-        "{stream.subtitles::exists[\"📝 Subtitles: {stream.subtitles::join(', ')}\"||\"🙊 No included subtitles\"]}"
+        "{stream.subtitles::exists[\"💬 Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
 
     private var file: File? = null
 
