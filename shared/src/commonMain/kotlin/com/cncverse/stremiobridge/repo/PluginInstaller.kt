@@ -96,11 +96,20 @@ object PluginInstaller {
     /** Deletes the .cs3 and every derived artifact (.dex, -jvmN.jar) for one plugin. */
     private fun deletePluginFiles(cacheDir: String, internalName: String, localPath: String?) {
         val dir = File(cacheDir, "plugins")
+        if (!dir.exists()) return
         val bases = buildSet {
-            add(sanitizeName(internalName))
-            localPath?.let { add(File(it).nameWithoutExtension) }
+            val s = sanitizeName(internalName).trim()
+            if (s.isNotBlank()) add(s)
+            localPath?.let {
+                val n = File(it).nameWithoutExtension.trim()
+                if (n.isNotBlank()) add(n)
+            }
         }
-        localPath?.let { File(it).delete() }
+        if (bases.isEmpty()) return
+        localPath?.let {
+            val f = File(it)
+            if (f.exists() && f.isFile) f.delete()
+        }
         dir.listFiles()?.forEach { f ->
             if (f.isFile && pluginFileBase(f.name) in bases) f.delete()
         }
@@ -130,6 +139,10 @@ object PluginInstaller {
         return candidates.map { it.internalName }
     }
 
+    private fun normalizeRepoUrl(url: String): String =
+        url.trim().lowercase().removeSuffix("/")
+            .replace("/refs/heads/", "/")
+
     /**
      * Startup cleanup: uninstalls extensions whose repo is no longer in
      * [repoUrls] and deletes plugin files (.cs3 / -jvmN.jar / .dex) that no
@@ -139,13 +152,13 @@ object PluginInstaller {
      */
     fun pruneOrphans(cacheDir: String, repoUrls: Collection<String>): List<String> {
         if (repoUrls.isEmpty()) return emptyList()
-        val known = repoUrls.toSet()
+        val normalizedKnown = repoUrls.map { normalizeRepoUrl(it) }.toSet()
         val installed = loadInstalledPlugins(cacheDir)
-        val (keep, orphaned) = installed.partition { it.repoUrl in known }
+        val (keep, orphaned) = installed.partition { normalizeRepoUrl(it.repoUrl) in normalizedKnown }
         orphaned.forEach { deletePluginFiles(cacheDir, it.internalName, it.localPath) }
         if (orphaned.isNotEmpty()) {
             writeInstalled(cacheDir, keep)
-            RepoState.setInstalledPlugins(RepoState.installedPlugins.value.filter { it.repoUrl in known })
+            RepoState.setInstalledPlugins(RepoState.installedPlugins.value.filter { normalizeRepoUrl(it.repoUrl) in normalizedKnown })
             orphaned.forEach { RepoState.setInstallState(it.internalName, PluginInstallState.NotInstalled) }
             ServerState.info("Removed ${orphaned.size} extension(s) whose repo was deleted: " +
                 orphaned.joinToString { it.displayName })

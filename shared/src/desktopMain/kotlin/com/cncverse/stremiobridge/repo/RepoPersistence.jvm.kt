@@ -37,3 +37,42 @@ actual fun loadExtensionSettings(): Map<String, String> {
 actual fun saveExtensionSettings(settings: Map<String, String>) {
     extSettingsFile.writeText(settings.map { "${it.key}=${it.value}" }.joinToString("\n"))
 }
+
+private val repoCacheJson = kotlinx.serialization.json.Json {
+    ignoreUnknownKeys = true
+    encodeDefaults = true
+}
+
+private val repoCacheFile: File
+    get() = PlatformPaths.fileInConfigDir("repos_cache.json")
+
+actual fun loadCachedRepoEntries(): List<com.cncverse.stremiobridge.state.RepoEntry> {
+    val f = repoCacheFile
+    if (!f.exists()) return emptyList()
+    return runCatching {
+        repoCacheJson.decodeFromString<List<com.cncverse.stremiobridge.state.RepoEntry>>(f.readText())
+    }.getOrDefault(emptyList())
+}
+
+actual fun saveCachedRepoEntries(entries: List<com.cncverse.stremiobridge.state.RepoEntry>) {
+    runCatching {
+        repoCacheFile.writeText(repoCacheJson.encodeToString(entries))
+    }
+}
+
+private val availablePluginsCacheFile: File
+    get() = PlatformPaths.fileInConfigDir("available_plugins_cache.json")
+
+actual fun loadCachedAvailablePlugins(): List<com.cncverse.stremiobridge.state.AvailablePlugin> {
+    val f = availablePluginsCacheFile
+    if (!f.exists()) return emptyList()
+    return runCatching {
+        repoCacheJson.decodeFromString<List<com.cncverse.stremiobridge.state.AvailablePlugin>>(f.readText())
+    }.getOrDefault(emptyList())
+}
+
+actual fun saveCachedAvailablePlugins(plugins: List<com.cncverse.stremiobridge.state.AvailablePlugin>) {
+    runCatching {
+        availablePluginsCacheFile.writeText(repoCacheJson.encodeToString(plugins))
+    }
+}

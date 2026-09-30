@@ -21,8 +21,21 @@ object RepoManager {
             urls = mutableListOf(DEFAULT_REPO_URL)
             saveRepoUrls(urls)
         }
-        val entries = urls.map { url -> RepoEntry(url = url) }
+        val cached = runCatching { loadCachedRepoEntries() }.getOrDefault(emptyList()).associateBy { it.url }
+        val entries = urls.map { url ->
+            val prev = cached[url]
+            if (prev != null) {
+                prev.copy(isLoading = false, error = null)
+            } else {
+                RepoEntry(url = url, isLoading = false)
+            }
+        }
         RepoState.setRepos(entries)
+
+        val cachedPlugins = runCatching { loadCachedAvailablePlugins() }.getOrDefault(emptyList())
+        if (cachedPlugins.isNotEmpty()) {
+            RepoState.setAvailablePlugins(cachedPlugins)
+        }
     }
 
     /**
@@ -54,13 +67,18 @@ object RepoManager {
                 iconUrl = meta.iconUrl,
                 description = meta.description,
                 lastFetched = System.currentTimeMillis(),
+                isLoading = false,
             )
         } else {
-            RepoEntry(url = trimmed, error = "Could not fetch repo metadata")
+            RepoEntry(url = trimmed, isLoading = false, error = "Could not fetch repo metadata")
         }
 
         RepoState.updateRepo(trimmed) { entry }
-        if (saveGlobally) persistUrls()
+        if (saveGlobally) {
+            persistUrls()
+            saveCachedRepoEntries(RepoState.repos.value.map { it.copy(isLoading = false) })
+            saveCachedAvailablePlugins(RepoState.availablePlugins.value)
+        }
 
         // Fetch plugins for this repo
         if (meta != null) fetchPluginsForRepo(entry, meta)
@@ -77,6 +95,8 @@ object RepoManager {
         val removed = if (!cacheDir.isNullOrEmpty()) PluginInstaller.removePluginsForRepo(url, cacheDir) else emptyList()
         RepoState.removeRepo(url)
         persistUrls()
+        saveCachedRepoEntries(RepoState.repos.value.map { it.copy(isLoading = false) })
+        saveCachedAvailablePlugins(RepoState.availablePlugins.value)
         return removed
     }
 
@@ -88,40 +108,62 @@ object RepoManager {
      */
     suspend fun refreshAllRepos() {
         if (!refreshMutex.tryLock()) {
-            // Already refreshing, wait for it to finish
-            refreshMutex.withLock { }
+            // Already refreshing, wait for it to finish up to 30 seconds
+            withTimeoutOrNull(30_000) { refreshMutex.withLock { } }
             return
         }
         try {
             RepoState.setRefreshing(true)
-            coroutineScope {
-                RepoState.repos.value.map { repoEntry ->
-                    async(Dispatchers.IO) { refreshRepo(repoEntry) }
-                }.awaitAll()
+            withTimeoutOrNull(45_000) {
+                supervisorScope {
+                    RepoState.repos.value.map { repoEntry ->
+                        async(Dispatchers.IO) { refreshRepo(repoEntry) }
+                    }.awaitAll()
+                }
             }
+            saveCachedRepoEntries(RepoState.repos.value.map { it.copy(isLoading = false) })
+        } catch (e: Exception) {
+            ServerState.warn("Repo refresh error: ${e.message}")
         } finally {
             RepoState.setRefreshing(false)
-            refreshMutex.unlock()
+            // Guarantee no repo remains stuck in isLoading state
+            RepoState.repos.value.forEach { r ->
+                if (r.isLoading) {
+                    RepoState.updateRepo(r.url) { it.copy(isLoading = false) }
+                }
+            }
+            if (refreshMutex.isLocked) {
+                runCatching { refreshMutex.unlock() }
+            }
         }
     }
 
     private suspend fun refreshRepo(repoEntry: RepoEntry) {
         RepoState.updateRepo(repoEntry.url) { it.copy(isLoading = true, error = null) }
-        val meta = PluginRepository.fetchRepoMeta(repoEntry.url)
-        if (meta == null) {
-            RepoState.updateRepo(repoEntry.url) { it.copy(isLoading = false, error = "Fetch failed") }
-            return
+        try {
+            withTimeout(30_000) {
+                val meta = PluginRepository.fetchRepoMeta(repoEntry.url)
+                if (meta == null) {
+                    RepoState.updateRepo(repoEntry.url) { it.copy(isLoading = false, error = "Fetch failed") }
+                    return@withTimeout
+                }
+                val updated = repoEntry.copy(
+                    name = meta.name,
+                    iconUrl = meta.iconUrl,
+                    description = meta.description,
+                    lastFetched = System.currentTimeMillis(),
+                    isLoading = false,
+                    error = null,
+                )
+                RepoState.updateRepo(repoEntry.url) { updated }
+                fetchPluginsForRepo(updated, meta)
+            }
+        } catch (e: Exception) {
+            ServerState.warn("Failed to refresh repo '${repoEntry.url}': ${e.message}")
+            RepoState.updateRepo(repoEntry.url) { it.copy(isLoading = false, error = e.message ?: "Timeout") }
+        } finally {
+            RepoState.updateRepo(repoEntry.url) { it.copy(isLoading = false) }
         }
-        val updated = repoEntry.copy(
-            name = meta.name,
-            iconUrl = meta.iconUrl,
-            description = meta.description,
-            lastFetched = System.currentTimeMillis(),
-            isLoading = false,
-            error = null,
-        )
-        RepoState.updateRepo(repoEntry.url) { updated }
-        fetchPluginsForRepo(updated, meta)
     }
 
     private suspend fun fetchPluginsForRepo(repoEntry: RepoEntry, meta: com.cncverse.stremiobridge.model.CncRepository) {
@@ -130,6 +172,7 @@ object RepoManager {
         }
         val wrapped = all.map { AvailablePlugin(plugin = it, repoEntry = repoEntry) }
         RepoState.mergeAvailablePlugins(wrapped, repoEntry.url)
+        saveCachedAvailablePlugins(RepoState.availablePlugins.value)
 
         // Update install states: mark UpdateAvailable where version changed
         val installed = RepoState.installedPlugins.value

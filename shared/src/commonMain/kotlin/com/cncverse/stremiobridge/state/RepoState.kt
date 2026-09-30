@@ -19,6 +19,7 @@ data class RepoEntry(
     val error: String? = null,
 )
 
+@Serializable
 data class AvailablePlugin(
     val plugin: SitePlugin,
     val repoEntry: RepoEntry,
@@ -88,6 +89,10 @@ object RepoState {
     fun mergeAvailablePlugins(plugins: List<AvailablePlugin>, repoUrl: String) {
         val others = _availablePlugins.value.filter { it.repoEntry.url != repoUrl }
         _availablePlugins.value = others + plugins
+    }
+
+    fun setAvailablePlugins(plugins: List<AvailablePlugin>) {
+        _availablePlugins.value = plugins
     }
 
     fun setInstalledPlugins(plugins: List<InstalledPlugin>) { _installedPlugins.value = plugins }

@@ -1,4 +1,4 @@
-﻿package com.cncverse.stremiobridge.server.web
+package com.cncverse.stremiobridge.server.web
 
 import com.cncverse.stremiobridge.Constants
 import com.cncverse.stremiobridge.format.StreamFormatter
@@ -16,6 +16,7 @@ import com.cncverse.stremiobridge.state.PluginInstallState
 import com.cncverse.stremiobridge.state.RepoState
 import com.cncverse.stremiobridge.state.ServerState
 import com.cncverse.stremiobridge.state.ServerStatus
+import com.cncverse.stremiobridge.state.StreamTracker
 import com.cncverse.stremiobridge.tunnel.CloudflaredManager
 import com.cncverse.stremiobridge.update.GithubRelease
 import com.cncverse.stremiobridge.update.OtaUpdater
@@ -32,6 +33,7 @@ import io.ktor.server.cio.CIO
 import io.ktor.server.engine.embeddedServer
 import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.request.receive
+import io.ktor.server.request.receiveText
 import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytes
 import io.ktor.server.response.respondRedirect
@@ -220,6 +222,15 @@ object WebAdmin {
                 call.respond(AdminActionResult(true, "Tunnel stopped"))
             }
 
+            post("/server/toggle-catalogs") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                ServerState.disableCatalogsGlobally = !ServerState.disableCatalogsGlobally
+                val msg = if (ServerState.disableCatalogsGlobally) "Catalogs disabled globally (Streams & Search only)"
+                          else "Catalogs enabled globally"
+                ServerState.info("⚙️ $msg")
+                call.respond(AdminActionResult(true, msg))
+            }
+
             // ── Repos ────────────────────────────────────────────────────────
 
             post("/repos/add") {
@@ -229,15 +240,15 @@ object WebAdmin {
                 if (url.isEmpty()) return@post call.respond(AdminActionResult(false, "Missing url"))
                 val saveGlobally = body.saveGlobally ?: true
                 scope().launch {
-                    val entry = BridgeRuntime.addRepo(url, saveGlobally = saveGlobally, autoInstallAll = true, disableNewPluginsByDefault = true)
+                    val entry = BridgeRuntime.addRepo(url, saveGlobally = saveGlobally, autoInstallAll = false, disableNewPluginsByDefault = true)
                     if (!saveGlobally) localOnlyRepos.add(url)
                     when {
                         entry == null -> ServerState.warn("Repo already installed: $url")
                         entry.error != null -> ServerState.warn("Repo add failed: ${entry.error}")
-                        else -> ServerState.info("Repo '${entry.name.ifBlank { entry.url }}' added — downloading all its extensions…")
+                        else -> ServerState.info("Repo '${entry.name.ifBlank { entry.url }}' added — sources available in catalog")
                     }
                 }
-                call.respond(AdminActionResult(true, "Adding repo — downloading all extensions…"))
+                call.respond(AdminActionResult(true, "Repository added — sources available in catalog"))
             }
 
             post("/repos/remove") {
@@ -319,6 +330,15 @@ object WebAdmin {
                 val internalName = body.internalName ?: return@post call.respond(AdminActionResult(false, "Missing internalName"))
                 scope().launch { BridgeRuntime.uninstallPlugin(internalName) }
                 call.respond(AdminActionResult(true, "Uninstalling…"))
+            }
+
+            post("/plugins/uninstall-batch") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val body = call.receive<AdminActionRequest>()
+                val internalNames = body.internalNames ?: emptyList()
+                if (internalNames.isEmpty()) return@post call.respond(AdminActionResult(false, "No internalNames provided"))
+                scope().launch { BridgeRuntime.uninstallPlugins(internalNames) }
+                call.respond(AdminActionResult(true, "Uninstalling ${internalNames.size} plugin(s)…"))
             }
 
             post("/plugins/toggle") {
@@ -427,6 +447,7 @@ object WebAdmin {
                     descriptionTemplate = cfg.descriptionTemplate,
                     presetName = StreamFormatter.PRESET_NAME,
                     presetDescription = StreamFormatter.PRESET_DESCRIPTION,
+                    presets = StreamFormatter.PRESETS,
                     variables = StreamVariables.NAMES,
                 ))
             }
@@ -477,6 +498,68 @@ object WebAdmin {
                 call.respond(AdminActionResult(true, "Logs cleared"))
             }
 
+            // ── Stream Health & Tracking ─────────────────────────────────────
+
+            get("/stream-health") {
+                if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
+                val installed = RepoState.installedPlugins.value
+                val disabledList = StremioServer.disabledPlugins
+                val healthList = installed.map { p ->
+                    val isDisabled = disabledList.contains(p.internalName)
+                    StreamTracker.getHealth(p.internalName, p.displayName, !isDisabled, p.iconUrl)
+                }
+                call.respond(healthList)
+            }
+
+            post("/stream-health/disable-dead") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val installed = RepoState.installedPlugins.value
+                var count = 0
+                installed.forEach { p ->
+                    val health = StreamTracker.getHealth(p.internalName, p.displayName, true)
+                    if (health.totalRequests > 0 && health.successRequests == 0) {
+                        StremioServer.setPluginDisabled(p.internalName, true)
+                        count++
+                    }
+                }
+                if (count > 0) StremioServer.saveDisabledPlugins()
+                call.respond(AdminActionResult(true, "Disabled $count dead/empty plugin(s)"))
+            }
+
+            post("/stream-health/clear") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                StreamTracker.clear()
+                call.respond(AdminActionResult(true, "Stream tracking stats reset"))
+            }
+
+            post("/stream-health/probe") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val targetId = call.request.queryParameters["internalName"]
+                val query = call.request.queryParameters["query"]?.takeIf { it.isNotBlank() } ?: "Avatar"
+                if (!targetId.isNullOrBlank()) {
+                    val api = StremioServer.loadedApis.find {
+                        it.internalName == targetId || it.pluginInternalName == targetId ||
+                        it.name.equals(targetId, ignoreCase = true)
+                    }
+                    if (api == null) {
+                        return@post call.respond(AdminActionResult(false, "Source '$targetId' not found in loaded extensions"))
+                    }
+                    ServerState.info("🔍 Probing source [${api.name}] with query '$query'...")
+                    val streamCount = StremioServer.probeApi(api, query)
+                    val msg = if (streamCount > 0) "✅ [${api.name}] Probe successful: $streamCount stream(s) found"
+                              else "❌ [${api.name}] Probe returned 0 streams"
+                    call.respond(AdminActionResult(streamCount > 0, msg))
+                } else {
+                    ServerState.info("🔍 Running stream probe benchmark across all active providers (query: '$query')...")
+                    val results = StremioServer.probeAllApis(query)
+                    val success = results.values.count { it > 0 }
+                    val total = results.size
+                    val msg = "Benchmark complete: $success/$total active source(s) resolved streamable links"
+                    ServerState.info("🏁 $msg")
+                    call.respond(AdminActionResult(true, msg))
+                }
+            }
+
 
             // ── OTA updates ──────────────────────────────────────────────────
 
@@ -517,6 +600,95 @@ object WebAdmin {
                     installDownloadedUpdate(filePath)
                 }
                 call.respond(AdminActionResult(true, "Downloading update…"))
+            }
+
+            // ── Theme / Accent Customizer ──────────────────────────────────
+            post("/settings/theme") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val body = runCatching {
+                    val raw = call.receiveText()
+                    adminJson.decodeFromString<AdminThemeRequest>(raw)
+                }.getOrNull() ?: AdminThemeRequest()
+                val hex = body.accentHex?.trim().takeUnless { it.isNullOrBlank() } ?: ServerState.globalAccentHex
+                val glow = body.accentGlow?.trim().takeUnless { it.isNullOrBlank() } ?: ServerState.globalAccentGlow
+                val hover = body.accentHover?.trim().takeUnless { it.isNullOrBlank() } ?: ServerState.globalAccentHover
+                val base = body.baseTheme?.trim().takeUnless { it.isNullOrBlank() } ?: ServerState.globalBaseTheme
+                StremioServer.saveThemeConfig(hex, glow, hover, base)
+                call.respond(AdminActionResult(true, "Theme configuration updated"))
+            }
+
+            // ── Authors & Credits ──────────────────────────────────────────
+            get("/credits") {
+                if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
+                call.respond(StremioServer.getCreditsList())
+            }
+
+            post("/credits/save") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val raw = call.receiveText()
+                val list = runCatching {
+                    adminJson.decodeFromString<List<com.cncverse.stremiobridge.state.AuthorCredit>>(raw)
+                }.getOrElse {
+                    runCatching {
+                        val obj = adminJson.decodeFromString<Map<String, List<com.cncverse.stremiobridge.state.AuthorCredit>>>(raw)
+                        obj["credits"] ?: emptyList()
+                    }.getOrElse { emptyList() }
+                }
+                StremioServer.saveCredits(list)
+                call.respond(AdminActionResult(true, "Saved ${list.size} author credit(s)"))
+            }
+
+            get("/footer-credits") {
+                if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
+                call.respond(StremioServer.getFooterCredits())
+            }
+
+            post("/footer-credits/save") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val raw = call.receiveText()
+                val list = runCatching {
+                    adminJson.decodeFromString<List<com.cncverse.stremiobridge.state.FooterCredit>>(raw)
+                }.getOrElse { emptyList() }
+                StremioServer.saveFooterCredits(list)
+                call.respond(AdminActionResult(true, "Saved ${list.size} footer credit(s)"))
+            }
+
+            // ── Stream Cache Management & Link Inspector ──────────────────
+            get("/cache/stats") {
+                if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
+                call.respond(com.cncverse.stremiobridge.cache.StreamCacheManager.getStats())
+            }
+
+            get("/cache/config") {
+                if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
+                call.respond(com.cncverse.stremiobridge.cache.StreamCacheManager.config)
+            }
+
+            post("/cache/config") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val raw = call.receiveText()
+                val newConfig = adminJson.decodeFromString<com.cncverse.stremiobridge.cache.StreamCacheConfig>(raw)
+                com.cncverse.stremiobridge.cache.StreamCacheManager.updateConfig(newConfig)
+                call.respond(AdminActionResult(true, "Cache configuration saved"))
+            }
+
+            post("/cache/purge-expired") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val purged = com.cncverse.stremiobridge.cache.StreamCacheManager.purgeExpired()
+                call.respond(AdminActionResult(true, "Purged $purged expired stream entries"))
+            }
+
+            post("/cache/clear") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                com.cncverse.stremiobridge.cache.StreamCacheManager.clearAll()
+                call.respond(AdminActionResult(true, "Flushed all stream caches"))
+            }
+
+            get("/cache/inspect") {
+                if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
+                val url = call.parameters["url"] ?: ""
+                val result = com.cncverse.stremiobridge.cache.StreamCacheManager.inspectLink(url)
+                call.respond(result)
             }
         }
     }
@@ -566,11 +738,12 @@ object WebAdmin {
                 lanUrl = "$displayBase/manifest.json",
                 localhostUrl = "$displayBase/manifest.json",
                 stremioModeUrl = status.stremioModeStremioUrl,
+                disableCatalogsGlobally = ServerState.disableCatalogsGlobally,
             )
         }
-            is ServerStatus.Starting -> AdminServerInfo(status = "Starting", message = status.message)
-            is ServerStatus.Error -> AdminServerInfo(status = "Error", message = status.message)
-            else -> AdminServerInfo(status = "Stopped")
+            is ServerStatus.Starting -> AdminServerInfo(status = "Starting", message = status.message, disableCatalogsGlobally = ServerState.disableCatalogsGlobally)
+            is ServerStatus.Error -> AdminServerInfo(status = "Error", message = status.message, disableCatalogsGlobally = ServerState.disableCatalogsGlobally)
+            else -> AdminServerInfo(status = "Stopped", disableCatalogsGlobally = ServerState.disableCatalogsGlobally)
         }
 
         val repos = RepoState.repos.value.map { repo ->
@@ -635,6 +808,12 @@ object WebAdmin {
             refreshing = RepoState.isRefreshing.value,
             update = update,
             tokenRequired = adminToken != null,
+            themeAccent = ServerState.globalAccentHex,
+            themeGlow = ServerState.globalAccentGlow,
+            themeHover = ServerState.globalAccentHover,
+            baseTheme = ServerState.globalBaseTheme,
+            footerCredits = StremioServer.getFooterCredits(),
+            cacheStats = com.cncverse.stremiobridge.cache.StreamCacheManager.getStats(),
         )
     }
 

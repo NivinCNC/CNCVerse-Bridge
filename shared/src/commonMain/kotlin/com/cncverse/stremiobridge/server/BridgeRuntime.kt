@@ -92,6 +92,8 @@ object BridgeRuntime {
         doReloadPlugins()
     }
 
+    private val pluginMutationMutex = Mutex()
+
     private suspend fun doReloadPlugins() {
         val installed = withContext(Dispatchers.IO) { PluginInstaller.loadInstalledPlugins(cacheDir) }
         RepoState.setInstalledPlugins(installed)
@@ -102,7 +104,7 @@ object BridgeRuntime {
     }
 
     /** Install a plugin and hot-reload it into the running server. */
-    suspend fun installPlugin(ap: AvailablePlugin): Boolean {
+    suspend fun installPlugin(ap: AvailablePlugin): Boolean = pluginMutationMutex.withLock {
         val success = PluginInstaller.installPlugin(ap, cacheDir)
         if (success) {
             ServerState.info("Loading installed plugin '${ap.plugin.name}'…")
@@ -112,7 +114,7 @@ object BridgeRuntime {
     }
 
     /** Uninstall a plugin and hot-reload. */
-    suspend fun uninstallPlugin(internalName: String) {
+    suspend fun uninstallPlugin(internalName: String) = pluginMutationMutex.withLock {
         PluginInstaller.uninstallPlugin(internalName, cacheDir)
         forceReloadPlugins()
     }
@@ -122,7 +124,7 @@ object BridgeRuntime {
      * single [forceReloadPlugins] pass — more efficient than calling
      * [uninstallPlugin] in a loop.
      */
-    suspend fun uninstallPlugins(internalNames: List<String>) {
+    suspend fun uninstallPlugins(internalNames: List<String>) = pluginMutationMutex.withLock {
         if (internalNames.isEmpty()) return
         internalNames.forEach { PluginInstaller.uninstallPlugin(it, cacheDir) }
         forceReloadPlugins()
@@ -133,7 +135,7 @@ object BridgeRuntime {
      * their .cs3 / converted jar files, strips them from the global disabled
      * set and every profile, then hot-reloads once.
      */
-    suspend fun removeRepo(url: String) {
+    suspend fun removeRepo(url: String) = pluginMutationMutex.withLock {
         val pluginsToRemove = RepoState.installedPlugins.value
             .filter { it.repoUrl == url }
             .map { it.internalName }
@@ -261,15 +263,8 @@ object BridgeRuntime {
                     forceReloadPlugins()
                 }
 
-                // Fresh headless install (no installed_plugins.json on disk yet):
-                // download everything the configured repos offer so the server
-                // works out of the box — "install a repo, get all its extensions".
-                if (headlessMode && !File(cacheDir, "installed_plugins.json").exists()) {
-                    val repoUrls = RepoState.availablePlugins.value.map { it.repoEntry.url }.distinct()
-                    if (repoUrls.isNotEmpty()) {
-                        ServerState.info("Fresh install — downloading all extensions from ${repoUrls.size} repo(s)…")
-                        repoUrls.forEach { installAllFromRepo(it) }
-                    }
+                if (!File(cacheDir, "installed_plugins.json").exists()) {
+                    runCatching { File(cacheDir, "installed_plugins.json").writeText("[]") }
                 }
             }.onFailure { e ->
                 ServerState.warn("Repo refresh error: ${e.message}")

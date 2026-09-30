@@ -5,6 +5,7 @@ import com.cncverse.stremiobridge.model.SitePlugin
 import com.cncverse.stremiobridge.state.ServerState
 import io.ktor.client.*
 import io.ktor.client.engine.cio.*
+import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.*
 import io.ktor.client.request.*
 import io.ktor.client.plugins.defaultRequest
@@ -32,7 +33,12 @@ object PluginRepository {
 
     internal var httpClient = HttpClient(CIO) {
         install(ContentNegotiation) { json(repoJson) }
-        engine { requestTimeout = 30_000 }
+        install(HttpTimeout) {
+            requestTimeoutMillis = 15_000
+            connectTimeoutMillis = 10_000
+            socketTimeoutMillis = 15_000
+        }
+        engine { requestTimeout = 20_000 }
         defaultRequest {
             header(HttpHeaders.UserAgent, BROWSER_USER_AGENT)
             header(HttpHeaders.Accept, "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,text/plain,*/*;q=0.8")
@@ -112,16 +118,18 @@ object PluginRepository {
         }
     }
 
+    private fun getCandidateUrls(url: String): List<String> = buildList {
+        githubRawToJsDelivr(url)?.let { add(it) }
+        add(url)
+    }
+
     /**
      * Fetches the top-level [CncRepository] manifest from [url].
-     * Falls back to jsDelivr CDN mirror for GitHub raw URLs on failure.
+     * Tries jsDelivr CDN mirror first for GitHub raw URLs, falling back to original URL.
      * Returns null on failure.
      */
     suspend fun fetchRepoMeta(url: String): CncRepository? = withContext(Dispatchers.IO) {
-        val urls = buildList {
-            add(url)
-            githubRawToJsDelivr(url)?.let { add(it) }
-        }
+        val urls = getCandidateUrls(url)
         for (candidate in urls) {
             try {
                 val text = httpClient.get(candidate) {
@@ -141,13 +149,10 @@ object PluginRepository {
 
     /**
      * Fetches all [SitePlugin] entries from a single plugin-list URL.
-     * Falls back to jsDelivr CDN mirror for GitHub raw URLs on failure.
+     * Tries jsDelivr CDN mirror first for GitHub raw URLs, falling back to original URL.
      */
     suspend fun fetchPluginsFromUrl(listUrl: String): List<SitePlugin> = withContext(Dispatchers.IO) {
-        val urls = buildList {
-            add(listUrl)
-            githubRawToJsDelivr(listUrl)?.let { add(it) }
-        }
+        val urls = getCandidateUrls(listUrl)
         for (candidate in urls) {
             try {
                 val text = httpClient.get(candidate) {
@@ -185,10 +190,7 @@ object PluginRepository {
             }
 
             val safeUrl = plugin.url.replace(" ", "%20")
-            val urls = buildList {
-                add(safeUrl)
-                githubRawToJsDelivr(safeUrl)?.let { add(it) }
-            }
+            val urls = getCandidateUrls(safeUrl)
 
             for (candidate in urls) {
                 try {

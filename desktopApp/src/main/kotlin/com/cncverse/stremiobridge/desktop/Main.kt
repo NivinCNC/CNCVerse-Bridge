@@ -30,9 +30,15 @@ import androidx.compose.ui.Modifier
 import com.cncverse.stremiobridge.shadowui.ShadowUi
 import com.cncverse.stremiobridge.ui.MainScreen
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.first
 import java.awt.Toolkit
 import java.awt.datatransfer.StringSelection
 import java.io.File
+import java.net.NetworkInterface
+import java.net.Inet4Address
+import com.cncverse.stremiobridge.repo.PluginInstaller
+import com.cncverse.stremiobridge.server.StremioServer
+import com.cncverse.stremiobridge.tunnel.CloudflaredManager
 
 private const val DEFAULT_PORT = 8080
 private val CACHE_DIR: String = PlatformPaths.cacheDir.absolutePath

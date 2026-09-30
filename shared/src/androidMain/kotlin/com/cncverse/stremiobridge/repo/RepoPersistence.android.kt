@@ -41,3 +41,43 @@ actual fun saveExtensionSettings(settings: Map<String, String>) {
     }
     editor.apply()
 }
+
+private const val KEY_REPO_CACHE = "repo_cache_json"
+private val androidRepoJson = kotlinx.serialization.json.Json {
+    ignoreUnknownKeys = true
+    encodeDefaults = true
+}
+
+actual fun loadCachedRepoEntries(): List<com.cncverse.stremiobridge.state.RepoEntry> {
+    val prefs = AndroidContextHolder.appContext
+        .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val raw = prefs.getString(KEY_REPO_CACHE, null) ?: return emptyList()
+    return runCatching {
+        androidRepoJson.decodeFromString<List<com.cncverse.stremiobridge.state.RepoEntry>>(raw)
+    }.getOrDefault(emptyList())
+}
+
+actual fun saveCachedRepoEntries(entries: List<com.cncverse.stremiobridge.state.RepoEntry>) {
+    val prefs = AndroidContextHolder.appContext
+        .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val raw = runCatching { androidRepoJson.encodeToString(entries) }.getOrNull() ?: return
+    prefs.edit().putString(KEY_REPO_CACHE, raw).apply()
+}
+
+private const val KEY_AVAILABLE_PLUGINS_CACHE = "available_plugins_cache_json"
+
+actual fun loadCachedAvailablePlugins(): List<com.cncverse.stremiobridge.state.AvailablePlugin> {
+    val prefs = AndroidContextHolder.appContext
+        .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val raw = prefs.getString(KEY_AVAILABLE_PLUGINS_CACHE, null) ?: return emptyList()
+    return runCatching {
+        androidRepoJson.decodeFromString<List<com.cncverse.stremiobridge.state.AvailablePlugin>>(raw)
+    }.getOrDefault(emptyList())
+}
+
+actual fun saveCachedAvailablePlugins(plugins: List<com.cncverse.stremiobridge.state.AvailablePlugin>) {
+    val prefs = AndroidContextHolder.appContext
+        .getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    val raw = runCatching { androidRepoJson.encodeToString(plugins) }.getOrNull() ?: return
+    prefs.edit().putString(KEY_AVAILABLE_PLUGINS_CACHE, raw).apply()
+}
