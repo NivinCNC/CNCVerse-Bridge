@@ -1763,6 +1763,7 @@ function renderFormatter() {
       '<b>Modifiers</b> (chain with <code>::</code>): exists, length, join(&#39;sep&#39;), default(&#39;text&#39;), replace(&#39;a&#39;,&#39;b&#39;), upper, lower, title, trim, first, last, truncate(n), bytes (GB), bytes2 (GiB), istrue, isfalse<br>' +
       '<b>Comparisons</b>: <code>=</code> <code>!=</code> <code>&gt;</code> <code>&gt;=</code> <code>&lt;</code> <code>&lt;=</code> <code>~</code> (contains)<br>' +
       '<b>Conditions</b>: <code>{stream.resolution::=2160p["4K"||"HD"]}</code> &mdash; branches are templates and can nest; <code>["text"]</code> alone means empty otherwise<br>' +
+      '<b>stream.source</b> is the server the extension reports (e.g. FslServer, HubCloud) &mdash; empty when it just repeats the extension name<br>' +
       '<b>Lists</b>: stream.specs, stream.languages, stream.subtitles, stream.visualTags, stream.audioTags, stream.seasonEpisode &middot; <b>size</b> is in bytes (use bytes / bytes2)<br>' +
       'Size, languages and tags are parsed from the extension&#39;s release name, so they are only present when the source names them.' +
       '</div></div>';

@@ -443,7 +443,9 @@ object StreamVariables {
             "stream.seasonepisode" to seasonEpisode,
             "stream.season" to season?.toLong(),
             "stream.episode" to episode?.toLong(),
-            "stream.source" to info?.source,
+            // Server/extractor the extension reports (e.g. "FslServer", "HubCloud");
+            // empty when it just repeats the extension name, so templates can use ::exists
+            "stream.source" to info?.source?.trim()?.takeIf { it.isNotEmpty() && !it.equals(addon, ignoreCase = true) },
             "stream.filename" to linkText,
             "stream.name" to stream.name,
             "stream.title" to stream.title,
@@ -471,7 +473,7 @@ object StreamFormatter {
     const val PRESET_DESCRIPTION =
         "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('PenguPlay stream')}\"]}\n" +
         "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::=2160p[\"4K\"||\"{stream.resolution::default('Auto')}\"]} • {stream.streamType::default('HLS')}\"]}\n" +
-        "🛰️ Source: {addon.name}\n" +
+        "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}\n" +
         "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}\n" +
         "{stream.languages::exists[\"🎧 Audio: {stream.languages::join(', ')}\"||\"\"]}\n" +
         "{stream.subtitles::exists[\"📝 Subtitles: {stream.subtitles::join(', ')}\"||\"🙊 No included subtitles\"]}"
@@ -566,7 +568,7 @@ object StreamFormatter {
             name = "Slow Horses\nPrime Video - 1080p",
             title = "Slow Horses S01E03 1080p WEB-DL [Hindi + English] x264",
             url = "https://example.com/slow-horses/master.m3u8",
-            info = StreamInfo(addonName = "Prime Video", quality = 1080, linkType = "M3U8",
+            info = StreamInfo(addonName = "Prime Video", quality = 1080, linkType = "M3U8", source = "FslServer",
                 linkName = "Slow Horses S01E03 1080p WEB-DL [Hindi + English] x264",
                 metadataTitle = "Slow Horses", metadataYear = 2022),
         ) to StreamRequestContext(season = 1, episode = 3),
