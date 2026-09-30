@@ -280,7 +280,7 @@ object StreamVariables {
         "stream.resolution", "stream.quality", "stream.specs", "stream.visualTags", "stream.encode",
         "stream.audioTags", "stream.audioChannels", "stream.streamType", "stream.size",
         "stream.languages", "stream.subtitles", "stream.seasonEpisode", "stream.season",
-        "stream.episode", "stream.source", "stream.filename", "stream.name", "stream.title",
+        "stream.episode", "stream.source", "stream.label", "stream.filename", "stream.name", "stream.title",
     )
 
     private fun rx(p: String) = Regex("(?<![A-Za-z0-9])(?:$p)(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
@@ -410,6 +410,20 @@ object StreamVariables {
         return s.takeIf { it.isNotEmpty() && !it.equals(addon, ignoreCase = true) }
     }
 
+    /** Link name minus any leading addon/source prefix; null when nothing distinctive is left. */
+    private fun labelName(linkName: String?, addon: String?, rawSource: String?, source: String?): String? {
+        var s = linkName?.trim().orEmpty()
+        for (prefix in listOfNotNull(addon, rawSource, source).filter { it.isNotBlank() }.sortedByDescending { it.length }) {
+            if (s.startsWith(prefix, ignoreCase = true) && (s.length == prefix.length || !s[prefix.length].isLetterOrDigit())) {
+                s = s.substring(prefix.length).trimStart(' ', '-', ':', '•', '|')
+            }
+        }
+        s = s.trim()
+        if (s.isEmpty()) return null
+        if (listOfNotNull(addon, rawSource, source).any { it.equals(s, ignoreCase = true) }) return null
+        return s
+    }
+
     fun build(stream: StremioStream, ctx: StreamRequestContext): Map<String, Any?> {
         val info = stream.info
         val linkText = info?.linkName ?: stream.title
@@ -434,6 +448,7 @@ object StreamVariables {
 
         val addon = info?.addonName
             ?: stream.name?.substringAfterLast('\n')?.substringBefore(" - ")?.takeIf { it.isNotBlank() }
+        val source = sourceName(info?.source, addon)
 
         return mapOf(
             "addon.name" to addon,
@@ -455,7 +470,11 @@ object StreamVariables {
             "stream.episode" to episode?.toLong(),
             // Server/extractor the extension reports (e.g. "FslServer", "HubCloud");
             // empty when it just repeats the extension name, so templates can use ::exists
-            "stream.source" to sourceName(info?.source, addon),
+            "stream.source" to source,
+            // The link's own label from the extension — what tells links of the
+            // same item apart (live feeds like "Hindi" / "English", servers,
+            // release names). Empty when it only repeats the addon/source name.
+            "stream.label" to labelName(info?.linkName, addon, info?.source, source),
             "stream.filename" to linkText,
             "stream.name" to stream.name,
             "stream.title" to stream.title,
@@ -482,6 +501,7 @@ object StreamFormatter {
         "🐧 PenguPlay {stream.resolution::=2160p[\"❄️ 4K\"||\"{stream.resolution::=1080p[\"🧊 {stream.resolution::default('Auto')}\"||\"🐧 {stream.resolution::default('Auto')}\"]}\"]} • {addon.name}"
     const val PRESET_DESCRIPTION =
         "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('PenguPlay stream')}\"]}\n" +
+        "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
         "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::=2160p[\"4K\"||\"{stream.resolution::default('Auto')}\"]} • {stream.streamType::default('HLS')}\"]}\n" +
         "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}\n" +
         "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}\n" +

@@ -1251,14 +1251,14 @@ object StremioServer {
                     results.filter { r -> cs3TvTypeToStremio(r.type) == type }
                         .ifEmpty { results }
                 } else results
-                filtered.map { it.toStremiMeta(nameSlug(api.name), type) }
+                filtered.map { it.toStremiMeta(nameSlug(api.name), type) }.also { rememberTitles(it) }
             } else {
                 val results = api.getMainPage(page = (skip / 20) + 1, type = type, sectionName = sectionName)
                 val filtered = if (api.supportedTypes.size > 1) {
                     results.filter { r -> cs3TvTypeToStremio(r.type) == type }
                         .ifEmpty { results }
                 } else results
-                filtered.map { it.toStremiMeta(nameSlug(api.name), type) }
+                filtered.map { it.toStremiMeta(nameSlug(api.name), type) }.also { rememberTitles(it) }
             }
         } catch (e: Throwable) {
             ServerState.warn("Catalog error for ${api.name}: ${e.message}")
@@ -1301,6 +1301,33 @@ object StremioServer {
     }
 
 
+    /**
+     * Stremio item id → display title for items we served in catalogs/meta.
+     * Stream requests only carry the id, so this is how streams opened from our
+     * own catalogs (live events, provider home pages) learn their title for the
+     * stream formatter's metadata.title. Bounded LRU.
+     */
+    private val metaTitles = object : LinkedHashMap<String, String>(1024, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>?): Boolean = size > 20_000
+    }
+    private val LEADING_SYMBOLS = Regex("^[^\\p{L}\\p{N}]+")
+
+    private fun rememberTitles(metas: List<StremioMeta>) {
+        synchronized(metaTitles) { metas.forEach { m -> if (m.name.isNotBlank()) metaTitles[m.id] = m.name } }
+    }
+
+    /** Remembered title for [id], minus leading status emoji like "🔴 ". */
+    private fun titleForId(id: String): String? =
+        synchronized(metaTitles) { metaTitles[id] }?.replace(LEADING_SYMBOLS, "")?.trim()?.takeIf { it.isNotEmpty() }
+
+    private fun withMetadataTitle(streams: List<StremioStream>, title: String?): List<StremioStream> {
+        if (title == null) return streams
+        return streams.map { st ->
+            val info = st.info ?: com.cncverse.stremiobridge.model.StreamInfo()
+            if (info.metadataTitle != null) st else st.copy(info = info.copy(metadataTitle = title))
+        }
+    }
+
     // ── Meta builder ──────────────────────────────────────────────────────────
 
     private suspend fun buildMeta(type: String, id: String, profileId: String? = null): StremioMeta? {
@@ -1311,7 +1338,7 @@ object StremioServer {
             ?: return null
         if (isPluginBlocked(api, profileId)) return null
         return try {
-            api.load(dataUrl)?.toStremiMeta(nameSlug(api.name), type)
+            api.load(dataUrl)?.toStremiMeta(nameSlug(api.name), type)?.also { rememberTitles(listOf(it)) }
         } catch (e: Throwable) {
             ServerState.warn("Meta error for ${api.name}: ${e.message}")
             null
@@ -1433,7 +1460,7 @@ object StremioServer {
                             ServerState.info("[${api.name}] Loading links for $dataUrl")
                             val links = api.loadLinks(dataUrl)
                             ServerState.info("[${api.name}] Got ${links.size} stream(s)")
-                            accumulated.addAll(links)
+                            accumulated.addAll(withMetadataTitle(links, titleForId(id)))
                         } catch (e: Throwable) {
                             ServerState.warn("[${api.name}] Stream error: ${e.message}")
                         }
