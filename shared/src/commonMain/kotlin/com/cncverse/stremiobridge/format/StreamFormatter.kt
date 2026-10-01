@@ -424,6 +424,15 @@ object StreamVariables {
         return s
     }
 
+    /**
+     * The stream's resolution ("2160p", "1080p", …) or null when unknown: the
+     * quality the extension reported, else what the link's own name says.
+     * Never the matched release/page title — single source of truth for the
+     * formatter, the profile quality filter and stream sorting.
+     */
+    fun resolutionOf(stream: StremioStream): String? =
+        resolutionFrom(stream.info?.quality, stream.info?.linkName ?: stream.title)
+
     fun build(stream: StremioStream, ctx: StreamRequestContext): Map<String, Any?> {
         val info = stream.info
         val linkText = info?.linkName ?: stream.title
@@ -431,12 +440,17 @@ object StreamVariables {
         val releaseText = stream.name?.substringBeforeLast('\n', "")?.takeIf { it.isNotBlank() }
         val allText = listOfNotNull(linkText, releaseText, stream.name).joinToString(" ")
 
-        val resolution = resolutionFrom(info?.quality, linkText, releaseText, stream.name)
-        val quality = tags(allText, QUALITY_TAGS, firstOnly = true)
-        val visual = tags(allText, VISUAL_TAGS)
-        val encode = tags(allText, ENCODE_TAGS, firstOnly = true)
-        val audio = tags(allText, AUDIO_TAGS)
-        val channels = CHANNEL_RX.find(allText)?.value
+        // Per-file facts (resolution, HDR/DV, codec, audio) come only from the link itself.
+        // The matched release name is often a multi-quality pack page ("4K | 1080p | 720p",
+        // "HDR"), so reading it labelled every unlabelled link 4K/HDR. Source type and
+        // languages describe the whole release, so those may still use it.
+        val resolution = resolutionOf(stream)
+        val linkOnly = linkText.orEmpty()
+        val quality = tags(linkOnly, QUALITY_TAGS, firstOnly = true).ifEmpty { tags(allText, QUALITY_TAGS, firstOnly = true) }
+        val visual = tags(linkOnly, VISUAL_TAGS)
+        val encode = tags(linkOnly, ENCODE_TAGS, firstOnly = true)
+        val audio = tags(linkOnly, AUDIO_TAGS)
+        val channels = CHANNEL_RX.find(linkOnly)?.value
         val languages = LANGUAGES.filter { (_, r) -> r.containsMatchIn(allText) }.map { it.first }
 
         val sxe = SXE_RX.find(allText)
@@ -513,6 +527,40 @@ data class StreamFormatterConfig(
     val enabled: Boolean = false,
     val nameTemplate: String = "",
     val descriptionTemplate: String = "",
+)
+
+/**
+ * A user profile's own formatter choice.
+ *  - "default": follow the server formatter (admin setting)
+ *  - "off":     original stream names, no formatting
+ *  - "preset":  one of [StreamFormatter.PRESETS] by [presetId]
+ *  - "custom":  the profile's own [nameTemplate] / [descriptionTemplate]
+ */
+@Serializable
+data class ProfileFormatter(
+    val mode: String = "default",
+    val presetId: String = "",
+    val nameTemplate: String = "",
+    val descriptionTemplate: String = "",
+)
+
+@Serializable
+data class FormatterPreviewSample(val label: String, val name: String, val description: String)
+
+@Serializable
+data class FormatterPreviewResult(
+    val ok: Boolean,
+    val error: String? = null,
+    val samples: List<FormatterPreviewSample> = emptyList(),
+)
+
+/** What the user configure page needs to build its formatter editor. */
+@Serializable
+data class FormatterCatalog(
+    val presets: List<FormatterPreset>,
+    val variables: List<String>,
+    val serverFormatterEnabled: Boolean,
+    val maxTemplateChars: Int,
 )
 
 object StreamFormatter {
@@ -640,6 +688,89 @@ object StreamFormatter {
         if (n == null && d == null) return streams
         return streams.map { format(it, ctx, n, d) }
     }
+
+    // ── Per-profile (user) formatters ────────────────────────────────────────
+
+    /** Upper bound per user template — keeps parsing/rendering cost trivial. */
+    const val MAX_TEMPLATE_CHARS = 4000
+    private val PROFILE_MODES = setOf("default", "off", "preset", "custom")
+
+    /** Parsed user templates, keyed by their text (many profiles share presets/templates). */
+    private val parsedCache: MutableMap<String, Pair<Template?, Template?>> = java.util.Collections.synchronizedMap(
+        object : LinkedHashMap<String, Pair<Template?, Template?>>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<Template?, Template?>>?) = size > 500
+        }
+    )
+
+    private fun parsedPair(nameTemplate: String, descriptionTemplate: String): Pair<Template?, Template?> {
+        val key = nameTemplate + "\u0000" + descriptionTemplate
+        parsedCache[key]?.let { return it }
+        val pair = validate(StreamFormatterConfig(true, nameTemplate, descriptionTemplate))
+        parsedCache[key] = pair
+        return pair
+    }
+
+    /** Checks a profile formatter before saving; throws [TemplateException] with a user-facing message. */
+    fun validateProfile(pf: ProfileFormatter): ProfileFormatter {
+        if (pf.mode !in PROFILE_MODES) throw TemplateException("Unknown formatter mode '${pf.mode}'")
+        return when (pf.mode) {
+            "preset" -> {
+                if (PRESETS.none { it.id == pf.presetId }) throw TemplateException("Unknown preset '${pf.presetId}'")
+                ProfileFormatter(mode = "preset", presetId = pf.presetId)
+            }
+            "custom" -> {
+                if (pf.nameTemplate.length > MAX_TEMPLATE_CHARS || pf.descriptionTemplate.length > MAX_TEMPLATE_CHARS) {
+                    throw TemplateException("Templates are limited to $MAX_TEMPLATE_CHARS characters each")
+                }
+                if (pf.nameTemplate.isBlank() && pf.descriptionTemplate.isBlank()) {
+                    throw TemplateException("Write a name or description template first")
+                }
+                validate(StreamFormatterConfig(true, pf.nameTemplate, pf.descriptionTemplate))
+                pf.copy(presetId = "")
+            }
+            else -> ProfileFormatter(mode = pf.mode)
+        }
+    }
+
+    /** Formats a stream response for a profile: its own formatter, or the server's one. */
+    fun applyFor(streams: List<StremioStream>, ctx: StreamRequestContext, pf: ProfileFormatter?): List<StremioStream> {
+        val (n, d) = when (pf?.mode) {
+            null, "default" -> return apply(streams, ctx)
+            "off" -> return streams
+            "preset" -> PRESETS.find { it.id == pf.presetId }
+                ?.let { runCatching { parsedPair(it.nameTemplate, it.descriptionTemplate) }.getOrNull() }
+                ?: return apply(streams, ctx)
+            "custom" -> runCatching { parsedPair(pf.nameTemplate, pf.descriptionTemplate) }.getOrNull()
+                ?: return apply(streams, ctx)
+            else -> return apply(streams, ctx)
+        }
+        if (n == null && d == null) return streams
+        return streams.map { format(it, ctx, n, d) }
+    }
+
+    /** Renders [nameTemplate] / [descriptionTemplate] against the sample streams (admin + user preview). */
+    fun preview(nameTemplate: String, descriptionTemplate: String): FormatterPreviewResult {
+        if (nameTemplate.length > MAX_TEMPLATE_CHARS || descriptionTemplate.length > MAX_TEMPLATE_CHARS) {
+            return FormatterPreviewResult(false, "Templates are limited to $MAX_TEMPLATE_CHARS characters each")
+        }
+        return try {
+            val (n, d) = validate(StreamFormatterConfig(true, nameTemplate, descriptionTemplate))
+            val labels = listOf("4K movie (direct file)", "Series episode (HLS)", "Live channel (minimal data)")
+            FormatterPreviewResult(true, samples = samples().mapIndexed { i, (stream, ctx) ->
+                val out = format(stream, ctx, n, d)
+                FormatterPreviewSample(labels.getOrElse(i) { "Sample" }, out.name.orEmpty(), out.title.orEmpty())
+            })
+        } catch (e: TemplateException) {
+            FormatterPreviewResult(false, e.message)
+        }
+    }
+
+    fun catalog(): FormatterCatalog = FormatterCatalog(
+        presets = PRESETS,
+        variables = StreamVariables.NAMES,
+        serverFormatterEnabled = config.enabled,
+        maxTemplateChars = MAX_TEMPLATE_CHARS,
+    )
 
     /** Season/episode from a Stremio stream id like "tt0903747:1:3" or "tmdb:1396:1:3". */
     fun contextFromId(type: String, id: String): StreamRequestContext {

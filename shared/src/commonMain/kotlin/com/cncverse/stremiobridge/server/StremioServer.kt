@@ -192,6 +192,10 @@ object StremioServer {
         val excludeCam: Boolean = false,
         /** Maximum streams to return per quality tier (0 = unlimited). */
         val maxStreamsPerResolution: Int = 0,
+        /** The profile's own stream formatter choice (null = follow the server's formatter). */
+        val formatter: com.cncverse.stremiobridge.format.ProfileFormatter? = null,
+        /** User-chosen profile name, shown in the Stremio addon title ("CNCVerse Bridge · Kids"). */
+        val displayName: String = "",
         val createdAt: Long = 0,
         val lastSeen: Long = 0,
     )
@@ -390,6 +394,15 @@ object StremioServer {
         return result
     }
 
+    /** Present ⇔ the admin turned catalogs off globally (survives restarts). */
+    private var catalogsOffMarker: File? = null
+
+    internal fun saveGlobalCatalogSetting() {
+        val f = catalogsOffMarker ?: return
+        runCatching { if (ServerState.disableCatalogsGlobally) f.writeText("1") else f.delete() }
+            .onFailure { ServerState.warn("Failed to save global catalog setting: ${it.message}") }
+    }
+
     private fun loadThemeConfig() {
         val file = themeConfigFile ?: return
         if (file.exists()) {
@@ -553,6 +566,8 @@ object StremioServer {
             allowedResolutions = allowedResolutions ?: existing?.allowedResolutions ?: emptySet(),
             excludeCam = excludeCam ?: existing?.excludeCam ?: false,
             maxStreamsPerResolution = maxStreamsPerResolution ?: existing?.maxStreamsPerResolution ?: 0,
+            formatter = existing?.formatter,
+            displayName = existing?.displayName ?: "",
             createdAt = existing?.createdAt ?: now,
             lastSeen = now,
         )
@@ -651,7 +666,12 @@ object StremioServer {
         val allowedResolutionsJson = allowedResolutions.joinToString(",") { "\"" + it.replace("\"", "\\\"") + "\"" }
         val excludeCam = rec?.excludeCam ?: false
         val maxStreamsPerResolution = rec?.maxStreamsPerResolution ?: 0
-        val extra = if (nowEnabled != null) ",\"nowEnabled\":$nowEnabled" else ""
+        val extra = (if (nowEnabled != null) ",\"nowEnabled\":$nowEnabled" else "") +
+            ",\"displayName\":" + serverJson.encodeToString(kotlinx.serialization.json.JsonPrimitive.serializer(), kotlinx.serialization.json.JsonPrimitive(rec?.displayName ?: "")) +
+            ",\"formatter\":" + serverJson.encodeToString(
+                com.cncverse.stremiobridge.format.ProfileFormatter.serializer(),
+                rec?.formatter ?: com.cncverse.stremiobridge.format.ProfileFormatter(),
+            )
         return "{\"profileId\":\"" + profileId + "\",\"disabledExtensions\":[" + disabledJson +
             "],\"enabledExtensions\":[" + overridesJson +
             "],\"disableCatalogs\":" + disableCatalogs +
@@ -748,6 +768,8 @@ object StremioServer {
             loadFooterCredits()
             themeConfigFile = File(cacheDir, "theme_config.json")
             loadThemeConfig()
+            catalogsOffMarker = File(cacheDir, "catalogs_disabled_globally")
+            ServerState.disableCatalogsGlobally = catalogsOffMarker?.exists() == true
             com.cncverse.stremiobridge.format.StreamFormatter.init(cacheDir)
             com.cncverse.stremiobridge.cache.StreamCacheManager.init(cacheDir)
         } else {
@@ -1034,6 +1056,62 @@ object StremioServer {
                 val now = currentTimeMillis()
                 val existing = profiles.getOrPut(profileId) { ProfileRecord(createdAt = now, lastSeen = now) }
                 profiles[profileId] = existing.copy(disableCatalogs = disable, lastSeen = now)
+                saveProfiles()
+                call.respondText(profileJson(profileId), ContentType.Application.Json)
+            }
+
+            // ── User-side stream formatter ───────────────────────────────────
+
+            // Presets + variables for the configure page's formatter editor
+            get("/api/formatter") {
+                call.respond(com.cncverse.stremiobridge.format.StreamFormatter.catalog())
+            }
+
+            // Live preview of templates against sample streams (nothing is saved)
+            post("/api/formatter/preview") {
+                val body = runCatching {
+                    serverJson.decodeFromString<com.cncverse.stremiobridge.format.ProfileFormatter>(call.receiveText())
+                }.getOrNull() ?: return@post call.respond(HttpStatusCode.BadRequest)
+                val (n, d) = if (body.mode == "preset") {
+                    val p = com.cncverse.stremiobridge.format.StreamFormatter.PRESETS.find { it.id == body.presetId }
+                        ?: return@post call.respond(com.cncverse.stremiobridge.format.FormatterPreviewResult(false, "Unknown preset"))
+                    p.nameTemplate to p.descriptionTemplate
+                } else body.nameTemplate to body.descriptionTemplate
+                call.respond(com.cncverse.stremiobridge.format.StreamFormatter.preview(n, d))
+            }
+
+            // Save this profile's formatter choice
+            post("/api/profile/{profileId}/formatter") {
+                val profileId = call.parameters["profileId"] ?: return@post call.respond(HttpStatusCode.BadRequest)
+                val body = runCatching {
+                    serverJson.decodeFromString<com.cncverse.stremiobridge.format.ProfileFormatter>(call.receiveText())
+                }.getOrNull() ?: return@post call.respondText(
+                    "{\"error\":\"invalid formatter body\"}", ContentType.Application.Json, HttpStatusCode.BadRequest)
+                val cleaned = try {
+                    com.cncverse.stremiobridge.format.StreamFormatter.validateProfile(body)
+                } catch (e: com.cncverse.stremiobridge.format.TemplateException) {
+                    return@post call.respondText(
+                        "{\"error\":" + serverJson.encodeToString(kotlinx.serialization.json.JsonPrimitive.serializer(),
+                            kotlinx.serialization.json.JsonPrimitive(e.message ?: "Invalid template")) + "}",
+                        ContentType.Application.Json, HttpStatusCode.BadRequest)
+                }
+                val now = currentTimeMillis()
+                val existing = profiles.getOrPut(profileId) { ProfileRecord(createdAt = now, lastSeen = now) }
+                profiles[profileId] = existing.copy(formatter = cleaned.takeUnless { it.mode == "default" }, lastSeen = now)
+                saveProfiles()
+                call.respondText(profileJson(profileId), ContentType.Application.Json)
+            }
+
+            // Rename this profile (shown in the Stremio addon title)
+            post("/api/profile/{profileId}/name") {
+                val profileId = call.parameters["profileId"] ?: return@post call.respond(HttpStatusCode.BadRequest)
+                val raw = runCatching {
+                    serverJson.parseToJsonElement(call.receiveText()).jsonObject["displayName"]?.jsonPrimitive?.content
+                }.getOrNull().orEmpty()
+                val name = raw.filter { !it.isISOControl() }.trim().take(40)
+                val now = currentTimeMillis()
+                val existing = profiles.getOrPut(profileId) { ProfileRecord(createdAt = now, lastSeen = now) }
+                profiles[profileId] = existing.copy(displayName = name, lastSeen = now)
                 saveProfiles()
                 call.respondText(profileJson(profileId), ContentType.Application.Json)
             }
@@ -1344,9 +1422,11 @@ object StremioServer {
             sorted
         }
 
-        val formatted = com.cncverse.stremiobridge.format.StreamFormatter.apply(
+        // A profile's own formatter (preset / custom / off) wins; otherwise the server's.
+        val formatted = com.cncverse.stremiobridge.format.StreamFormatter.applyFor(
             filtered,
             com.cncverse.stremiobridge.format.StreamFormatter.contextFromId(type, id),
+            profileId?.let { profiles[it]?.formatter },
         )
         respond(StremioStreamResponse(formatted))
     }
@@ -1652,6 +1732,7 @@ object StremioServer {
         // Dynamic version hash so Stremio client invalidates manifest cache on config changes
         val configHash = (
             (if (rec?.disableCatalogs == true || ServerState.disableCatalogsGlobally) 1 else 0) * 397 xor
+            (rec?.displayName?.hashCode() ?: 0) * 7 xor
             (rec?.disabledCatalogs?.hashCode() ?: 0) * 31 xor
             (rec?.disabled?.hashCode() ?: 0) * 17 xor
             (rec?.enabledOverrides?.hashCode() ?: 0) xor
@@ -1662,7 +1743,8 @@ object StremioServer {
             id          = if (profileSuffix == null) "com.cncverse.stremiobridge"
                           else "com.cncverse.stremiobridge." + profileSuffix,
             version     = "1.0.$configHash",
-            name        = if (profileId == null) "CNCVerse Bridge" else "CNCVerse Bridge \u00B7 Profile",
+            name        = if (profileId == null) "CNCVerse Bridge"
+                          else "CNCVerse Bridge \u00B7 " + (profiles[profileId]?.displayName?.takeIf { it.isNotBlank() } ?: "Profile"),
             description = "Cloudstream plugin bridge for Stremio \u2014 Developed by NivinCNC",
             logo        = "https://raw.githubusercontent.com/NivinCNC/CNCVerse-Bridge/refs/heads/main/logo.png",
             types       = types,
@@ -1894,58 +1976,32 @@ object StremioServer {
 
     // ── Quality sorting ───────────────────────────────────────────────────────
 
-    private fun streamQualityRank(stream: StremioStream): Int {
-        val text = "${stream.name.orEmpty()} ${stream.title.orEmpty()}".uppercase()
-        val resMatch = Regex("(2160|1080|720|480|360)P").find(text)
-        if (resMatch != null) {
-            return when (resMatch.groupValues[1]) {
-                "2160" -> 5
-                "1080" -> 4
-                "720" -> 3
-                "480" -> 2
-                "360" -> 1
-                else -> 0
-            }
+    /** Sort rank from the stream's own resolution (never the release/page title). */
+    private fun streamQualityRank(stream: StremioStream): Int =
+        when (detectStreamResolution(stream)) {
+            "2160p" -> 5
+            "1080p" -> 4
+            "720p" -> 3
+            "480p" -> 2
+            "360p" -> 1
+            else -> 0
         }
-        return when {
-            Regex("\\b(4K|UHD)\\b").containsMatchIn(text)  -> 5
-            Regex("\\b(FHD)\\b").containsMatchIn(text)     -> 4
-            Regex("\\b(HD)\\b").containsMatchIn(text)       -> 3
-            Regex("\\b(SD)\\b").containsMatchIn(text)       -> 2
-            else                                          -> 0
-        }
-    }
 
     private fun sortStreamsByQuality(streams: List<StremioStream>): List<StremioStream> =
         streams.sortedByDescending { streamQualityRank(it) }
 
     /** Detects standard resolution tier: 2160p, 1080p, 720p, 480p, 360p, or other. */
-    fun detectStreamResolution(stream: StremioStream): String {
-        val q = stream.info?.quality
-        if (q != null && q > 0) {
-            return when {
-                q >= 2160 -> "2160p"
-                q >= 1080 -> "1080p"
-                q >= 720  -> "720p"
-                q >= 480  -> "480p"
-                q >= 360  -> "360p"
-                else      -> "${q}p"
-            }
+    fun detectStreamResolution(stream: StremioStream): String =
+        // Same rule as the formatter: reported quality, else the link's own name —
+        // never the matched release title (multi-quality pack pages say "4K 1080p 720p").
+        when (com.cncverse.stremiobridge.format.StreamVariables.resolutionOf(stream)) {
+            "4320p", "2160p" -> "2160p"
+            "1440p", "1080p" -> "1080p"
+            "720p" -> "720p"
+            "576p", "480p" -> "480p"
+            "360p" -> "360p"
+            else -> "other"
         }
-        val text = "${stream.name.orEmpty()} ${stream.title.orEmpty()}".uppercase()
-        val resMatch = Regex("(2160|1440|1080|720|480|360)P").find(text)
-        if (resMatch != null) {
-            val v = resMatch.groupValues[1]
-            return if (v == "1440") "1080p" else "${v}p"
-        }
-        return when {
-            Regex("\\b(4K|UHD)\\b").containsMatchIn(text) -> "2160p"
-            Regex("\\b(FHD)\\b").containsMatchIn(text)    -> "1080p"
-            Regex("\\b(HD)\\b").containsMatchIn(text)     -> "720p"
-            Regex("\\b(SD)\\b").containsMatchIn(text)     -> "480p"
-            else                                          -> "other"
-        }
-    }
 
     /** Returns true if the stream name/title indicates a CAM / TeleSync / Screener recording. */
     fun isCamStream(stream: StremioStream): Boolean {
@@ -3588,6 +3644,28 @@ input:checked + .slider:before {
 .author-link-btn.heart { color: #f43f5e; border-color: rgba(244, 63, 94, 0.28); background: rgba(244, 63, 94, 0.05); }
 .author-link-btn.heart:hover { color: #fff; border-color: #f43f5e; background: #f43f5e; }
 
+/* Profile switcher + user formatter cards */
+.u-card { background: var(--surface-card); border: 1px solid var(--border); border-radius: var(--card-radius); padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+.u-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.u-select, .u-input { background: var(--surface); border: 1.5px solid var(--border); border-radius: 7px; color: var(--text); font-size: 12.5px; font-weight: 600; padding: 6px 10px; outline: none; }
+.u-select { cursor: pointer; min-width: 160px; }
+.u-btn { background: var(--surface); border: 1.5px solid var(--border); border-radius: 7px; color: var(--text); font-size: 12px; font-weight: 700; padding: 6px 11px; cursor: pointer; }
+.u-btn:hover { border-color: var(--accent); }
+.u-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.u-btn.danger:hover { border-color: #f43f5e; color: #f43f5e; }
+.u-tpl { width: 100%; box-sizing: border-box; background: var(--surface); border: 1.5px solid var(--border); border-radius: 8px; color: var(--text); font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; padding: 8px 10px; resize: vertical; white-space: pre; overflow-x: auto; outline: none; }
+.u-tpl:focus, .u-input:focus, .u-select:focus { border-color: var(--accent); }
+.u-label { font-size: 11px; font-weight: 700; color: var(--text-sub); text-transform: uppercase; letter-spacing: .03em; }
+.u-sample { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 9px 11px; }
+.u-sample-kind { font-size: 10px; color: var(--text-sub); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }
+.u-sample-name { font-weight: 700; font-size: 12.5px; white-space: pre-wrap; word-break: break-word; margin-bottom: 4px; }
+.u-sample-desc { font-size: 12px; white-space: pre-wrap; word-break: break-word; opacity: .85; }
+.u-vars { display: flex; flex-wrap: wrap; gap: 5px; }
+.u-vars code { cursor: pointer; font-size: 11px; padding: 2px 6px; border-radius: 5px; background: var(--surface); border: 1px solid var(--border); }
+.u-vars code:hover { border-color: var(--accent); }
+.u-err { color: #f43f5e; background: rgba(244, 63, 94, 0.08); border-radius: 7px; padding: 7px 10px; font-size: 12px; white-space: pre-wrap; }
+.u-tag { font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px; background: var(--green-bg); color: var(--green); border: 1px solid rgba(16,185,129,0.25); }
+
 /* Toast */
 .toast {
   position: fixed;
@@ -3683,6 +3761,26 @@ input:checked + .slider:before {
       <div class="stat-lbl">SYNC</div>
       <div class="stat-val" id="stat-mode-val">Dev Choice</div>
       <div class="stat-sub" id="stat-sync-sub">Auto-sync on</div>
+    </div>
+  </div>
+
+  <!-- PROFILE SWITCHER (several profiles on one device, each its own addon) -->
+  <div class="u-card" id="profile-card">
+    <div class="u-row" style="justify-content:space-between;">
+      <div>
+        <div class="catalog-title" style="font-size:14px;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+          <span>Profiles</span>
+          <span class="u-tag" id="profile-count-tag">1 profile</span>
+        </div>
+        <div class="catalog-desc">Each profile is its own addon with its own sources, catalogs, quality and formatter. Install several side by side in Stremio.</div>
+      </div>
+    </div>
+    <div class="u-row">
+      <select class="u-select" id="profile-select" onchange="switchProfile(this.value)" title="Switch profile"></select>
+      <button class="u-btn" onclick="createProfile()">+ New</button>
+      <button class="u-btn" onclick="renameProfile()">Rename</button>
+      <button class="u-btn danger" onclick="removeProfile()">Remove</button>
     </div>
   </div>
 
@@ -3787,6 +3885,47 @@ input:checked + .slider:before {
         <input type="checkbox" id="q-exclude-cam" checked onchange="onQualityChange()" style="accent-color:var(--red); cursor:pointer;">
         <span>Block CAM / Screeners</span>
       </label>
+    </div>
+  </div>
+
+  <!-- USER STREAM FORMATTER (per profile) -->
+  <div class="u-card" id="formatter-card">
+    <div class="u-row" style="justify-content:space-between;">
+      <div>
+        <div class="catalog-title" style="font-size:14px;">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
+          <span>Stream Formatter</span>
+          <span class="u-tag" id="fmt-mode-tag">Server default</span>
+        </div>
+        <div class="catalog-desc">Choose how stream names and details look in Stremio for this profile &mdash; pick a preset or write your own.</div>
+      </div>
+    </div>
+    <div class="u-row">
+      <select class="u-select" id="ufmt-mode" onchange="onUserFormatterModeChange()"></select>
+      <button class="u-btn primary" onclick="saveUserFormatter()">Save</button>
+      <span id="ufmt-status" style="font-size:12px;"></span>
+    </div>
+    <div id="ufmt-custom" style="display:none; flex-direction:column; gap:8px;">
+      <div class="u-row">
+        <span class="u-label">Start from</span>
+        <select class="u-select" id="ufmt-start" onchange="copyPresetIntoCustom(this.value)"></select>
+      </div>
+      <label class="u-label" for="ufmt-name">Name template</label>
+      <textarea class="u-tpl" id="ufmt-name" rows="2" spellcheck="false" oninput="scheduleUserFormatterPreview()"></textarea>
+      <label class="u-label" for="ufmt-desc">Description template <span style="text-transform:none;font-weight:500;">(blank lines are removed)</span></label>
+      <textarea class="u-tpl" id="ufmt-desc" rows="7" spellcheck="false" oninput="scheduleUserFormatterPreview()"></textarea>
+      <details>
+        <summary style="cursor:pointer;font-size:12px;font-weight:700;color:var(--text-sub);">Variables &amp; syntax</summary>
+        <div class="u-vars" id="ufmt-vars" style="margin-top:8px;"></div>
+        <div style="font-size:11.5px;line-height:1.7;color:var(--text-sub);margin-top:8px;">
+          Click a variable to insert it. Modifiers chain with <code>::</code> &mdash; exists, length, join('sep'), default('text'), replace('a','b'), upper, lower, title, truncate(n), bytes2.
+          Conditions: <code>{stream.resolution::=2160p["4K"||"HD"]}</code>. Compare with = != &gt; &gt;= &lt; &lt;= ~ (contains).
+        </div>
+      </details>
+    </div>
+    <div>
+      <div class="u-label" style="margin-bottom:6px;">Preview</div>
+      <div id="ufmt-preview" style="display:flex; flex-direction:column; gap:6px;"></div>
     </div>
   </div>
 
@@ -3935,6 +4074,13 @@ input:checked + .slider:before {
       <div style="display:flex;align-items:center;gap:10px;">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm4.64 6.8c-.15 1.58-.8 5.42-1.13 7.19-.14.75-.42 1-.68 1.03-.58.05-1.02-.38-1.58-.75-.88-.58-1.38-.94-2.23-1.5-.99-.65-.35-1.01.22-1.59.15-.15 2.71-2.48 2.76-2.69a.2.2 0 0 0-.05-.18c-.06-.05-.14-.03-.21-.02-.09.02-1.49.95-4.22 2.79-.4.27-.76.41-1.08.4-.36-.01-1.04-.2-1.55-.37-.63-.2-1.12-.31-1.08-.66.02-.18.27-.36.74-.55 2.92-1.27 4.86-2.11 5.83-2.51 2.78-1.16 3.35-1.36 3.73-1.36.08 0 .27.02.39.12.1.08.13.19.14.27-.01.06.01.24 0 .38z"/></svg>
         <span>Telegram Community</span>
+      </div>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+    </a>
+    <a class="drawer-btn" href="https://discord.gg/djuu5s2b8e" target="_blank" rel="noopener">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M20.32 4.37A19.8 19.8 0 0 0 15.4 2.84a.07.07 0 0 0-.08.04c-.21.38-.45.87-.61 1.25a18.3 18.3 0 0 0-5.49 0 12.6 12.6 0 0 0-.62-1.25.08.08 0 0 0-.08-.04 19.7 19.7 0 0 0-4.92 1.53.07.07 0 0 0-.03.03C.53 9.05-.32 13.58.1 18.06a.08.08 0 0 0 .03.06 19.9 19.9 0 0 0 6 3.03.08.08 0 0 0 .08-.03c.46-.63.87-1.3 1.23-1.99a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1 0-.13l.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01l.37.29a.08.08 0 0 1 0 .13c-.6.35-1.22.65-1.87.89a.08.08 0 0 0-.04.11c.36.7.78 1.36 1.23 1.99a.08.08 0 0 0 .08.03 19.8 19.8 0 0 0 6.01-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03zM8.02 15.33c-1.18 0-2.16-1.09-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.33-.96 2.42-2.16 2.42zm7.97 0c-1.18 0-2.15-1.09-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.33-.95 2.42-2.16 2.42z"/></svg>
+        <span>Discord Community</span>
       </div>
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
     </a>
@@ -4683,12 +4829,261 @@ function loadRepos() {
       repos = data || [];
       populateDropdownFilters();
       updateMetrics();
-      var m = document.getElementById("credits-modal");
-      if (m && m.classList.contains("open")) {
-        renderCreditsModal();
-      }
+      // The credits modal is rendered when opened; re-rendering it from this
+      // 15 s refresh made the open Developer Credits view reload and jump.
     })
     .catch(function(){});
+}
+
+/* ── Multiple profiles on one device ─────────────────────────────────────────
+   The device keeps a list of its profiles in localStorage; each profile is a
+   separate server-side profile (own manifest URL, sources, catalogs, quality
+   and formatter), so several can be installed side by side in Stremio. */
+var PROFILES_KEY = "cnc_profiles";
+
+function writeProfileList(list) {
+  try { localStorage.setItem(PROFILES_KEY, JSON.stringify(list)); } catch (e) {}
+}
+
+function readProfileList() {
+  var list = [];
+  try { list = JSON.parse(localStorage.getItem(PROFILES_KEY) || "[]") || []; } catch (e) { list = []; }
+  list = list.filter(function(p) { return p && typeof p.id === "string" && p.id.length >= 8; });
+  if (!list.some(function(p) { return p.id === pid; })) {
+    list.push({ id: pid, name: list.length ? ("Profile " + (list.length + 1)) : "Main" });
+    writeProfileList(list);
+  }
+  return list;
+}
+
+function newProfileId() {
+  return "p_" + Math.random().toString(36).slice(2, 10) + Math.random().toString(36).slice(2, 6);
+}
+
+function renderProfileBar() {
+  var list = readProfileList();
+  var sel = document.getElementById("profile-select");
+  if (sel) {
+    sel.innerHTML = list.map(function(p) {
+      return '<option value="' + esc(p.id) + '"' + (p.id === pid ? ' selected' : '') + '>' + esc(p.name || p.id) + '</option>';
+    }).join("");
+  }
+  var tag = document.getElementById("profile-count-tag");
+  if (tag) tag.textContent = list.length + (list.length === 1 ? " profile" : " profiles");
+}
+
+function switchProfile(id) {
+  if (!id || id === pid) return;
+  localStorage.setItem("stremio_profile_id", id);
+  window.location.href = "/u/" + encodeURIComponent(id) + "/configure";
+}
+
+function syncProfileName(id, name) {
+  return fetch("/api/profile/" + encodeURIComponent(id) + "/name", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ displayName: name })
+  }).catch(function() {});
+}
+
+function createProfile() {
+  var list = readProfileList();
+  var name = prompt("Name for the new profile (e.g. Kids, Movies, Living room):", "Profile " + (list.length + 1));
+  if (name === null) return;
+  name = String(name).trim().slice(0, 40) || ("Profile " + (list.length + 1));
+  var id = newProfileId();
+  list.push({ id: id, name: name });
+  writeProfileList(list);
+  syncProfileName(id, name).then(function() { switchProfile(id); });
+}
+
+function renameProfile() {
+  var list = readProfileList();
+  var cur = list.filter(function(p) { return p.id === pid; })[0];
+  var name = prompt("Rename this profile:", cur ? cur.name : "");
+  if (name === null) return;
+  name = String(name).trim().slice(0, 40);
+  if (!name) return;
+  list.forEach(function(p) { if (p.id === pid) p.name = name; });
+  writeProfileList(list);
+  renderProfileBar();
+  syncProfileName(pid, name).then(function() { toast("Profile renamed"); });
+}
+
+function removeProfile() {
+  var list = readProfileList();
+  if (list.length <= 1) { toast("This is your only profile — create another one first"); return; }
+  if (!confirm("Remove this profile from this device? If it is installed in Stremio, uninstall it there too.")) return;
+  list = list.filter(function(p) { return p.id !== pid; });
+  writeProfileList(list);
+  switchProfile(list[0].id);
+}
+
+/* Keep the device's profile name and the server's (shown in Stremio) in sync. */
+function applyServerProfileName(p) {
+  var list = readProfileList();
+  var cur = list.filter(function(x) { return x.id === pid; })[0];
+  if (!cur) return;
+  if (p.displayName && p.displayName !== cur.name) {
+    cur.name = p.displayName;
+    writeProfileList(list);
+    renderProfileBar();
+  } else if (!p.displayName && cur.name) {
+    syncProfileName(pid, cur.name);
+  }
+}
+
+/* ── User stream formatter (per profile) ─────────────────────────────────── */
+var ufmtCatalog = null;
+var ufmtState = { mode: "default", presetId: "", nameTemplate: "", descriptionTemplate: "" };
+var ufmtPreviewTimer = null;
+var ufmtLastFocus = null;
+
+document.addEventListener("focusin", function(ev) {
+  var t = ev.target;
+  if (t && (t.id === "ufmt-name" || t.id === "ufmt-desc")) ufmtLastFocus = t;
+});
+
+function loadFormatterCatalog() {
+  fetch("/api/formatter")
+    .then(function(r) { return r.json(); })
+    .then(function(c) { ufmtCatalog = c; renderUserFormatterControls(); })
+    .catch(function() {});
+}
+
+function renderUserFormatterControls() {
+  if (!ufmtCatalog) return;
+  var opts = '<option value="default">Server default' + (ufmtCatalog.serverFormatterEnabled ? '' : ' (original names)') + '</option>' +
+    '<option value="off">Original names (no formatting)</option>';
+  ufmtCatalog.presets.forEach(function(p) {
+    opts += '<option value="preset:' + esc(p.id) + '">Preset: ' + esc(p.title) + '</option>';
+  });
+  opts += '<option value="custom">Custom (write your own)</option>';
+  var sel = document.getElementById("ufmt-mode");
+  sel.innerHTML = opts;
+  sel.value = ufmtState.mode === "preset" ? ("preset:" + ufmtState.presetId) : ufmtState.mode;
+  if (!sel.value) sel.value = "default";
+
+  var start = '<option value="">— copy a preset to edit —</option>';
+  ufmtCatalog.presets.forEach(function(p) { start += '<option value="' + esc(p.id) + '">' + esc(p.title) + '</option>'; });
+  document.getElementById("ufmt-start").innerHTML = start;
+
+  var vars = document.getElementById("ufmt-vars");
+  vars.innerHTML = ufmtCatalog.variables.map(function(v) {
+    return '<code data-var="' + esc(v) + '">{' + esc(v) + '}</code>';
+  }).join("");
+  vars.onclick = function(ev) {
+    var v = ev.target && ev.target.getAttribute ? ev.target.getAttribute("data-var") : null;
+    if (v) insertFormatterVariable("{" + v + "}");
+  };
+
+  document.getElementById("ufmt-name").value = ufmtState.nameTemplate || "";
+  document.getElementById("ufmt-desc").value = ufmtState.descriptionTemplate || "";
+  updateUserFormatterUI();
+}
+
+function insertFormatterVariable(text) {
+  var ta = ufmtLastFocus || document.getElementById("ufmt-desc");
+  var s = ta.selectionStart == null ? ta.value.length : ta.selectionStart;
+  var e = ta.selectionEnd == null ? s : ta.selectionEnd;
+  ta.value = ta.value.slice(0, s) + text + ta.value.slice(e);
+  ta.focus();
+  ta.setSelectionRange(s + text.length, s + text.length);
+  scheduleUserFormatterPreview();
+}
+
+function currentUserFormatter() {
+  var v = document.getElementById("ufmt-mode").value || "default";
+  if (v.indexOf("preset:") === 0) return { mode: "preset", presetId: v.slice(7), nameTemplate: "", descriptionTemplate: "" };
+  if (v === "custom") {
+    return { mode: "custom", presetId: "",
+      nameTemplate: document.getElementById("ufmt-name").value,
+      descriptionTemplate: document.getElementById("ufmt-desc").value };
+  }
+  return { mode: v, presetId: "", nameTemplate: "", descriptionTemplate: "" };
+}
+
+function updateUserFormatterUI() {
+  var f = currentUserFormatter();
+  document.getElementById("ufmt-custom").style.display = f.mode === "custom" ? "flex" : "none";
+  var tag = document.getElementById("fmt-mode-tag");
+  if (tag) {
+    tag.textContent = f.mode === "default" ? "Server default" : f.mode === "off" ? "Original names" : f.mode === "custom" ? "Custom" : "Preset";
+  }
+  previewUserFormatter();
+}
+
+function onUserFormatterModeChange() {
+  var f = currentUserFormatter();
+  // Switching to Custom with empty boxes: start from the first preset
+  if (f.mode === "custom" && !document.getElementById("ufmt-name").value &&
+      !document.getElementById("ufmt-desc").value && ufmtCatalog && ufmtCatalog.presets.length) {
+    copyPresetIntoCustom(ufmtCatalog.presets[0].id);
+  }
+  updateUserFormatterUI();
+}
+
+function copyPresetIntoCustom(id) {
+  if (!id || !ufmtCatalog) return;
+  var p = ufmtCatalog.presets.filter(function(x) { return x.id === id; })[0];
+  if (!p) return;
+  document.getElementById("ufmt-name").value = p.nameTemplate;
+  document.getElementById("ufmt-desc").value = p.descriptionTemplate;
+  document.getElementById("ufmt-start").value = "";
+  scheduleUserFormatterPreview();
+}
+
+function scheduleUserFormatterPreview() {
+  clearTimeout(ufmtPreviewTimer);
+  ufmtPreviewTimer = setTimeout(previewUserFormatter, 350);
+}
+
+function previewUserFormatter() {
+  var box = document.getElementById("ufmt-preview");
+  if (!box) return;
+  var f = currentUserFormatter();
+  if (f.mode === "off" || (f.mode === "default" && ufmtCatalog && !ufmtCatalog.serverFormatterEnabled)) {
+    box.innerHTML = '<div style="font-size:12px;color:var(--text-sub);">Streams keep the names their extensions give them.</div>';
+    return;
+  }
+  if (f.mode === "default") {
+    box.innerHTML = '<div style="font-size:12px;color:var(--text-sub);">Uses the server&#39;s formatter, as set by the admin.</div>';
+    return;
+  }
+  fetch("/api/formatter/preview", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(f) })
+    .then(function(r) { return r.json(); })
+    .then(function(res) {
+      if (!res.ok) { box.innerHTML = '<div class="u-err">' + esc(res.error || "Invalid template") + '</div>'; return; }
+      box.innerHTML = (res.samples || []).map(function(s) {
+        return '<div class="u-sample"><div class="u-sample-kind">' + esc(s.label) + '</div>' +
+          '<div class="u-sample-name">' + esc(s.name) + '</div>' +
+          '<div class="u-sample-desc">' + esc(s.description) + '</div></div>';
+      }).join("");
+    })
+    .catch(function() { box.innerHTML = '<div class="u-err">Preview unavailable</div>'; });
+}
+
+function saveUserFormatter() {
+  var f = currentUserFormatter();
+  var st = document.getElementById("ufmt-status");
+  fetch("/api/profile/" + encodeURIComponent(pid) + "/formatter", {
+    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(f)
+  })
+    .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, body: j }; }); })
+    .then(function(res) {
+      if (!res.ok) { st.innerHTML = '<span style="color:#f43f5e;">' + esc(res.body.error || "Could not save") + '</span>'; return; }
+      ufmtState = res.body.formatter || f;
+      st.innerHTML = '<span style="color:var(--green);">Saved</span>';
+      toast("Formatter saved — Stremio shows it on the next stream list");
+      setTimeout(function() { st.innerHTML = ""; }, 3000);
+    })
+    .catch(function(e) { st.innerHTML = '<span style="color:#f43f5e;">' + esc(e.message) + '</span>'; });
+}
+
+function applyUserFormatterFromProfile(p) {
+  if (!p || !p.formatter) return;
+  ufmtState = p.formatter;
+  if (ufmtCatalog) renderUserFormatterControls();
 }
 
 function loadProfile() {
@@ -4702,11 +5097,16 @@ function loadProfile() {
       pData._d = new Set(pData.disabledExtensions);
       pData._e = new Set(pData.enabledExtensions);
       pData._dc = new Set(pData.disabledCatalogs);
+      // Load the saved catalog toggle too — without this the page always assumed
+      // "catalogs on" after a refresh and the next save overwrote the real setting.
+      pData.disableCatalogs = p.disableCatalogs || false;
       pData.allowedResolutions = p.allowedResolutions || [];
       pData.excludeCam = p.excludeCam || false;
       pData.maxStreamsPerResolution = p.maxStreamsPerResolution || 0;
 
       applyQualityPreferences(p);
+      applyUserFormatterFromProfile(p);
+      applyServerProfileName(p);
 
       if (pData._d.size > 0 || pData._e.size > 0 || pData._dc.size > 0 || pData.disableCatalogs) {
         localStorage.setItem("cnc_customized_" + pid, "true");
@@ -5040,6 +5440,8 @@ function loadFooterCredits() {
 updateUrls();
 loadExts();
 loadRepos();
+renderProfileBar();
+loadFormatterCatalog();
 loadProfile();
 loadStats();
 loadFooterCredits();

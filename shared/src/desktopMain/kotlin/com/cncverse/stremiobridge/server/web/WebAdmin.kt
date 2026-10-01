@@ -228,6 +228,7 @@ object WebAdmin {
             post("/server/toggle-catalogs") {
                 if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
                 ServerState.disableCatalogsGlobally = !ServerState.disableCatalogsGlobally
+                StremioServer.saveGlobalCatalogSetting()
                 val msg = if (ServerState.disableCatalogsGlobally) "Catalogs disabled globally (Streams & Search only)"
                           else "Catalogs enabled globally"
                 ServerState.info("⚙️ $msg")
@@ -643,9 +644,9 @@ object WebAdmin {
                 }.getOrElse {
                     runCatching {
                         val obj = adminJson.decodeFromString<Map<String, List<com.cncverse.stremiobridge.state.AuthorCredit>>>(raw)
-                        obj["credits"] ?: emptyList()
-                    }.getOrElse { emptyList() }
-                }
+                        obj["credits"]
+                    }.getOrNull()
+                } ?: return@post call.respond(AdminActionResult(false, "Invalid credits data — nothing was saved"))
                 StremioServer.saveCredits(list)
                 call.respond(AdminActionResult(true, "Saved ${list.size} author credit(s)"))
             }
@@ -660,7 +661,7 @@ object WebAdmin {
                 val raw = call.receiveText()
                 val list = runCatching {
                     adminJson.decodeFromString<List<com.cncverse.stremiobridge.state.FooterCredit>>(raw)
-                }.getOrElse { emptyList() }
+                }.getOrNull() ?: return@post call.respond(AdminActionResult(false, "Invalid footer credits data — nothing was saved"))
                 StremioServer.saveFooterCredits(list)
                 call.respond(AdminActionResult(true, "Saved ${list.size} footer credit(s)"))
             }

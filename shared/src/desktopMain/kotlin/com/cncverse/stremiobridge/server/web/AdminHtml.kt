@@ -1549,6 +1549,13 @@ main#view {
       </div>
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
     </a>
+    <a class="drawer-btn" href="https://discord.gg/djuu5s2b8e" target="_blank" rel="noopener">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M20.32 4.37A19.8 19.8 0 0 0 15.4 2.84a.07.07 0 0 0-.08.04c-.21.38-.45.87-.61 1.25a18.3 18.3 0 0 0-5.49 0 12.6 12.6 0 0 0-.62-1.25.08.08 0 0 0-.08-.04 19.7 19.7 0 0 0-4.92 1.53.07.07 0 0 0-.03.03C.53 9.05-.32 13.58.1 18.06a.08.08 0 0 0 .03.06 19.9 19.9 0 0 0 6 3.03.08.08 0 0 0 .08-.03c.46-.63.87-1.3 1.23-1.99a.08.08 0 0 0-.04-.11 13.1 13.1 0 0 1-1.87-.89.08.08 0 0 1 0-.13l.37-.29a.07.07 0 0 1 .08-.01c3.93 1.79 8.18 1.79 12.06 0a.07.07 0 0 1 .08.01l.37.29a.08.08 0 0 1 0 .13c-.6.35-1.22.65-1.87.89a.08.08 0 0 0-.04.11c.36.7.78 1.36 1.23 1.99a.08.08 0 0 0 .08.03 19.8 19.8 0 0 0 6.01-3.03.08.08 0 0 0 .03-.05c.5-5.18-.84-9.68-3.55-13.66a.06.06 0 0 0-.03-.03zM8.02 15.33c-1.18 0-2.16-1.09-2.16-2.42 0-1.33.96-2.42 2.16-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.33-.96 2.42-2.16 2.42zm7.97 0c-1.18 0-2.15-1.09-2.15-2.42 0-1.33.95-2.42 2.15-2.42 1.21 0 2.18 1.1 2.16 2.42 0 1.33-.95 2.42-2.16 2.42z"/></svg>
+        <span>Discord Community</span>
+      </div>
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+    </a>
     <a class="drawer-btn" href="https://cncverse.pages.dev" target="_blank" rel="noopener">
       <div style="display:flex;align-items:center;gap:10px;color:var(--red);">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/></svg>
@@ -2955,6 +2962,7 @@ function renderAbout() {
   html += '<div class="row" style="margin-top:14px;gap:6px">';
   html += '<a class="pill" href="https://github.com/NivinCNC/CNCVerse-Bridge" target="_blank" rel="noreferrer">GitHub</a>';
   html += '<a class="pill" href="https://t.me/cncverse" target="_blank" rel="noreferrer">Telegram</a>';
+  html += '<a class="pill" href="https://discord.gg/djuu5s2b8e" target="_blank" rel="noreferrer">Discord</a>';
   html += '<a class="pill" href="https://cncverse.pages.dev" target="_blank" rel="noreferrer">Support</a>';
   html += '</div>';
   html += '<div class="muted" style="margin-top:16px;font-size:12px;line-height:1.6;">Made with <span style="color:#f43f5e">&#10084;&#65039;</span> &bull; <a href="https://t.me/NivinCNC" target="_blank" rel="noreferrer" style="color:var(--text);text-decoration:none;font-weight:700;">NivinCNC</a> <span style="opacity:0.5;font-size:10px;">Bridge Creator &amp; Maintainer</span> &bull; <a href="https://discord.com/users/sleepycat555" target="_blank" rel="noreferrer" style="color:var(--text);text-decoration:none;font-weight:700;">Ayu</a> <span style="opacity:0.5;font-size:10px;">UI &amp; JVM Core Developer</span></div>';
@@ -3164,20 +3172,39 @@ var creditsData = [];
 var footerCreditsData = [];
 var creditsLoaded = false;
 var creditsSubTab = 'team'; // 'team' | 'repos' | 'footer'
+var creditsDirty = false;   // unsaved edits in the Credits tab
+var creditsLoadSeq = 0;     // only the newest load may apply
 
-function loadCredits() {
+// force = explicit Reload. Otherwise unsaved edits are never overwritten by a
+// (possibly slow) load — that's what used to revert edited URLs before Save.
+function loadCredits(force) {
+  if (creditsDirty && !force) {
+    if (tab === "credits") renderCredits();
+    return;
+  }
+  var seq = ++creditsLoadSeq;
   Promise.all([
     api("/credits"),
     api("/footer-credits")
   ]).then(function(res) {
+    if (seq !== creditsLoadSeq) return;          // a newer load superseded this one
+    if (creditsDirty && !force) return;          // user started editing meanwhile
     creditsData = res[0] || [];
     footerCreditsData = res[1] || [];
     creditsLoaded = true;
+    creditsDirty = false;
     if (tab === "credits") renderCredits();
     updateAdminSidebarFooter();
   }).catch(function(e) {
     if (tab === "credits") toast("Failed to load credits: " + e.message);
   });
+}
+
+function reloadCredits() {
+  if (creditsDirty && !confirm("Discard your unsaved credit changes?")) return;
+  creditsDirty = false;
+  creditsLoaded = false;
+  loadCredits(true);
 }
 
 function renderCredits() {
@@ -3192,7 +3219,7 @@ function renderCredits() {
     html += '<button class="primary small" onclick="addNewFooterCredit()">+ Add Footer Credit</button>';
   }
   html += '<button class="success small" onclick="saveAllCredits()">Save All Changes</button>';
-  html += '<button class="ghost small" onclick="creditsLoaded=false; loadCredits();">' + svgRefresh + ' Reload</button>';
+  html += '<button class="ghost small" onclick="reloadCredits()">' + svgRefresh + ' Reload</button>';
   html += '</div></div>';
 
   var teamEntries = creditsData.filter(function(c) { return c.isCurated && (!c.repoUrl || c.repoUrl === ""); });
@@ -3368,10 +3395,12 @@ function renderCredits() {
 }
 
 function updateCreditField(idx, field, value) {
+  creditsDirty = true;
   if (creditsData[idx]) creditsData[idx][field] = value;
 }
 
 function addNewAuthorCredit() {
+  creditsDirty = true;
   creditsData.push({
     id: "author_" + Date.now(),
     authorName: "",
@@ -3391,11 +3420,13 @@ function addNewAuthorCredit() {
 }
 
 function deleteAuthorCredit(idx) {
+  creditsDirty = true;
   creditsData.splice(idx, 1);
   renderCredits();
 }
 
 function moveCredit(idx, dir) {
+  creditsDirty = true;
   var target = idx + dir;
   if (target < 0 || target >= creditsData.length) return;
   var temp = creditsData[idx];
@@ -3405,6 +3436,7 @@ function moveCredit(idx, dir) {
 }
 
 function addNewFooterCredit() {
+  creditsDirty = true;
   footerCreditsData.push({
     id: "ft_" + Date.now(),
     label: "Developed by",
@@ -3417,12 +3449,14 @@ function addNewFooterCredit() {
 }
 
 function deleteFooterCredit(idx) {
+  creditsDirty = true;
   footerCreditsData.splice(idx, 1);
   renderCredits();
   updateAdminSidebarFooter();
 }
 
 function moveFooterCredit(idx, dir) {
+  creditsDirty = true;
   var target = idx + dir;
   if (target < 0 || target >= footerCreditsData.length) return;
   var temp = footerCreditsData[idx];
@@ -3433,6 +3467,7 @@ function moveFooterCredit(idx, dir) {
 }
 
 function updateFooterCreditField(idx, field, value) {
+  creditsDirty = true;
   if (footerCreditsData[idx]) {
     footerCreditsData[idx][field] = value;
     updateAdminSidebarFooter();
@@ -3473,7 +3508,10 @@ function saveAllCredits() {
       method: "POST",
       body: JSON.stringify(footerCreditsData)
     })
-  ]).then(function() {
+  ]).then(function(results) {
+    var failed = results.filter(function(r) { return r && r.ok === false; });
+    if (failed.length) { toast("Save failed: " + (failed[0].message || "server rejected the data")); return; }
+    creditsDirty = false;
     toast("✓ Author & Footer credits saved!");
     updateAdminSidebarFooter();
   }).catch(function(e) {
