@@ -4640,9 +4640,9 @@ function renderCards() {
   custEl.innerHTML = filtered.map(function(e){
     var isSelected = isExtActive(e);
 
-    // metadata text (e.g. 4K · Movies, Series · Repo · Lang)
+    // metadata text (e.g. Movies, Series · Repo · Lang). No resolution badge:
+    // extensions don't declare a max quality, so a fixed "4K" was wrong for most.
     var parts = [];
-    parts.push('<span class="p-res-highlight">4K</span>');
     if (e.types && e.types.length) {
       parts.push('<span class="p-types-badge">' + esc(e.types.join(", ")) + '</span>');
     }
