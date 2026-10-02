@@ -109,6 +109,21 @@ object SegmentCache {
 
     fun unmarkPrefetching(key: String) = prefetchingUrls.remove(key)
 
+    /** Live segment URL (without query) → the segments listed after it in the last playlist. */
+    private class NextSegs(val at: Long, val urls: List<String>)
+    private val nextSegments = ConcurrentHashMap<String, NextSegs>()
+
+    fun rememberNextSegments(ordered: List<String>, ahead: Int) {
+        val now = System.currentTimeMillis()
+        // Only the live edge matters: players sit ~20 s behind it
+        val tail = ordered.takeLast(20)
+        for (i in 0 until tail.size - 1) {
+            nextSegments[tail[i].substringBefore("?")] = NextSegs(now, tail.subList(i + 1, minOf(tail.size, i + 1 + ahead)).toList())
+        }
+    }
+
+    fun nextSegments(url: String): List<String>? = nextSegments[url.substringBefore("?")]?.urls
+
     // ==================== Single-flight ====================
 
     /**
@@ -162,6 +177,8 @@ object SegmentCache {
                 .forEach { cleanedInitCache.remove(it) }
         }
 
+        nextSegments.entries.removeIf { now - it.value.at > 120_000L }
+
         // Clean MPD cache
         mpdCache.entries.removeIf { now - it.value.timestamp > MPD_CACHE_TTL_MS * 5 }
         if (mpdCache.size > MAX_MPD_CACHE_SIZE) {
@@ -177,5 +194,6 @@ object SegmentCache {
         segmentCache.clear()
         mpdCache.clear()
         prefetchingUrls.clear()
+        nextSegments.clear()
     }
 }

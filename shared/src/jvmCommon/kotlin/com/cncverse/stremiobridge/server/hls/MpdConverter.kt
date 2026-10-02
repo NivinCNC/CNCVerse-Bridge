@@ -32,6 +32,11 @@ class MpdConverter {
         private const val HLS_VERSION = 6
         private const val DEFAULT_TARGET_DURATION = 6 // Ridotto per latenza migliore
         private const val MAX_LIVE_SEGMENTS = 5000  // Large cap for multi-period MPDs with DVR windows
+        // Live playlists only list the last 90 s. Jio advertises a 30-min DVR window (900 segments,
+        // ~700 KB per playlist) that every viewer re-downloads every few seconds — players start
+        // 20 s behind the edge (EXT-X-START) and never use the rest.
+        private const val MAX_LIVE_PLAYLIST_SECONDS = 90.0
+        const val PREFETCH_AHEAD = 3
         private const val LIVE_WINDOW_SECONDS = 180  // Default fallback; overridden by timeShiftBufferDepth
         
         // Stateful tracker for live HLS MEDIA-SEQUENCE.
@@ -222,7 +227,8 @@ class MpdConverter {
 
         // Parse timeShiftBufferDepth for live window (fallback to LIVE_WINDOW_SECONDS)
         val liveWindowSeconds = if (isLive) {
-            parseDuration(mpd.getAttribute("timeShiftBufferDepth")) ?: LIVE_WINDOW_SECONDS.toDouble()
+            (parseDuration(mpd.getAttribute("timeShiftBufferDepth")) ?: LIVE_WINDOW_SECONDS.toDouble())
+                .coerceAtMost(MAX_LIVE_PLAYLIST_SECONDS)
         } else {
             LIVE_WINDOW_SECONDS.toDouble()
         }
@@ -337,6 +343,12 @@ class MpdConverter {
         }
 
         val totalDuration = segments.sumOf { it.duration }
+
+        // Tell the decrypt relay which segments follow each one, so it can fetch ahead whatever
+        // the naming scheme (Jio's numbers are timestamps: +1200 per segment, not +1)
+        if (isLive && segments.size > 1) {
+            SegmentCache.rememberNextSegments(segments.map { it.url }, PREFETCH_AHEAD)
+        }
 
         // Calcola TARGETDURATION dal segmento più lungo + 1 (come EasyProxy)
         val maxDuration = segments.maxOfOrNull { it.duration } ?: DEFAULT_TARGET_DURATION.toDouble()

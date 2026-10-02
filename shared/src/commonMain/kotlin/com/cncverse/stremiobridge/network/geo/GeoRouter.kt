@@ -61,7 +61,7 @@ data class GeoProxySettings(
      */
     val ultrasurfProxy: String = System.getenv("CNC_ULTRASURF_PROXY")?.trim().orEmpty(),
     /** Host suffixes that always go through Ultrasurf (never public proxies, never skipped). */
-    val ultrasurfDomains: List<String> = listOf("workers.dev", "jio.com"),
+    val ultrasurfDomains: List<String> = listOf("workers.dev"),
 )
 
 val DEFAULT_DOMAIN_RULES: Map<String, String> = mapOf(
@@ -643,14 +643,21 @@ object GeoRouter {
         @Volatile var standby: PooledProxy? = null
             private set
         @Volatile var lastUsed = System.currentTimeMillis()
+        @Volatile private var lastReview = System.currentTimeMillis()
 
         @Synchronized
         fun current(): PooledProxy? {
-            lastUsed = System.currentTimeMillis()
+            val now = System.currentTimeMillis()
+            lastUsed = now
             // Hot path (every segment of every viewer): keep a working pair without rescanning the pool
             val p = primary
             val s = standby
-            if (p != null && s != null && ProxyPool.isUsable(p) && ProxyPool.isUsable(s)) return p
+            if (p != null && s != null && ProxyPool.isUsable(p) && ProxyPool.isUsable(s)) {
+                if (now - lastReview < REVIEW_MS) return p
+                lastReview = now
+                reviewSpeed(p)
+                return primary
+            }
             val healthy = ProxyPool.healthy(country).map { it.endpoint.key }.toSet()
             if (primary != null && primary!!.endpoint.key !in healthy) {
                 setPrimary(standby?.takeIf { it.endpoint.key in healthy })
@@ -662,6 +669,22 @@ object GeoRouter {
                 standby = ProxyPool.leastLoaded(country, setOfNotNull(primary?.endpoint?.key), host, cap)
             }
             return primary
+        }
+
+        /**
+         * Moves the channel to a clearly faster proxy: off Ultrasurf as soon as a pool proxy
+         * is available, or to one measured at more than twice the speed while this one is
+         * too slow for HD (< 1.5 MB/s).
+         */
+        private fun reviewSpeed(p: PooledProxy) {
+            val best = ProxyPool.leastLoaded(country, setOf(p.endpoint.key), host, settings.maxStreamsPerProxy) ?: return
+            val mine = ProxyPool.effectiveKbps(p)
+            val better = (p.builtin && !best.builtin) ||
+                (best.kbps > 0 && best.kbps > 2 * mine && mine < 1_500)
+            if (!better) return
+            ServerState.info("[GeoProxy] stream $key: ${p.endpoint.key} (${mine.toInt()} KB/s) → ${best.endpoint.key} (${ProxyPool.effectiveKbps(best).toInt()} KB/s) — faster")
+            setPrimary(best)
+            standby = ProxyPool.leastLoaded(country, setOf(best.endpoint.key), host, settings.maxStreamsPerProxy)
         }
 
         private fun setPrimary(p: PooledProxy?) {
@@ -693,6 +716,7 @@ object GeoRouter {
     }
 
     private val leases = ConcurrentHashMap<String, StreamLease>()
+    private const val REVIEW_MS = 15_000L
     private const val LEASE_IDLE_MS = 2 * 60_000L
 
     /** Live channel key: CDN host + the channel's directory (segments/renditions share it). */

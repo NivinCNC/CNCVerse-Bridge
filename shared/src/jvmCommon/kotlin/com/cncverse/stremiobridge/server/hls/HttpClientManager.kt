@@ -1,6 +1,8 @@
 package com.cncverse.stremiobridge.server.hls
 
 import okhttp3.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.InetSocketAddress
@@ -143,7 +145,8 @@ object HttpClientManager {
                     com.cncverse.stremiobridge.network.geo.ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
                     // Another proxy got through, so the earlier 403s were about those IPs (e.g. Ultrasurf)
                     refused.forEach { com.cncverse.stremiobridge.network.geo.ProxyPool.banForHost(request.url.host, it) }
-                    return resp
+                    // Tag which proxy carried it, so the body download can be credited to its speed
+                    return resp.newBuilder().header(VIA_PROXY_HEADER, p.endpoint.key).build()
                 }
             } catch (e: java.io.IOException) {
                 lease.failover(p, e.javaClass.simpleName)
@@ -206,7 +209,87 @@ object HttpClientManager {
             if (!response.isSuccessful) {
                 throw httpError(response)
             }
-            response.body?.bytes() ?: throw Exception("Empty response body")
+            readTimed(response)
+        }
+    }
+
+    private const val VIA_PROXY_HEADER = "X-Cnc-Via-Proxy"
+
+    /** Reads the body; when a pool proxy carried it, credits the transfer speed to that proxy. */
+    private fun readTimed(response: Response): ByteArray {
+        val started = System.currentTimeMillis()
+        val bytes = response.body?.bytes() ?: throw Exception("Empty response body")
+        response.header(VIA_PROXY_HEADER)?.let { key ->
+            com.cncverse.stremiobridge.network.geo.ProxyPool.reportThroughput(key, bytes.size.toLong(), System.currentTimeMillis() - started)
+        }
+        return bytes
+    }
+
+    /**
+     * Media segment fetch with a hedge for slow tunnels. Ultrasurf (Jio) often answers
+     * fast but then trickles one connection at ~2 Mbps, so a 2 s segment can take 3–6 s
+     * and the player stalls. If the plain fetch isn't done after [hedgeAfterMs], the same
+     * segment is also fetched as parallel byte ranges (separate connections), which
+     * measured 0.45–0.8 s every time; whichever finishes first wins.
+     */
+    suspend fun getSegmentBytes(
+        url: String,
+        headers: Map<String, String> = emptyMap(),
+        proxyUrl: String? = null,
+        hedgeAfterMs: Long = 1_200L,
+    ): ByteArray {
+        // Detached from the caller: a losing fetch is a blocking OkHttp read that can't be
+        // interrupted, and the caller must not wait for it to trickle to the end
+        val primary = hedgeScope.async { runCatching { getBytes(url, headers, proxyUrl) } }
+        // Fast path — and errors that come back before the hedge point propagate as before
+        kotlinx.coroutines.withTimeoutOrNull(hedgeAfterMs) { primary.await() }?.let { return it.getOrThrow() }
+        val hedge = hedgeScope.async { runCatching { getBytesRanged(url, headers, proxyUrl) } }
+        val (first, primaryWon) = kotlinx.coroutines.selects.select<Pair<Result<ByteArray>, Boolean>> {
+            primary.onAwait { it to true }
+            hedge.onAwait { it to false }
+        }
+        if (first.isSuccess) return first.getOrThrow()
+        // One side failed: the other may still make it
+        val second = (if (primaryWon) hedge else primary).await()
+        return second.getOrElse { throw first.exceptionOrNull()!! }
+    }
+
+    private val hedgeScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO)
+
+    /** Fetches [url] as [parts] parallel byte ranges; falls back to the whole body if ranges aren't supported. */
+    private suspend fun getBytesRanged(
+        url: String,
+        headers: Map<String, String>,
+        proxyUrl: String?,
+        parts: Int = 4,
+    ): ByteArray = kotlinx.coroutines.coroutineScope {
+        val firstLen = 256L * 1024
+        val (first, total) = fetchRange(url, headers, proxyUrl, 0, firstLen - 1)
+        if (total == null || total <= first.size) return@coroutineScope first // no range support / small file
+        val rest = total - first.size
+        val chunk = (rest + parts - 1) / parts
+        val ranges = (0 until parts).map { i ->
+            val start = first.size + i * chunk
+            start to minOf(total - 1, start + chunk - 1)
+        }.filter { it.first <= it.second }
+        val bodies = ranges.map { (s, e) ->
+            async(kotlinx.coroutines.Dispatchers.IO) { fetchRange(url, headers, proxyUrl, s, e).first }
+        }.awaitAll()
+        val out = java.io.ByteArrayOutputStream(total.toInt())
+        out.write(first)
+        bodies.forEach { out.write(it) }
+        out.toByteArray().also { if (it.size.toLong() != total) throw java.io.IOException("Ranged fetch size ${it.size} != $total") }
+    }
+
+    /** One byte range; returns the bytes and the full size (null when the server ignored Range). */
+    private fun fetchRange(url: String, headers: Map<String, String>, proxyUrl: String?, start: Long, end: Long): Pair<ByteArray, Long?> {
+        val request = buildRequest(url, headers + ("Range" to "bytes=$start-$end"))
+        return routed(request, proxyUrl, url, pluginOf(headers)).use { response ->
+            if (!response.isSuccessful) throw httpError(response)
+            val body = readTimed(response)
+            if (response.code != 206) return@use body to null
+            val total = response.header("Content-Range")?.substringAfter('/')?.trim()?.toLongOrNull()
+            body to total
         }
     }
 

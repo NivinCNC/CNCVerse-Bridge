@@ -59,16 +59,26 @@ object DecryptHandler {
             // Check cache first
             val segmentCacheKey = "${decodedSegmentUrl.substringBefore("?")}_${keyId}"
             val cached = SegmentCache.getSegment(segmentCacheKey)
-            if (cached != null) {
-                respondBytesOrHead(call, cached, ContentType.parse("video/mp4"), false)
-                return
-            }
-
             // Extract custom headers
             val queryParams = call.request.queryParameters.entries()
                 .associate { it.key to it.value.firstOrNull().orEmpty() }
             val customHeaders = HttpClientManager.extractHeadersFromParams(queryParams)
             val proxyUrl: String? = null
+
+            if (cached != null) {
+                // Keep the look-ahead rolling on cache hits too — otherwise every few segments
+                // the player catches up with the prefetched ones and waits on a cold fetch
+                prefetchNextSegments(
+                    currentSegmentUrl = decodedSegmentUrl,
+                    initUrl = decodedInitUrl,
+                    keyId = keyId,
+                    key = key,
+                    headers = customHeaders,
+                    proxyUrl = proxyUrl
+                )
+                respondBytesOrHead(call, cached, ContentType.parse("video/mp4"), false)
+                return
+            }
 
             withContext(Dispatchers.IO) {
               // One upstream fetch+decrypt per segment, shared by every viewer asking for it at once
@@ -231,7 +241,7 @@ object DecryptHandler {
                 }
             }
             val segmentDeferred = async {
-                HttpClientManager.getBytes(url = segmentUrl, headers = headers, proxyUrl = proxyUrl)
+                HttpClientManager.getSegmentBytes(url = segmentUrl, headers = headers, proxyUrl = proxyUrl)
             }
             Pair(initDeferred.await(), segmentDeferred.await())
         }
@@ -306,16 +316,17 @@ object DecryptHandler {
         proxyUrl: String?,
         count: Int = 3
     ) {
-        val regex = Regex("""[_-](\d+)\.m4[sv]""")
-        val match = regex.find(currentSegmentUrl) ?: return
-        val currentNum = match.groupValues[1].toIntOrNull() ?: return
+        // Live playlists record the real next segments (any naming scheme); otherwise guess +1
+        val nextUrls = SegmentCache.nextSegments(currentSegmentUrl) ?: run {
+            val regex = Regex("""[_-](\d+)\.m4[sv]""")
+            val match = regex.find(currentSegmentUrl) ?: return
+            val currentNum = match.groupValues[1].toIntOrNull() ?: return
+            (1..count).map { i ->
+                currentSegmentUrl.replace(regex, match.value.replace(currentNum.toString(), (currentNum + i).toString()))
+            }
+        }
 
-        for (i in 1..count) {
-            val nextNum = currentNum + i
-            val nextUrl = currentSegmentUrl.replace(
-                regex,
-                match.value.replace(currentNum.toString(), nextNum.toString())
-            )
+        for (nextUrl in nextUrls.take(count)) {
 
             val segmentCacheKey = "${nextUrl.substringBefore("?")}_$keyId"
 
@@ -334,7 +345,7 @@ object DecryptHandler {
                             HttpClientManager.getBytes(url = it, headers = headers, proxyUrl = proxyUrl)
                         }
 
-                    val segmentContent = HttpClientManager.getBytes(
+                    val segmentContent = HttpClientManager.getSegmentBytes(
                         url = nextUrl,
                         headers = headers,
                         proxyUrl = proxyUrl
