@@ -354,7 +354,7 @@ object StremioServer {
             val ghUser = ghMatch?.groupValues?.get(1) ?: ""
             val ghRepo = ghMatch?.groupValues?.get(2)?.removeSuffix(".git") ?: ""
             val liveAuthorName = repo.name.ifBlank { ghUser.ifBlank { repo.url.substringAfterLast("/").ifBlank { "Unknown Repo" } } }
-            val liveAvatar = repo.iconUrl?.takeUnless { it.isBlank() } ?: (if (ghUser.isNotBlank()) "https://github.com/$ghUser.png" else null)
+            val liveAvatar = PublicUrls.safeForBrowser(repo.iconUrl) ?: (if (ghUser.isNotBlank()) "https://github.com/$ghUser.png" else null)
             val liveGhLink = if (ghUser.isNotBlank() && ghRepo.isNotBlank()) "https://github.com/$ghUser/$ghRepo" else null
             val id = "repo_" + kotlin.math.abs(repo.url.hashCode())
 
@@ -1236,7 +1236,7 @@ object StremioServer {
                         put("repoUrl", kotlinx.serialization.json.JsonPrimitive(repoUrl))
                         put("repoName", kotlinx.serialization.json.JsonPrimitive(repoName))
                         put("lang", kotlinx.serialization.json.JsonPrimitive(lang))
-                        put("iconUrl", kotlinx.serialization.json.JsonPrimitive(plugin?.iconUrl.orEmpty()))
+                        put("iconUrl", kotlinx.serialization.json.JsonPrimitive(PublicUrls.safeForBrowser(plugin?.iconUrl).orEmpty()))
                         put("description", kotlinx.serialization.json.JsonPrimitive(plugin?.description?.replace("\n", " ").orEmpty()))
                         put("types", kotlinx.serialization.json.JsonArray(types.map { kotlinx.serialization.json.JsonPrimitive(it) }))
                         // working | proxy | dead | unknown — from real traffic + the nightly probe
@@ -1260,7 +1260,7 @@ object StremioServer {
                     if (i > 0) sb.append(",")
                     val name = repo.name.ifBlank { repo.url }.replace("\"", "\\\"")
                     val url = repo.url.replace("\"", "\\\"")
-                    val icon = repo.iconUrl?.replace("\"", "\\\"") ?: ""
+                    val icon = PublicUrls.safeForBrowser(repo.iconUrl)?.replace("\"", "\\\"") ?: ""
                     val desc = repo.description?.replace("\"", "\\\"") ?: ""
                     val count = com.cncverse.stremiobridge.state.RepoState.availablePlugins.value
                         .count { it.repoEntry.url == repo.url }
@@ -5711,8 +5711,8 @@ fun SearchResult.toStremiMeta(pluginInternalName: String, stremioType: String): 
         id          = encodedId,
         type        = resolvedType,
         name        = name,
-        poster      = posterUrl,
-        background  = if (isHorizontal) posterUrl else null,
+        poster      = PublicUrls.safeForBrowser(posterUrl),
+        background  = if (isHorizontal) PublicUrls.safeForBrowser(posterUrl) else null,
         posterShape = if (isHorizontal) "landscape" else "poster",
         genres      = null,
         year        = year,
@@ -5727,7 +5727,7 @@ fun MediaInfo.toStremiMeta(pluginInternalName: String, stremioType: String) = St
     id          = StremioIds.encode(pluginInternalName, dataUrl),
     type        = cs3TvTypeToStremio(type),
     name        = name,
-    poster      = posterUrl,
+    poster      = PublicUrls.safeForBrowser(posterUrl),
     description = description,
     year        = year,
     videos      = episodes?.mapIndexed { index, ep ->
@@ -5736,7 +5736,7 @@ fun MediaInfo.toStremiMeta(pluginInternalName: String, stremioType: String) = St
             title    = ep.name ?: "Episode ${ep.episode ?: (index + 1)}",
             season   = ep.season ?: 1,
             episode  = ep.episode ?: (index + 1),
-            thumbnail= ep.posterUrl ?: posterUrl
+            thumbnail= PublicUrls.safeForBrowser(ep.posterUrl ?: posterUrl)
         )
     }
 )

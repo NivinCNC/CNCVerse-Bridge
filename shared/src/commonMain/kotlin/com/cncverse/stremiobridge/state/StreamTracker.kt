@@ -205,7 +205,13 @@ object StreamTracker {
                 if (key == pluginInternalName && internalName != pluginInternalName && s.lastProbeTime >= now - 60_000) {
                     // Several APIs of one plugin: the plugin keeps the best result of this sweep
                     s.lastDirectProbeStreams = maxOf(s.lastDirectProbeStreams, directStreams)
-                    s.lastProxyProbeStreams = maxOf(s.lastProxyProbeStreams, proxyStreams)
+                    // Links anywhere win; otherwise an inconclusive API (-2) keeps the plugin from being DEAD
+                    val a = s.lastProxyProbeStreams
+                    s.lastProxyProbeStreams = when {
+                        a > 0 || proxyStreams > 0 -> maxOf(a, proxyStreams)
+                        a == -2 || proxyStreams == -2 -> -2
+                        else -> maxOf(a, proxyStreams)
+                    }
                     if (proxyCountry != null) s.lastProxyCountry = proxyCountry
                     if (directStreams > 0 || proxyStreams > 0) s.lastProbeNote = note
                 } else {

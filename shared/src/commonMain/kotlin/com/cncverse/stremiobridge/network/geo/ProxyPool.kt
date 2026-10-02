@@ -254,10 +254,12 @@ object ProxyPool {
      * Up to [n] proxies for [country], best first, spreading load across the
      * top few. Empty when the pool is still being built.
      */
-    fun pick(country: String, n: Int = 2, exclude: Set<String> = emptySet(), host: String? = null): List<PooledProxy> {
+    fun pick(country: String, n: Int = 2, exclude: Set<String> = emptySet(), host: String? = null, residentialOnly: Boolean = false): List<PooledProxy> {
         demand(country)
         val banned = host?.let { bannedFor(it) }.orEmpty()
-        val ranked = healthy(country).filter { it.endpoint.key !in exclude && it.endpoint.key !in banned }.sortedBy { it.score }
+        val ranked = healthy(country)
+            .filter { it.endpoint.key !in exclude && it.endpoint.key !in banned && (!residentialOnly || it.residential || it.custom) }
+            .sortedBy { it.score }
         if (ranked.isEmpty()) return emptyList()
         val head = ranked.take(3).shuffled()
         return (head + ranked.drop(3)).take(n)

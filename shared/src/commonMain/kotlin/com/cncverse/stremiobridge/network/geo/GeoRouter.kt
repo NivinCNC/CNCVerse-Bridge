@@ -373,6 +373,12 @@ object GeoRouter {
     /** Health tracking asks whether a success came through a proxy. */
     internal fun routesViaProxy(plugin: String): Boolean = usesProxy(plugin)
 
+    /** Requests of a forced-proxy health probe that no proxy could carry (per plugin). */
+    private val probeMisses = ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
+
+    fun resetProbeMisses(plugin: String) { probeMisses.remove(plugin) }
+    fun probeMisses(plugin: String): Int = probeMisses[plugin]?.get() ?: 0
+
     fun needsProxy(plugin: String): Boolean = (pluginProxy[plugin] ?: 0L) > System.currentTimeMillis()
 
     private fun event(plugin: String?, message: String) {
@@ -399,11 +405,11 @@ object GeoRouter {
      * for the next one. Returns the first usable response, the last blocked
      * one when nothing better came back, or null when no proxy answered.
      */
-    fun viaPool(plugin: String?, country: String, req: Request): Response? {
+    fun viaPool(plugin: String?, country: String, req: Request, residentialOnly: Boolean = false): Response? {
         val tried = HashSet<String>()
         var lastBlocked: Response? = null
         repeat(3) {
-            val p = ProxyPool.pick(country, 1, tried, req.url.host).firstOrNull() ?: return lastBlocked
+            val p = ProxyPool.pick(country, 1, tried, req.url.host, residentialOnly).firstOrNull() ?: return lastBlocked
             tried += p.endpoint.key
             val started = System.currentTimeMillis()
             try {
@@ -453,7 +459,14 @@ object GeoRouter {
                 Decision.DIRECT -> return chain.proceed(req)
 
                 Decision.PROXY_FIRST -> {
-                    if (retryable(req)) viaPool(plugin, country!!, req)?.let { return it }
+                    // Health probes only trust residential/private proxies (datacenter refusals prove nothing)
+                    val probing = mode == RouteMode.FORCE_PROXY
+                    val r = if (retryable(req)) viaPool(plugin, country!!, req, residentialOnly = probing) else null
+                    if (probing && (r == null || r.code in GEO_BLOCK_CODES || r.header("cf-mitigated") != null)) {
+                        // The "via proxy" probe did not really get through a proxy here
+                        plugin?.let { probeMisses.getOrPut(it) { java.util.concurrent.atomic.AtomicInteger() }.incrementAndGet() }
+                    }
+                    r?.let { return it }
                     return chain.proceed(req)
                 }
 
@@ -520,8 +533,11 @@ object GeoRouter {
             if (plugin == null && ruleCountry(host) == null) return null
             val (decision, country) = decide(plugin, mode, host)
             if (decision != Decision.PROXY_FIRST || country == null) return null
-            val picked = ProxyPool.pick(country, 2, host = host).map { it.endpoint.toJavaProxy() }
-            if (picked.isEmpty()) return null
+            val picked = ProxyPool.pick(country, 2, host = host, residentialOnly = mode == RouteMode.FORCE_PROXY).map { it.endpoint.toJavaProxy() }
+            if (picked.isEmpty()) {
+                if (mode == RouteMode.FORCE_PROXY && plugin != null) probeMisses.getOrPut(plugin) { java.util.concurrent.atomic.AtomicInteger() }.incrementAndGet()
+                return null
+            }
             return picked + java.net.Proxy.NO_PROXY
         }
 

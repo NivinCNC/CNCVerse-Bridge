@@ -510,7 +510,7 @@ object WebAdmin {
                 val disabledList = StremioServer.disabledPlugins
                 val healthList = installed.map { p ->
                     val isDisabled = disabledList.contains(p.internalName)
-                    StreamTracker.getHealth(p.internalName, p.displayName, !isDisabled, p.iconUrl)
+                    StreamTracker.getHealth(p.internalName, p.displayName, !isDisabled, com.cncverse.stremiobridge.server.PublicUrls.safeForBrowser(p.iconUrl))
                 }
                 call.respond(healthList)
             }
@@ -910,7 +910,7 @@ object WebAdmin {
             AdminRepoInfo(
                 url = repo.url,
                 name = repo.name.ifBlank { repo.url },
-                iconUrl = repo.iconUrl,
+                iconUrl = com.cncverse.stremiobridge.server.PublicUrls.safeForBrowser(repo.iconUrl),
                 description = repo.description,
                 isLoading = repo.isLoading,
                 error = repo.error,
@@ -926,7 +926,7 @@ object WebAdmin {
                 internalName = inst.internalName,
                 displayName = inst.displayName,
                 version = inst.version,
-                iconUrl = inst.iconUrl,
+                iconUrl = com.cncverse.stremiobridge.server.PublicUrls.safeForBrowser(inst.iconUrl),
                 tvTypes = inst.tvTypes,
                 language = inst.language,
                 description = inst.description,
@@ -997,7 +997,7 @@ object WebAdmin {
                 internalName = ap.plugin.internalName,
                 displayName = ap.plugin.name,
                 version = ap.plugin.version,
-                iconUrl = ap.plugin.iconUrl,
+                iconUrl = com.cncverse.stremiobridge.server.PublicUrls.safeForBrowser(ap.plugin.iconUrl),
                 tvTypes = ap.plugin.tvTypes ?: emptyList(),
                 language = ap.plugin.language,
                 authors = ap.plugin.authors ?: emptyList(),

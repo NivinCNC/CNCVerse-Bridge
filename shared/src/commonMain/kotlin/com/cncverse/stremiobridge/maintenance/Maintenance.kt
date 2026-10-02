@@ -38,9 +38,10 @@ import java.util.concurrent.atomic.AtomicInteger
 
 object HealthProbe {
 
-    class Outcome(val streams: Int, val note: String)
+    /** [timedOut]: the run hit its time budget — says nothing about whether links exist. */
+    class Outcome(val streams: Int, val note: String, val timedOut: Boolean = false)
 
-    private const val MODE_TIMEOUT_MS = 75_000L
+    private const val MODE_TIMEOUT_MS = 150_000L
 
     /**
      * One probe run in [mode]: the extension's own home page first (first few
@@ -49,13 +50,13 @@ object HealthProbe {
      */
     suspend fun probeOnce(api: MainApiWrapper, mode: RouteMode): Outcome =
         withContext(Dispatchers.IO + NetContext.RouteModeElement(mode)) {
-            withTimeoutOrNull(MODE_TIMEOUT_MS) { runFlow(api) } ?: Outcome(0, "timed out")
+            withTimeoutOrNull(MODE_TIMEOUT_MS) { runFlow(api) } ?: Outcome(0, "timed out", timedOut = true)
         }
 
     private suspend fun runFlow(api: MainApiWrapper): Outcome {
         val type = api.supportedTypes.firstOrNull() ?: "movie"
         val home = runCatching { api.getMainPage(1, type, null) }.getOrDefault(emptyList())
-        val candidates = home.distinctBy { it.url }.take(3).ifEmpty {
+        val candidates = home.distinctBy { it.url }.take(2).ifEmpty {
             runCatching { api.search("Avatar") }.getOrDefault(emptyList()).take(2)
         }
         if (candidates.isEmpty()) return Outcome(0, if (home.isEmpty()) "home page and search empty" else "no items")
@@ -86,23 +87,36 @@ object HealthProbe {
         }
         val country = GeoRouter.countryFor(plugin)
         if (country == null || !GeoRouter.settings.enabled) {
-            StreamTracker.recordProbe(plugin, api.internalName, api.name, 0, -1, null,
+            // No proxy route exists: a clean "0 links" is the whole evidence; a timeout is none
+            StreamTracker.recordProbe(plugin, api.internalName, api.name, if (direct.timedOut) -1 else 0, -1, null,
                 "direct: ${direct.note}; no proxy country")
-            return HealthStatus.DEAD
+            return if (direct.timedOut) HealthStatus.UNKNOWN else HealthStatus.DEAD
         }
-        if (ProxyPool.pickAwait(country).isEmpty()) {
-            // Proxy route not testable now — not enough evidence to call it dead
+        ProxyPool.pickAwait(country)
+        // Datacenter proxies get refused/challenged by the same sites that block this
+        // server, so a failed run through them proves nothing — only a residential or
+        // private proxy can turn "no links" into DEAD (auto-uninstall depends on it).
+        if (ProxyPool.healthy(country).none { it.residential || it.custom }) {
             StreamTracker.recordProbe(plugin, api.internalName, api.name, 0, -2, country,
-                "direct: ${direct.note}; no working $country proxy available")
+                "direct: ${direct.note}; no residential $country proxy available to verify")
             return HealthStatus.UNKNOWN
         }
+        GeoRouter.resetProbeMisses(plugin)
         val proxied = probeOnce(api, RouteMode.FORCE_PROXY)
-        StreamTracker.recordProbe(plugin, api.internalName, api.name, 0, proxied.streams, country,
-            "direct: ${direct.note}; $country proxy: ${proxied.note}")
+        val misses = GeoRouter.probeMisses(plugin)
+        val note = "direct: ${direct.note}; $country proxy: ${proxied.note}" +
+            (if (misses > 0) " ($misses request(s) found no working proxy)" else "")
         if (proxied.streams > 0) {
+            StreamTracker.recordProbe(plugin, api.internalName, api.name, 0, proxied.streams, country, note)
             GeoRouter.markPluginNeedsProxy(plugin, true)
             return HealthStatus.PROXY
         }
+        // DEAD needs two clean "no links" answers; a run that timed out proves nothing (-2 = inconclusive)
+        if (direct.timedOut || proxied.timedOut || misses > 0) {
+            StreamTracker.recordProbe(plugin, api.internalName, api.name, 0, -2, country, "$note (inconclusive)")
+            return HealthStatus.UNKNOWN
+        }
+        StreamTracker.recordProbe(plugin, api.internalName, api.name, 0, 0, country, note)
         return HealthStatus.DEAD
     }
 }
