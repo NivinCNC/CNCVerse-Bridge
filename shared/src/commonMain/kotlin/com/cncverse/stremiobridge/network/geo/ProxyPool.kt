@@ -177,6 +177,10 @@ object ProxyPool {
     private const val SOURCE_TTL_MS = 30 * 60_000L
     private const val DEMAND_TTL_MS = 6 * 60 * 60_000L
     private const val MAX_FAILURES = 2
+    /** Ultrasurf / private proxies carry hundreds of requests: a few failures in a row under load must not take them out. */
+    private const val MAX_FAILURES_CUSTOM = 6
+
+    private fun failLimit(p: PooledProxy) = if (p.custom) MAX_FAILURES_CUSTOM else MAX_FAILURES
     private const val VALIDATE_CONCURRENCY = 24
     private const val MAX_VALIDATE_PER_ROUND = 240
 
@@ -237,7 +241,7 @@ object ProxyPool {
             delay(20_000)
             while (isActive) {
                 runCatching { maintain() }.onFailure { ServerState.warn("[GeoProxy] maintenance error: ${it.message}") }
-                delay(60_000)
+                delay(30_000)
             }
         }
     }
@@ -251,10 +255,10 @@ object ProxyPool {
 
     /** Still in its pool and not marked down. */
     fun isUsable(p: PooledProxy): Boolean =
-        p.consecutiveFailures < MAX_FAILURES && pools[p.country]?.contains(p) == true
+        p.consecutiveFailures < failLimit(p) && pools[p.country]?.contains(p) == true
 
     fun healthy(country: String): List<PooledProxy> =
-        pools[country].orEmpty().filter { it.consecutiveFailures < MAX_FAILURES }
+        pools[country].orEmpty().filter { it.consecutiveFailures < failLimit(it) }
 
     /**
      * Up to [n] proxies for [country], best first, spreading load across the
@@ -511,7 +515,8 @@ object ProxyPool {
         }
         for (country in demand.keys) {
             val pool = pools[country].orEmpty()
-            val due = pool.filter { now - it.lastChecked > HEALTH_INTERVAL_MS }
+            // Down private/built-in tunnels are re-checked every 30 s so they come back fast
+            val due = pool.filter { now - it.lastChecked > (if (it.custom && it.consecutiveFailures >= failLimit(it)) 30_000L else HEALTH_INTERVAL_MS) }
             if (due.isNotEmpty()) healthCheck(due)
             if (healthy(country).size < targetFor(country)) {
                 val last = lastRefill[country] ?: 0L
