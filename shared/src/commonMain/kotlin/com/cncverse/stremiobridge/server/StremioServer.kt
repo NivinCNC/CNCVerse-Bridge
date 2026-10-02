@@ -1454,9 +1454,26 @@ object StremioServer {
      * collisions when two repos ship an extension with the same name.
      */
     private fun profileMatchIds(api: MainApiWrapper): List<String> {
-        val ids = mutableListOf(api.internalName, api.pluginInternalName)
+        val ids = mutableListOf(api.internalName)
+        // A plugin with several sources (VegaMovies plugin = VegaMovies + Rogmovies) gets one
+        // card per source, and its plugin id often equals one source's card id. Matching
+        // every source by the plugin id made deselecting "VegaMovies" also hide Rogmovies —
+        // so only single-source plugins are matched by their plugin id.
+        if ((apisPerPlugin()[api.pluginInternalName] ?: 1) <= 1) ids.add(api.pluginInternalName)
         unambiguousSlug(api)?.let { ids.add(it) }
         return ids.distinct()
+    }
+
+    /** pluginInternalName -> number of loaded APIs; rebuilt only when [loadedApis] changes. */
+    @Volatile private var apisPerPluginCache: Pair<Long, Map<String, Int>>? = null
+
+    private fun apisPerPlugin(): Map<String, Int> {
+        val version = apiList.version
+        apisPerPluginCache?.let { (v, counts) -> if (v == version) return counts }
+        val counts = HashMap<String, Int>()
+        for (api in apiList) counts[api.pluginInternalName] = (counts[api.pluginInternalName] ?: 0) + 1
+        apisPerPluginCache = version to counts
+        return counts
     }
 
     /**
