@@ -2307,8 +2307,25 @@ function renderExtensions() {
   html += '<div id="sources-rows-container"><div class="empty"><span class="loader"></span> Loading available sources from repositories…</div></div>';
   html += '</div>'; // close Sources Pool card
 
+  // Keep the page and every open Sources list where they were across this re-render
+  var scroller = document.scrollingElement || document.documentElement;
+  var pageY = scroller.scrollTop;
+  var viewParent = el("view").parentElement;
+  var parentY = viewParent ? viewParent.scrollTop : 0;
+  var listY = {};
+  document.querySelectorAll("details[data-src-plugin] > div").forEach(function(d) {
+    listY[d.parentElement.getAttribute("data-src-plugin")] = d.scrollTop;
+  });
+
   el("view").innerHTML = html;
   updateExtensionsSourcesOnly();
+
+  document.querySelectorAll("details[data-src-plugin] > div").forEach(function(d) {
+    var y = listY[d.parentElement.getAttribute("data-src-plugin")];
+    if (y) d.scrollTop = y;
+  });
+  if (viewParent) viewParent.scrollTop = parentY;
+  scroller.scrollTop = pageY;
 }
 
 function updateExtensionsSourcesOnly() {
@@ -2518,11 +2535,11 @@ function renderUnifiedSourceRow(p, installedList) {
     // Remember open lists: the tab re-renders every few seconds and would close it mid-edit
     html += '<details data-src-plugin="' + esc(p.internalName) + '"' + (openSourceLists[p.internalName] ? ' open' : '') +
       ' ontoggle="openSourceLists[this.getAttribute(\'data-src-plugin\')] = this.open" style="margin-top:8px">' +
-      '<summary class="muted" style="cursor:pointer;font-size:11.5px">Sources: ' + onCount + ' of ' + inst.sources.length + ' on</summary>';
+      '<summary class="muted" style="cursor:pointer;font-size:11.5px">Sources: <span class="src-count">' + onCount + '</span> of ' + inst.sources.length + ' on</summary>';
     html += '<div style="display:flex;flex-direction:column;gap:4px;margin-top:6px;max-height:220px;overflow-y:auto">';
     inst.sources.forEach(function(s) {
       html += '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"><input type="checkbox" ' + (s.enabled ? 'checked ' : '') +
-        'onchange="togglePlugin(\'' + jsa(s.id) + '\')"> ' + esc(s.name) + '</label>';
+        'onchange="toggleSource(\'' + jsa(p.internalName) + '\',\'' + jsa(s.id) + '\', this)"> ' + esc(s.name) + '</label>';
     });
     html += '</div></details>';
   }
@@ -2693,6 +2710,24 @@ function installPlugin(id) {
 }
 
 var openSourceLists = {};  // plugin id -> Sources list expanded (kept across re-renders)
+
+// One source switch: updates only that checkbox and the "N of M on" count — no tab
+// re-render, so neither the page nor the source list scrolls back to the top.
+function toggleSource(pluginId, sourceId, box) {
+  var wanted = box.checked;
+  box.disabled = true;
+  api("/plugins/toggle", { method: "POST", body: JSON.stringify({ internalName: sourceId }) })
+    .then(function() {
+      var inst = summary && summary.installedPlugins && summary.installedPlugins.find(function(x) { return x.internalName === pluginId; });
+      var src = inst && inst.sources ? inst.sources.find(function(x) { return x.id === sourceId; }) : null;
+      if (src) src.enabled = wanted;
+      var details = box.closest("details");
+      var cnt = details ? details.querySelector(".src-count") : null;
+      if (cnt && inst) cnt.textContent = inst.sources.filter(function(x) { return x.enabled; }).length;
+    })
+    .catch(function(e) { box.checked = !wanted; toast("Toggle failed: " + e.message); })
+    .finally(function() { box.disabled = false; });
+}
 
 function togglePlugin(id) {
   api("/plugins/toggle", {method:"POST", body: JSON.stringify({internalName: id})})

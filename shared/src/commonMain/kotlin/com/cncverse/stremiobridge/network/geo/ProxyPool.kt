@@ -518,6 +518,13 @@ object ProxyPool {
         pools.forEach { (c, l) -> if (l.any { it.custom }) demand[c] = now }
         demand.entries.removeIf { now - it.value > DEMAND_TTL_MS }
         rejected.entries.removeIf { it.value < now }
+        // TheSpeedX lists have no country: look them up a slice at a time (ip-api free tier
+        // allows ~1500 IPs/min) so their proxies join the right country pools
+        if (demand.isNotEmpty()) {
+            runCatching { ProxySources.refreshSpeedX(directClient) }
+            val slice = ProxySources.unclassifiedSpeedX(300)
+            if (slice.isNotEmpty()) runCatching { IpClassifier.classify(slice, directClient, json) }
+        }
         pools.keys.filter { !demand.containsKey(it) }.forEach { c ->
             pools.remove(c)?.forEach { dropClient(it.endpoint) }
         }
@@ -745,9 +752,42 @@ internal object ProxySources {
             }
         }.filter { it.second == country }
 
+        // TheSpeedX lists carry no country: use the ones the background classifier already placed here
+        all += speedX().filter { IpClassifier.cached(it.host)?.countryCode == country }.map { it to country }
+
         // SOCKS5 first (tunnels any protocol), then HTTP; de-duplicated
         return all.map { it.first }.distinctBy { it.key }.sortedBy { if (it.type == "socks5") 0 else 1 }
     }
+
+    // ── TheSpeedX/PROXY-List: large, refreshed often, no country info ──────────
+    @Volatile private var speedXList: List<ProxyEndpoint> = emptyList()
+    @Volatile private var speedXAt = 0L
+
+    fun speedX(): List<ProxyEndpoint> = speedXList
+
+    /** Re-downloads the TheSpeedX HTTP + SOCKS5 lists every 30 min. */
+    fun refreshSpeedX(client: OkHttpClient) {
+        val now = System.currentTimeMillis()
+        if (now - speedXAt < TTL_MS) return
+        speedXAt = now
+        val base = "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/"
+        val out = ArrayList<ProxyEndpoint>()
+        for ((file, type) in listOf("socks5.txt" to "socks5", "http.txt" to "http")) {
+            val body = fetch(client, base + file) ?: continue
+            body.lineSequence().mapNotNull { line ->
+                val t = line.trim(); val i = t.lastIndexOf(':')
+                if (i <= 0) null else t.substring(i + 1).toIntOrNull()?.let { ProxyEndpoint(type, t.substring(0, i), it) }
+            }.forEach { out += it }
+        }
+        if (out.isNotEmpty()) {
+            speedXList = out.distinctBy { it.key }
+            ServerState.info("[GeoProxy] TheSpeedX lists: ${speedXList.size} proxies")
+        }
+    }
+
+    /** Hosts from TheSpeedX not looked up yet (for the background classifier). */
+    fun unclassifiedSpeedX(limit: Int): List<String> =
+        speedXList.asSequence().map { it.host }.distinct().filter { IpClassifier.cached(it) == null }.take(limit).toList()
 }
 
 /** ip-api.com batch lookups (country + hosting flag), rate-limited and cached. */
@@ -769,6 +809,9 @@ internal object IpClassifier {
 
     private val cache = ConcurrentHashMap<String, Info>()
     private const val TTL_MS = 24 * 60 * 60_000L
+
+    /** Cached lookup only (no network). */
+    fun cached(ip: String): Info? = cache[ip]?.takeIf { System.currentTimeMillis() - it.at < TTL_MS }
     private val rate = Mutex()
     @Volatile private var nextAllowed = 0L
 
