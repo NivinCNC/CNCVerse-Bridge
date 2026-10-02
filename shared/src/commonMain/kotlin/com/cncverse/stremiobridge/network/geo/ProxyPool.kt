@@ -752,6 +752,45 @@ internal object ProxySources {
             }
         }.filter { it.second == country }
 
+        // ProxyScrape's GitHub mirror, per country
+        all += cached("proxyscrape-gh:$country") {
+            val body = fetch(client, "https://raw.githubusercontent.com/ProxyScrape/free-proxy-list/main/proxies/countries/" +
+                country.lowercase() + "/data.json") ?: return@cached emptyList()
+            json.parseToJsonElement(body).jsonArray.mapNotNull { el ->
+                val o = el as? JsonObject ?: return@mapNotNull null
+                val type = normType(str(o["protocol"])) ?: return@mapNotNull null
+                val ip = str(o["ip"]) ?: return@mapNotNull null
+                val port = o["port"]?.jsonPrimitive?.intOrNull ?: return@mapNotNull null
+                ProxyEndpoint(type, ip, port) to country
+            }
+        }
+
+        // proxyfreeonly.com — one big list for all countries (cached)
+        all += cached("proxyfreeonly") {
+            val body = fetch(client, "https://proxyfreeonly.com/api/free-proxy-list?limit=500&page=1&sortBy=lastChecked&sortType=desc")
+                ?: return@cached emptyList()
+            json.parseToJsonElement(body).jsonArray.flatMap { el ->
+                val o = el as? JsonObject ?: return@flatMap emptyList()
+                val ip = str(o["ip"]) ?: return@flatMap emptyList()
+                val port = str(o["port"])?.toIntOrNull() ?: return@flatMap emptyList()
+                val cc = str(o["country"])
+                (o["protocols"] as? JsonArray).orEmpty().mapNotNull { p -> normType(str(p))?.let { ProxyEndpoint(it, ip, port) to cc } }
+            }
+        }.filter { it.second == country }
+
+        // hproxy.com, per country (recently verified only)
+        all += cached("hproxy:$country") {
+            val body = fetch(client, "https://hproxy.com/v1/proxy-list?format=json&recent=true&country=$country&limit=5000")
+                ?: return@cached emptyList()
+            json.parseToJsonElement(body).jsonArray.flatMap { el ->
+                val o = el as? JsonObject ?: return@flatMap emptyList()
+                if (str(o["status"]) != null && str(o["status"]) != "alive") return@flatMap emptyList()
+                val ip = str(o["ip"]) ?: return@flatMap emptyList()
+                val port = o["port"]?.jsonPrimitive?.intOrNull ?: return@flatMap emptyList()
+                (o["protocols"] as? JsonArray).orEmpty().mapNotNull { p -> normType(str(p))?.let { ProxyEndpoint(it, ip, port) to country } }
+            }
+        }
+
         // TheSpeedX lists carry no country: use the ones the background classifier already placed here
         all += speedX().filter { IpClassifier.cached(it.host)?.countryCode == country }.map { it to country }
 
