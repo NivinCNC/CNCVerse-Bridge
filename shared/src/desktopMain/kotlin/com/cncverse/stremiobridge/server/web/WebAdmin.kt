@@ -691,6 +691,15 @@ object WebAdmin {
                 call.respond(AdminActionResult(true, "Forgot learned proxy routes for ${r.plugin}"))
             }
 
+            post("/geo/clear-host") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val r = runCatching { call.receive<AdminGeoCountryRequest>() }.getOrNull()
+                val host = r?.key?.trim()?.lowercase()?.takeIf { it.isNotEmpty() }
+                    ?: return@post call.respond(AdminActionResult(false, "Invalid request"))
+                com.cncverse.stremiobridge.network.geo.GeoRouter.clearHost(host)
+                call.respond(AdminActionResult(true, "Forgot $host — it is tried directly again"))
+            }
+
             post("/geo/refill") {
                 if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
                 val r = runCatching { call.receive<AdminGeoCountryRequest>() }.getOrNull()

@@ -2713,6 +2713,72 @@ body {
   gap: 7px;
 }
 
+/* Left burger + page views (Home / Profiles / Quality / Formatter) */
+.hdr-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.hdr-profile {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 46vw;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text-muted, var(--text));
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.hdr-profile:hover { border-color: var(--border-focus); color: var(--accent); }
+.view-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 1.05rem;
+  font-weight: 800;
+  color: var(--text);
+  margin: 2px 0 -4px;
+}
+.view-hidden { display: none !important; }
+.drawer-btn.active {
+  background: var(--accent-glow);
+  border-color: rgba(139, 92, 246, 0.45);
+  color: var(--accent);
+}
+/* Health badges + dead filter on provider cards */
+.hb {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 999px;
+  line-height: 1.3;
+}
+.hb-dead { background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid rgba(239, 68, 68, 0.4); }
+.hb-proxy { background: rgba(59, 130, 246, 0.15); color: #60a5fa; border: 1px solid rgba(59, 130, 246, 0.4); }
+.p-card.is-dead { opacity: 0.62; }
+.dead-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+}
+
 /* Slide-Over Drawer Menu */
 .drawer-backdrop {
   position: fixed;
@@ -2732,19 +2798,19 @@ body {
 .drawer {
   position: fixed;
   top: 0;
-  right: 0;
+  left: 0;
   bottom: 0;
   width: 290px;
   max-width: 85vw;
   background: var(--surface);
-  border-left: 1px solid var(--border);
-  box-shadow: -8px 0 32px rgba(0, 0, 0, 0.5);
+  border-right: 1px solid var(--border);
+  box-shadow: 8px 0 32px rgba(0, 0, 0, 0.5);
   z-index: 650;
   display: flex;
   flex-direction: column;
   padding: 16px 14px;
   gap: 12px;
-  transform: translateX(100%);
+  transform: translateX(-100%);
   transition: transform 0.25s cubic-bezier(0.16, 1, 0.3, 1);
   box-sizing: border-box;
 }
@@ -3731,21 +3797,27 @@ input:checked + .slider:before {
 <div class="container">
   <!-- HEADER -->
   <header class="hdr">
-    <div class="brand-wrap">
-      <div class="logo-box">
-        <img src="/logo.png" alt="CNCVerse" style="width:32px;height:32px;border-radius:8px;object-fit:contain;" onerror="this.style.display='none'">
+    <div class="hdr-left">
+      <button class="btn-icon-hdr btn-burger" onclick="toggleDrawer(true)" title="Menu &amp; pages">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      </button>
+      <div class="brand-wrap" onclick="showView('home')" style="cursor:pointer;">
+        <div class="logo-box">
+          <img src="/logo.png" alt="CNCVerse" style="width:32px;height:32px;border-radius:8px;object-fit:contain;" onerror="this.style.display='none'">
+        </div>
+        <h1 class="brand-title">CNCVerse Bridge</h1>
       </div>
-      <h1 class="brand-title">CNCVerse Bridge</h1>
     </div>
     <div class="hdr-actions">
-      <button class="btn-icon-hdr btn-burger" onclick="toggleDrawer(true)" title="Menu &amp; Links">
-        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      <button class="hdr-profile" id="hdr-profile" onclick="showView('profiles')" title="Active profile — switch or manage profiles">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg>
+        <span id="hdr-profile-name">Profile</span>
       </button>
     </div>
   </header>
 
   <!-- DONATION GOAL BAR (pengu.uk top bar - click to donate) -->
-  <a class="goal-card" id="goal-card" title="Click to view &amp; support CNCVerse Community Goal" href="https://cncverse.pages.dev" target="_blank" rel="noopener">
+  <a class="goal-card" id="goal-card" data-view="home" title="Click to view &amp; support CNCVerse Community Goal" href="https://cncverse.pages.dev" target="_blank" rel="noopener">
     <div class="goal-top">
       <div class="goal-text" id="goal-text">&#36;0 raised of &#36;100 goal</div>
       <div class="goal-pct" id="goal-pct">0%</div>
@@ -3761,7 +3833,7 @@ input:checked + .slider:before {
   </a>
 
   <!-- 4 METRIC STATS CARDS (REPOSITORIES, SOURCES, QUALITIES, SYNC) -->
-  <div class="stats-grid">
+  <div class="stats-grid" data-view="home">
     <div class="stat-card" onclick="openReposModal()" style="cursor:pointer;" title="Click to view installed repositories &amp; sources">
       <div class="stat-lbl">REPOSITORIES</div>
       <div class="stat-val" id="st-repos-count">0</div>
@@ -3785,7 +3857,7 @@ input:checked + .slider:before {
   </div>
 
   <!-- PROFILE SWITCHER (several profiles on one device, each its own addon) -->
-  <div class="u-card" id="profile-card">
+  <div class="u-card" id="profile-card" data-view="profiles">
     <div class="u-row" style="justify-content:space-between;">
       <div>
         <div class="catalog-title" style="font-size:14px;">
@@ -3805,7 +3877,7 @@ input:checked + .slider:before {
   </div>
 
   <!-- THE MAIN HERO INSTALL CARD (No manifest url displayed, embedded inside buttons) -->
-  <div class="install-hero-card">
+  <div class="install-hero-card" data-view="home">
     <div class="install-hero-hdr">
       <div class="install-hero-tag">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polygon points="6 3 20 12 6 21 6 3"/></svg>
@@ -3838,7 +3910,7 @@ input:checked + .slider:before {
   </div>
 
   <!-- SHOW CATALOGS SWITCH CARD (Positive logic & Clear Phrasing) -->
-  <div class="catalog-card">
+  <div class="catalog-card" data-view="home">
     <div>
       <div class="catalog-title">
         <span>Show Catalogs in Stremio</span>
@@ -3855,7 +3927,7 @@ input:checked + .slider:before {
   </div>
 
   <!-- STREAM QUALITY PREFERENCES CARD -->
-  <div class="quality-card" style="background:var(--surface-card); border:1px solid var(--border); border-radius:var(--card-radius); padding:14px 16px; display:flex; flex-direction:column; gap:12px;">
+  <div class="quality-card" data-view="quality" style="background:var(--surface-card); border:1px solid var(--border); border-radius:var(--card-radius); padding:14px 16px; display:flex; flex-direction:column; gap:12px;">
     <div style="display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;">
       <div>
         <div class="catalog-title" style="font-size:14px;">
@@ -3909,7 +3981,7 @@ input:checked + .slider:before {
   </div>
 
   <!-- USER STREAM FORMATTER (per profile) -->
-  <div class="u-card" id="formatter-card">
+  <div class="u-card" id="formatter-card" data-view="formatter">
     <div class="u-row" style="justify-content:space-between;">
       <div>
         <div class="catalog-title" style="font-size:14px;">
@@ -3950,7 +4022,7 @@ input:checked + .slider:before {
   </div>
 
   <!-- SOURCES SECTION -->
-  <div class="sources-section" id="sources-section">
+  <div class="sources-section" id="sources-section" data-view="home">
     <div class="providers-card">
       <div class="providers-top-line">
         <div>
@@ -3994,6 +4066,7 @@ input:checked + .slider:before {
         <select class="filter-select" id="type-filter" onchange="onTypeFilterChange(this.value)">
           <option value="">All Content Types</option>
         </select>
+        <label class="dead-toggle" title="Dead = tested directly and through a proxy, no links (re-checked every night)"><input type="checkbox" id="hide-dead" onchange="onHideDeadChange(this.checked)"> Hide dead <span id="dead-count" class="hb hb-dead" style="display:none"></span></label>
         <select class="filter-select" id="lang-filter" onchange="onLangFilterChange(this.value)">
           <option value="">All Languages</option>
         </select>
@@ -4077,7 +4150,33 @@ input:checked + .slider:before {
     </button>
   </div>
   <div class="drawer-menu">
-    <div class="drawer-section-label">COMMUNITY &amp; SOURCES</div>
+    <div class="drawer-section-label">PAGES</div>
+    <button class="drawer-btn" data-page="home" onclick="showView('home'); toggleDrawer(false);">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>
+        <span>Home &amp; sources</span>
+      </div>
+    </button>
+    <button class="drawer-btn" data-page="profiles" onclick="showView('profiles'); toggleDrawer(false);">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+        <span>Profiles</span>
+      </div>
+    </button>
+    <button class="drawer-btn" data-page="quality" onclick="showView('quality'); toggleDrawer(false);">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17 2 12 7 7 2"/></svg>
+        <span>Stream quality</span>
+      </div>
+    </button>
+    <button class="drawer-btn" data-page="formatter" onclick="showView('formatter'); toggleDrawer(false);">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
+        <span>Stream formatter</span>
+      </div>
+    </button>
+
+    <div class="drawer-section-label" style="margin-top:10px;">COMMUNITY &amp; SOURCES</div>
     <button class="drawer-btn" onclick="openReposModal(); toggleDrawer(false);">
       <div style="display:flex;align-items:center;gap:10px;">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></svg>
@@ -4156,6 +4255,43 @@ function toggleTheme() {
   applyTheme(cur === "dark" ? "light" : "dark");
 }
 applyTheme(localStorage.getItem("cnc_theme") || "dark");
+
+/* Page views: Home / Profiles / Quality / Formatter (hash-routed, back button works) */
+var VIEWS = ["home", "profiles", "quality", "formatter"];
+var currentView = "home";
+function showView(name, fromHash) {
+  if (VIEWS.indexOf(name) < 0) name = "home";
+  currentView = name;
+  var nodes = document.querySelectorAll("[data-view]");
+  for (var i = 0; i < nodes.length; i++) {
+    nodes[i].classList.toggle("view-hidden", nodes[i].getAttribute("data-view") !== name);
+  }
+  var btns = document.querySelectorAll(".drawer-btn[data-page]");
+  for (var j = 0; j < btns.length; j++) {
+    btns[j].classList.toggle("active", btns[j].getAttribute("data-page") === name);
+  }
+  if (!fromHash) {
+    var h = name === "home" ? "" : "#" + name;
+    if ((window.location.hash || "") !== h) {
+      try { history.pushState(null, "", window.location.pathname + window.location.search + h); } catch (e) { window.location.hash = h; }
+    }
+  }
+  window.scrollTo(0, 0);
+}
+function viewFromHash() { return (window.location.hash || "").replace("#", "") || "home"; }
+window.addEventListener("popstate", function() { showView(viewFromHash(), true); });
+window.addEventListener("hashchange", function() { showView(viewFromHash(), true); });
+
+function updateHeaderProfile() {
+  var label = document.getElementById("hdr-profile-name");
+  if (!label) return;
+  var name = "";
+  try {
+    var list = readProfileList();
+    for (var i = 0; i < list.length; i++) if (list[i].id === pid) name = list[i].name || list[i].id;
+  } catch (e) {}
+  label.textContent = name || "Profile";
+}
 
 /* Slide-Over Drawer */
 function toggleDrawer(open) {
@@ -4609,6 +4745,28 @@ function saveProfileState() {
     .catch(function(e){ toast("Sync error: " + e.message); });
 }
 
+/* Dead extensions: probed directly and via proxy, no links. Users can hide them. */
+var hideDead = false;
+try { hideDead = localStorage.getItem("cnc_hide_dead") === "1"; } catch (e) {}
+function onHideDeadChange(on) {
+  hideDead = !!on;
+  try { localStorage.setItem("cnc_hide_dead", hideDead ? "1" : "0"); } catch (e) {}
+  renderCards();
+}
+function syncDeadToggle() {
+  var box = document.getElementById("hide-dead");
+  if (box) box.checked = hideDead;
+  var n = exts.filter(function(e) { return e.health === "dead"; }).length;
+  var badge = document.getElementById("dead-count");
+  if (badge) { badge.textContent = n; badge.style.display = n ? "" : "none"; }
+}
+function timeAgoShort(ts) {
+  var s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+}
+
 function getFilteredExtensions() {
   var q = (document.getElementById("ext-search") ? document.getElementById("ext-search").value : "").trim().toLowerCase();
 
@@ -4634,6 +4792,8 @@ function getFilteredExtensions() {
       if (!hasType) return false;
     }
 
+    if (hideDead && e.health === "dead") return false;
+
     if (currentLang) {
       var eLang = (e.lang || "en").toLowerCase();
       if (eLang !== currentLang.toLowerCase()) return false;
@@ -4651,6 +4811,7 @@ function renderCards() {
   var filtered = getFilteredExtensions();
   var orderMap = getActiveOrderMap();
   updateMetrics();
+  syncDeadToggle();
 
   if (!filtered.length) {
     custEl.innerHTML = '<div class="empty">No providers match your search or filter.</div>';
@@ -4671,6 +4832,11 @@ function renderCards() {
     }
     var langStr = (e.lang || "en").toUpperCase();
     parts.push('<span class="p-lang-badge">' + esc(langStr) + '</span>');
+    if (e.health === "dead") {
+      parts.push('<span class="hb hb-dead" title="No links found directly or through a proxy' + (e.lastChecked ? " (checked " + timeAgoShort(e.lastChecked) + ")" : "") + '">&#10005; Dead</span>');
+    } else if (e.health === "proxy") {
+      parts.push('<span class="hb hb-proxy" title="Geo-blocked for the server; served through a regional proxy">&#127760; Via proxy</span>');
+    }
     if (!e.enabled) {
       parts.push('<span style="color:var(--amber); font-weight:700;">Off</span>');
     }
@@ -4697,7 +4863,7 @@ function renderCards() {
       ? '<img class="p-icon" src="' + esc(e.iconUrl) + '" alt="" onerror="this.style.display=\'none\'">'
       : '<span class="p-icon-letter">' + esc((e.name||"?").charAt(0).toUpperCase()) + '</span>';
 
-    return '<div class="p-card ' + (isSelected ? "selected" : "") + '" onclick="toggleCard(\'' + esc(e.internalName).replace(/\'/g, "%27") + '\')">' +
+    return '<div class="p-card ' + (isSelected ? "selected" : "") + (e.health === "dead" ? " is-dead" : "") + '" onclick="toggleCard(\'' + esc(e.internalName).replace(/\'/g, "%27") + '\')">' +
       '<div class="p-card-icon-col">' + iconHtml + '</div>' +
       '<div class="p-card-info-col">' +
         '<div class="p-top-line">' +
@@ -4770,6 +4936,7 @@ function populateDropdownFilters() {
 }
 
 function scrollToSources() {
+  if (currentView !== "home") showView("home");
   var el = document.getElementById("sources-section");
   if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
 }
@@ -4890,6 +5057,7 @@ function renderProfileBar() {
   }
   var tag = document.getElementById("profile-count-tag");
   if (tag) tag.textContent = list.length + (list.length === 1 ? " profile" : " profiles");
+  updateHeaderProfile();
 }
 
 function switchProfile(id) {
@@ -5458,6 +5626,7 @@ function loadFooterCredits() {
 }
 
 updateUrls();
+showView(viewFromHash(), true);
 loadExts();
 loadRepos();
 renderProfileBar();

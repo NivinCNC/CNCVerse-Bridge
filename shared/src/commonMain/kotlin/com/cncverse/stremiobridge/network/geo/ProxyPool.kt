@@ -564,6 +564,7 @@ object ProxyPool {
             ) + info
             var accepted = 0
             for ((ep, r) in results) {
+                if (accepted >= need) break // parallel validation can overshoot the target
                 val exit = exitInfo[r.exitIp]
                 if (exit != null && exit.countryCode != country) {
                     rejected[ep.key] = System.currentTimeMillis() + 6 * 60 * 60_000L

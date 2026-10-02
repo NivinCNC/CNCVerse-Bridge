@@ -1503,6 +1503,12 @@ main#view {
         <span>Stream Diagnostics</span>
       </div>
     </button>
+    <button class="drawer-btn" data-tab="proxy" onclick="openTab('proxy'); toggleDrawer(false);">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+        <span>Geo Proxy</span>
+      </div>
+    </button>
     <button class="drawer-btn" data-tab="cache" onclick="openTab('cache'); toggleDrawer(false);">
       <div style="display:flex;align-items:center;gap:10px;">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg>
@@ -3128,6 +3134,7 @@ var tabTitles = {
   "server": "Dashboard",
   "extensions": "Extensions & Repositories",
   "health": "Stream Diagnostics",
+  "proxy": "Geo Proxy Routing",
   "cache": "Stream Cache & Deduplication",
   "formatter": "Stream Formatter",
   "credits": "Team & Developer Credits",
@@ -3160,6 +3167,7 @@ function openTab(t) {
   if (t === "logs") { renderLogs(); pollLogs(); }
   else if (t === "extensions") { renderExtensions(); loadPlugins(); }
   else if (t === "health") { renderStreamHealth(); loadStreamHealth(); }
+  else if (t === "proxy") { renderGeo(); loadGeo(); }
   else if (t === "cache") { renderCacheTab(); loadCacheConfig(); }
   else if (t === "formatter") { renderFormatter(); }
   else if (t === "credits") { loadCredits(); }
@@ -3957,6 +3965,9 @@ var probingIds = {};             // internalName -> true while that single probe
 var probingDoneCount = 0;
 var probingTotalCount = 0;
 
+var maintData = null;            // /maintenance (nightly run, sweep, auto-uninstall)
+var maintTimer = null;
+
 function loadStreamHealth() {
   api("/stream-health").then(function(data) {
     streamHealthData = data || [];
@@ -3964,323 +3975,315 @@ function loadStreamHealth() {
   }).catch(function(e) {
     if (tab === "health") toast("Failed to load stream health: " + e.message);
   });
+  loadMaintenance();
 }
 
+function loadMaintenance() {
+  api("/maintenance").then(function(m) {
+    var wasRunning = maintData && maintData.running;
+    maintData = m;
+    // Poll while a run/sweep is going so progress moves; reload health when it ends
+    if (m.running && !maintTimer) {
+      maintTimer = setInterval(function() { if (tab === "health") loadMaintenance(); }, 4000);
+    } else if (!m.running && maintTimer) {
+      clearInterval(maintTimer); maintTimer = null;
+    }
+    if (wasRunning && !m.running) {
+      api("/stream-health").then(function(d) { streamHealthData = d || []; if (tab === "health") renderStreamHealth(); });
+    } else if (tab === "health") renderStreamHealth();
+  }).catch(function() {});
+}
+
+function hStatus(p) { return p.status || "unknown"; }
+
+function healthDeadList() { return streamHealthData.filter(function(p) { return hStatus(p) === "dead"; }); }
+
 function disableDeadPlugins() {
-  var deadCount = streamHealthData.filter(function(p) {
-    return p.totalRequests > 0 && p.successRequests === 0;
-  }).length;
-  if (!deadCount) { toast("No dead plugins found."); return; }
-  if (!confirm("Disable all " + deadCount + " dead plugin(s) that returned 0 streams?")) return;
+  var dead = healthDeadList();
+  if (!dead.length) { toast("No dead extensions."); return; }
+  if (!confirm("Disable all " + dead.length + " dead extension(s)?")) return;
   api("/stream-health/disable-dead", { method: "POST", body: "{}" })
-    .then(function(res) {
-      toast(res.message || "Disabled dead plugins");
-      loadStreamHealth();
-      poll();
-    })
+    .then(function(res) { toast(res.message || "Disabled dead extensions"); loadStreamHealth(); poll(); })
     .catch(function(e) { toast("Error: " + e.message); });
 }
 
 function uninstallAllDead() {
-  var dead = streamHealthData.filter(function(p) {
-    return p.totalRequests > 0 && p.successRequests === 0;
-  });
-  if (!dead.length) { toast("No dead plugins to uninstall."); return; }
-  var deadIds = dead.map(function(p) { return p.internalName; });
-  toast("Uninstalling " + dead.length + " dead plugin(s)…");
-  api("/plugins/uninstall-batch", { method: "POST", body: JSON.stringify({ internalNames: deadIds }) })
-    .then(function(res) {
-      toast(res.message || ("✓ Uninstalled " + dead.length + " dead plugin(s)"));
-      loadStreamHealth();
-      poll();
-    })
+  var dead = healthDeadList();
+  if (!dead.length) { toast("No dead extensions to uninstall."); return; }
+  if (!confirm("Uninstall " + dead.length + " dead extension(s)? (probed directly and via proxy, no links)")) return;
+  var ids = dead.map(function(p) { return p.internalName; });
+  toast("Uninstalling " + dead.length + " dead extension(s)…");
+  api("/plugins/uninstall-batch", { method: "POST", body: JSON.stringify({ internalNames: ids }) })
+    .then(function(res) { toast(res.message || ("Uninstalled " + dead.length)); loadStreamHealth(); poll(); })
     .catch(function(e) { toast("Uninstall error: " + e.message); });
 }
 
-// ── Benchmark modal ───────────────────────────────────────────────────────────
-function openBenchmarkModal() {
-  var inp = document.getElementById("benchmark-query-input");
-  if (inp) inp.value = "Avatar";
-  document.getElementById("benchmark-modal").classList.add("open");
-  setTimeout(function() { var i = document.getElementById("benchmark-query-input"); if (i) i.focus(); }, 80);
-}
-function closeBenchmarkModal() {
-  document.getElementById("benchmark-modal").classList.remove("open");
-}
-function submitBenchmark() {
-  var inp = document.getElementById("benchmark-query-input");
-  var q = (inp ? inp.value : "").trim() || "Avatar";
-  var btn = document.getElementById("benchmark-submit-btn");
-  if (btn) { btn.disabled = true; btn.textContent = "Running…"; }
-  closeBenchmarkModal();
-  probingAll = true;
-  probingIds = {};
-  probingTotalCount = streamHealthData.filter(function(p) { return p.enabled; }).length || streamHealthData.length;
-  if (tab === "extensions") renderExtensions();
-  api("/stream-health/probe?query=" + encodeURIComponent(q), { method: "POST", body: "{}" })
-    .then(function(res) { toast(res.message || "Benchmark complete ✓"); })
-    .catch(function(e) { toast("Probe error: " + e.message); })
-    .finally(function() {
-      probingAll = false;
-      probingIds = {};
-      if (btn) { btn.disabled = false; btn.textContent = "Run Benchmark"; }
-      loadStreamHealth();
-      poll();
-    });
+// Full sweep (background on the server; progress via /maintenance)
+function probeAllSources() {
+  if (!confirm("Probe every extension now? Each is tested from its home page, directly and then through its country's proxy. Takes a while on a small VPS.")) return;
+  api("/maintenance/sweep", { method: "POST", body: JSON.stringify({ onlyStale: false }) })
+    .then(function(res) { toast(res.message || "Health sweep started"); loadMaintenance(); })
+    .catch(function(e) { toast("Error: " + e.message); });
 }
 
-// Alias for button references that still call old name
-function probeAllSources() { openBenchmarkModal(); }
-
-// ── Single probe modal ────────────────────────────────────────────────────────
-var _pendingProbeId = null;
-function openProbeModal(internalName, displayName) {
-  _pendingProbeId = internalName;
-  var nameEl = document.getElementById("probe-plugin-name");
-  if (nameEl) nameEl.textContent = displayName || internalName;
-  var inp = document.getElementById("probe-query-input");
-  if (inp) inp.value = "Avatar";
-  document.getElementById("probe-modal").classList.add("open");
-  setTimeout(function() { var i = document.getElementById("probe-query-input"); if (i) { i.focus(); i.select(); } }, 80);
-}
-function closeProbeModal() {
-  document.getElementById("probe-modal").classList.remove("open");
-}
-function submitProbe() {
-  var id = _pendingProbeId;
-  if (!id) return;
-  var inp = document.getElementById("probe-query-input");
-  var q = (inp ? inp.value : "").trim() || "Avatar";
-  var btn = document.getElementById("probe-submit-btn");
-  if (btn) { btn.disabled = true; btn.textContent = "Testing…"; }
-  closeProbeModal();
-  probingIds[id] = true;
-  if (tab === "extensions") renderExtensions();
-  api("/stream-health/probe?internalName=" + encodeURIComponent(id) + "&query=" + encodeURIComponent(q), { method: "POST", body: "{}" })
-    .then(function(res) { toast(res.message || "Probe completed ✓"); })
-    .catch(function(e) { toast("Probe error: " + e.message); })
-    .finally(function() {
-      delete probingIds[id];
-      if (btn) { btn.disabled = false; btn.textContent = "Test Now"; }
-      loadStreamHealth();
-      poll();
-    });
+function runMaintenanceNow() {
+  if (!confirm("Run nightly maintenance now? Reloads all plugins, refreshes home pages, probes stale extensions and auto-uninstalls opted-in dead ones.")) return;
+  api("/maintenance/run", { method: "POST", body: JSON.stringify({ reload: true, sweep: true }) })
+    .then(function(res) { toast(res.message || "Maintenance started"); loadMaintenance(); })
+    .catch(function(e) { toast("Error: " + e.message); });
 }
 
-// Alias for old callers
+function saveAutoUninstallDays() {
+  var inp = el("au-days");
+  var d = parseInt(inp ? inp.value : "", 10);
+  if (!(d >= 1 && d <= 90)) { toast("Days must be 1–90"); return; }
+  api("/maintenance/auto-uninstall/days", { method: "POST", body: JSON.stringify({ days: d }) })
+    .then(function(res) { toast(res.message || "Saved"); loadMaintenance(); })
+    .catch(function(e) { toast("Error: " + e.message); });
+}
+
+function isAutoUninstall(id) {
+  if (!maintData || !maintData.optedIn) return false;
+  return maintData.optedIn.some(function(o) { return o.internalName === id; });
+}
+
+function toggleAutoUninstall(id, on) {
+  api("/maintenance/auto-uninstall/toggle", { method: "POST", body: JSON.stringify({ internalName: id, enabled: on }) })
+    .then(function(res) { toast(res.message || "Saved"); loadMaintenance(); if (tab === "extensions") loadPlugins(); })
+    .catch(function(e) { toast("Error: " + e.message); });
+}
+
+var probingIds = probingIds || {};
 function probeSingleSource(internalName, displayName) {
-  openProbeModal(internalName, displayName || internalName);
+  probingIds[internalName] = true;
+  if (tab === "health") renderStreamHealth();
+  toast("Testing " + (displayName || internalName) + " (direct, then via proxy)…");
+  api("/stream-health/probe?internalName=" + encodeURIComponent(internalName), { method: "POST", body: "{}" })
+    .then(function(res) { toast(res.message || "Probe completed"); })
+    .catch(function(e) { toast("Probe error: " + e.message); })
+    .finally(function() { delete probingIds[internalName]; loadStreamHealth(); });
 }
+function openProbeModal(id, name) { probeSingleSource(id, name); }
 
 function clearStreamStats() {
-  toast("Resetting stream stats…");
+  if (!confirm("Reset all stream stats and probe results?")) return;
   api("/stream-health/clear", { method: "POST", body: "{}" })
-    .then(function() { toast("Stream stats reset ✓"); loadStreamHealth(); })
+    .then(function() { toast("Stream stats reset"); loadStreamHealth(); })
     .catch(function(e) { toast("Error: " + e.message); });
 }
 
 function togglePluginHealth(internalName) {
   api("/plugins/toggle", { method: "POST", body: JSON.stringify({ internalName: internalName }) })
-    .then(function() {
-      toast("Plugin status updated");
-      loadStreamHealth();
-      poll();
-    })
+    .then(function() { toast("Plugin status updated"); loadStreamHealth(); poll(); })
     .catch(function(e) { toast("Error: " + e.message); });
 }
 
-function renderStreamHealth() {
-  var html = "";
+function fmtIst(ts) {
+  if (!ts) return "—";
+  try {
+    return new Date(ts).toLocaleString("en-IN", { timeZone: "Asia/Kolkata", day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }) + " IST";
+  } catch (e) { return new Date(ts).toLocaleString(); }
+}
 
-  var totalInstalled = streamHealthData.length;
-  var streamingOk = 0, deadCount = 0, untestedCount = 0, disabledCount = 0;
-  streamHealthData.forEach(function(p) {
-    if (!p.enabled) disabledCount++;
-    if (p.successRequests > 0) streamingOk++;
-    else if (p.totalRequests > 0 && p.successRequests === 0) deadCount++;
-    else untestedCount++;
-  });
+function fmtIn(ts) {
+  var s = Math.max(0, Math.floor((ts - Date.now()) / 1000));
+  var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
+  return (h > 0 ? h + "h " : "") + m + "m";
+}
 
-  // ── Live probing banner ──────────────────────────────────────────────────
-  if (probingAll) {
-    html += '<div style="display:flex;align-items:center;gap:10px;padding:12px 16px;background:rgba(99,102,241,0.12);border:1.5px solid var(--accent);border-radius:10px;margin-bottom:14px;">';
+var healthBadge = {
+  working: '<span class="badge green">&#9679; Working</span>',
+  proxy: '<span class="badge" style="background:rgba(59,130,246,0.15);color:#60a5fa;border:1px solid rgba(59,130,246,0.4);">&#127760; Via proxy</span>',
+  dead: '<span class="badge red">&#10005; Dead</span>',
+  unknown: '<span class="badge gray">&#9675; Unknown</span>'
+};
+
+function renderMaintenanceCard() {
+  var m = maintData;
+  var html = '<div class="card" style="margin-bottom:14px">';
+  html += '<div class="row" style="justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:10px;margin-bottom:10px;">';
+  html += '<div><h2>&#127769; Nightly maintenance</h2><div class="hint" style="margin-bottom:0">Every day at 12:00 AM IST: reload all plugins &rarr; refresh home pages &rarr; probe extensions without links in 24h (direct, then via proxy) &rarr; auto-uninstall opted-in dead ones.</div></div>';
+  html += '<div class="row" style="gap:8px;flex-wrap:wrap;">';
+  html += '<button class="primary small" onclick="runMaintenanceNow()"' + (m && m.running ? ' disabled' : '') + '>Run now</button>';
+  html += '<button class="ghost small" onclick="probeAllSources()"' + (m && m.running ? ' disabled' : '') + '>Probe all extensions</button>';
+  html += '</div></div>';
+  if (!m) { html += '<div class="muted">Loading…</div></div>'; return html; }
+
+  html += '<div class="stat-cards-grid">';
+  html += '<div class="stat-card"><div class="stat-label">Next run</div><div class="stat-val" style="font-size:16px">' + esc(fmtIst(m.nextRunAt)) + '</div><div class="stat-sub">in ' + fmtIn(m.nextRunAt) + '</div></div>';
+  var lr = m.lastRun;
+  html += '<div class="stat-card"><div class="stat-label">Last run</div><div class="stat-val" style="font-size:16px">' + (lr ? esc(fmtIst(lr.startedAt)) : 'never') + '</div><div class="stat-sub">' +
+    (lr ? esc(lr.trigger) + (lr.error ? ' &middot; error' : '') + ' &middot; ' + (lr.uninstalled ? lr.uninstalled.length : 0) + ' auto-removed' : '&nbsp;') + '</div></div>';
+  var sw = m.sweep || {};
+  var sweepTxt = sw.running ? (sw.done + ' / ' + sw.total + ' probed') : (sw.finishedAt ? fmtTimeAgo(sw.finishedAt) : 'not run yet');
+  html += '<div class="stat-card"><div class="stat-label">Health sweep</div><div class="stat-val" style="font-size:16px">' + esc(sweepTxt) + '</div><div class="stat-sub">' +
+    (sw.total ? (sw.working + ' working &middot; ' + sw.proxy + ' via proxy &middot; ' + sw.dead + ' dead') : '&nbsp;') + '</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Auto-uninstall after</div><div class="row" style="gap:6px;align-items:center;margin-top:4px;">' +
+    '<input id="au-days" type="number" min="1" max="90" value="' + (m.autoUninstallDays || 3) + '" style="width:70px">' +
+    '<span class="muted" style="font-size:12px">days</span><button class="ghost small" onclick="saveAutoUninstallDays()">Save</button></div>' +
+    '<div class="stat-sub">only for extensions switched on below</div></div>';
+  html += '</div>';
+
+  if (m.running) {
+    var pct = sw.total ? Math.round((sw.done / sw.total) * 100) : 0;
+    html += '<div style="display:flex;align-items:center;gap:10px;padding:10px 14px;background:rgba(99,102,241,0.12);border:1.5px solid var(--accent);border-radius:10px;margin-top:12px;">';
     html += '<span style="width:10px;height:10px;border-radius:50%;background:var(--accent);display:inline-block;animation:pulse 1s ease-in-out infinite;"></span>';
-    html += '<span style="font-weight:700;color:var(--accent);">Benchmarking all sources…</span>';
-    html += '<span style="color:var(--text-dim);font-size:12px;flex:1;">Testing each plugin against your query. Results will appear when done.</span>';
-    html += '<button class="ghost small" onclick="probingAll=false;renderStreamHealth();">Cancel View</button>';
+    html += '<span style="font-weight:700;color:var(--accent);">' + esc(m.step || "Running") + '</span>';
+    if (sw.running) html += '<div style="flex:1;height:5px;background:var(--border);border-radius:3px;overflow:hidden;"><div style="height:100%;background:var(--accent);width:' + pct + '%"></div></div><span style="font-size:12px;font-weight:700">' + pct + '%</span>';
     html += '</div>';
   }
 
-  // ── Top stat cards ───────────────────────────────────────────────────────
+  if (m.optedIn && m.optedIn.length) {
+    html += '<div style="margin-top:14px"><div class="drawer-section-label" style="padding:0 0 6px 0">AUTO-UNINSTALL ON (' + m.optedIn.length + ')</div><div class="pillrow">';
+    m.optedIn.forEach(function(o) {
+      var due = (o.dueInDays === null || o.dueInDays === undefined) ? '' :
+        (o.dueInDays <= 0 ? ' &middot; removing next run' : ' &middot; removed in ' + o.dueInDays.toFixed(1) + 'd if still dead');
+      html += '<span class="pill" title="' + esc(o.status) + '">' + esc(o.displayName) + ' <span class="muted">(' + esc(o.status) + due + ')</span> ' +
+        '<a href="#" onclick="toggleAutoUninstall(\'' + jsa(o.internalName) + '\', false);return false;" style="color:var(--red);text-decoration:none">&times;</a></span>';
+    });
+    html += '</div></div>';
+  }
+  if (m.history && m.history.length) {
+    html += '<details style="margin-top:10px"><summary class="muted" style="cursor:pointer;font-size:12px">Auto-uninstall history (' + m.history.length + ')</summary><div style="margin-top:6px">';
+    m.history.slice(0, 30).forEach(function(h) {
+      html += '<div style="font-size:12px;padding:3px 0;border-bottom:1px solid var(--divider)"><b>' + esc(h.name) + '</b> <span class="muted">' + esc(fmtIst(h.at)) + ' &mdash; ' + esc(h.reason) + '</span></div>';
+    });
+    html += '</div></details>';
+  }
+  html += '</div>';
+  return html;
+}
+
+function renderStreamHealth() {
+  var html = renderMaintenanceCard();
+
+  var counts = { working: 0, proxy: 0, dead: 0, unknown: 0 };
+  var disabledCount = 0;
+  streamHealthData.forEach(function(p) {
+    counts[hStatus(p)] = (counts[hStatus(p)] || 0) + 1;
+    if (!p.enabled) disabledCount++;
+  });
+  var total = streamHealthData.length;
+
   html += '<div class="stat-cards-grid">';
-  html += '<div class="stat-card"><div class="stat-label">Installed</div><div class="stat-val">' + totalInstalled + '</div><div class="stat-sub">Tracked by Bridge</div></div>';
-  html += '<div class="stat-card"><div class="stat-label">Streaming OK</div><div class="stat-val green">' + streamingOk + '</div><div class="stat-sub">Returning links</div></div>';
-  html += '<div class="stat-card" style="cursor:pointer" onclick="setStreamHealthFilter(\'dead\')">' +
-    '<div class="stat-label">Dead / 0 Streams</div>' +
-    '<div class="stat-val' + (deadCount > 0 ? ' red' : '') + '">' + deadCount + '</div>' +
-    '<div class="stat-sub">' + (deadCount > 0 ? 'Click to filter' : 'All clear') + '</div></div>';
-  html += '<div class="stat-card"><div class="stat-label">Untested</div><div class="stat-val">' + untestedCount + '</div><div class="stat-sub">Run Benchmark to test</div></div>';
+  html += '<div class="stat-card"><div class="stat-label">Installed</div><div class="stat-val">' + total + '</div><div class="stat-sub">Tracked by Bridge</div></div>';
+  html += '<div class="stat-card" style="cursor:pointer" onclick="setStreamHealthFilter(\'working\')"><div class="stat-label">Working</div><div class="stat-val green">' + counts.working + '</div><div class="stat-sub">Links directly</div></div>';
+  html += '<div class="stat-card" style="cursor:pointer" onclick="setStreamHealthFilter(\'proxy\')"><div class="stat-label">Via proxy</div><div class="stat-val" style="color:#60a5fa">' + counts.proxy + '</div><div class="stat-sub">Geo-blocked, served via proxy</div></div>';
+  html += '<div class="stat-card" style="cursor:pointer" onclick="setStreamHealthFilter(\'dead\')"><div class="stat-label">Dead</div><div class="stat-val' + (counts.dead ? ' red' : '') + '">' + counts.dead + '</div><div class="stat-sub">No links direct or via proxy</div></div>';
   html += '</div>';
 
-  // ── Main card ────────────────────────────────────────────────────────────
   html += '<div class="card" style="margin-top:14px">';
   html += '<div class="row" style="align-items:flex-start;justify-content:space-between;margin-bottom:12px;flex-wrap:wrap;gap:10px;">';
-  html += '<div><h2><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg> Plugin Stream Health Tracker</h2>';
-  html += '<div class="hint" style="margin-bottom:0">Live health of every installed plugin. Benchmark to check which ones actually return streams.</div></div>';
-
-  // ── Action buttons ───────────────────────────────────────────────────────
+  html += '<div><h2>Extension stream health</h2><div class="hint" style="margin-bottom:0">Status comes from real user traffic plus the probe (home page &rarr; links, direct then through the extension\'s country proxy). Users see Dead badges and can hide dead extensions.</div></div>';
   html += '<div class="row" style="gap:8px;flex-wrap:wrap;">';
-  html += '<button class="primary small" onclick="probeAllSources()" ' + (probingAll ? 'disabled' : '') + '>';
-  html += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg>';
-  html += (probingAll ? ' Benchmarking…' : ' Benchmark All') + '</button>';
-
-  if (deadCount > 0) {
-    html += '<button class="danger small" onclick="disableDeadPlugins()" title="Disable all dead plugins">';
-    html += '<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>';
-    html += ' Disable ' + deadCount + ' Dead</button>';
-
-    html += '<button class="danger small" onclick="uninstallAllDead()" title="Permanently remove all dead plugins">';
-    html += svgTrash + ' Uninstall All Dead</button>';
+  if (counts.dead > 0) {
+    html += '<button class="danger small" onclick="disableDeadPlugins()">Disable ' + counts.dead + ' dead</button>';
+    html += '<button class="danger small" onclick="uninstallAllDead()">' + svgTrash + ' Uninstall all dead</button>';
   }
-  html += '<button class="ghost small" onclick="clearStreamStats()">Reset Stats</button>';
+  html += '<button class="ghost small" onclick="clearStreamStats()">Reset stats</button>';
   html += '<button class="ghost small" onclick="loadStreamHealth()">' + svgRefresh + ' Refresh</button>';
-  html += '</div>';
-  html += '</div>'; // close row
+  html += '</div></div>';
 
-  // ── Filter pills ─────────────────────────────────────────────────────────
   html += '<div class="pillrow">';
-  html += '<span class="pill' + (streamHealthFilter === "all" ? " active" : "") + '" onclick="setStreamHealthFilter(\'all\')">All (' + totalInstalled + ')</span>';
-  html += '<span class="pill' + (streamHealthFilter === "ok" ? " active" : "") + '" onclick="setStreamHealthFilter(\'ok\')">✓ Streaming OK (' + streamingOk + ')</span>';
-  html += '<span class="pill' + (streamHealthFilter === "dead" ? " active" : "") + '" onclick="setStreamHealthFilter(\'dead\')">✗ Dead (' + deadCount + ')</span>';
-  html += '<span class="pill' + (streamHealthFilter === "disabled" ? " active" : "") + '" onclick="setStreamHealthFilter(\'disabled\')">Disabled (' + disabledCount + ')</span>';
-  html += '<span class="pill' + (streamHealthFilter === "untested" ? " active" : "") + '" onclick="setStreamHealthFilter(\'untested\')">Untested (' + untestedCount + ')</span>';
+  [["all", "All", total], ["working", "Working", counts.working], ["proxy", "Via proxy", counts.proxy], ["dead", "Dead", counts.dead], ["unknown", "Unknown", counts.unknown], ["disabled", "Disabled", disabledCount], ["auto", "Auto-uninstall on", (maintData && maintData.optedIn) ? maintData.optedIn.length : 0]].forEach(function(f) {
+    html += '<span class="pill' + (streamHealthFilter === f[0] ? " active" : "") + '" onclick="setStreamHealthFilter(\'' + f[0] + '\')">' + f[1] + ' (' + f[2] + ')</span>';
+  });
   html += '</div>';
 
-  // ── Search ───────────────────────────────────────────────────────────────
   html += '<div style="position:relative;margin-bottom:14px;">';
-  html += '<input type="text" id="health-search" placeholder="Search plugins by name or error…" value="' + esc(streamHealthSearch) + '" oninput="setStreamHealthSearch(this.value)" style="padding-right:32px">';
-  if (streamHealthSearch) {
-    html += '<button onclick="setStreamHealthSearch(\'\')" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);padding:4px;cursor:pointer;font-size:14px;line-height:1;" title="Clear">&times;</button>';
-  }
+  html += '<input type="text" id="health-search" placeholder="Search by name, error or probe note…" value="' + esc(streamHealthSearch) + '" oninput="setStreamHealthSearch(this.value)" style="padding-right:32px">';
+  if (streamHealthSearch) html += '<button onclick="setStreamHealthSearch(\'\')" style="position:absolute;right:8px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--muted);padding:4px;cursor:pointer;font-size:14px;line-height:1;" title="Clear">&times;</button>';
   html += '</div>';
 
-  // ── Plugin list ──────────────────────────────────────────────────────────
   var filtered = streamHealthData.filter(function(p) {
-    if (streamHealthFilter === "ok" && p.successRequests <= 0) return false;
-    if (streamHealthFilter === "dead" && (p.totalRequests === 0 || p.successRequests > 0)) return false;
-    if (streamHealthFilter === "disabled" && p.enabled) return false;
-    if (streamHealthFilter === "untested" && p.totalRequests > 0) return false;
+    var s = hStatus(p);
+    if (streamHealthFilter === "disabled") { if (p.enabled) return false; }
+    else if (streamHealthFilter === "auto") { if (!isAutoUninstall(p.internalName)) return false; }
+    else if (streamHealthFilter !== "all" && streamHealthFilter !== s) return false;
     if (streamHealthSearch) {
       var q = streamHealthSearch.toLowerCase();
-      if ((p.pluginName || "").toLowerCase().indexOf(q) < 0 &&
-          (p.internalName || "").toLowerCase().indexOf(q) < 0 &&
-          (p.lastError || "").toLowerCase().indexOf(q) < 0) return false;
+      var hay = ((p.pluginName || "") + " " + (p.internalName || "") + " " + (p.lastError || "") + " " + (p.lastProbeNote || "")).toLowerCase();
+      if (hay.indexOf(q) < 0) return false;
     }
     return true;
   });
 
   if (!filtered.length) {
-    html += '<div class="empty">No plugins match your filter.</div>';
+    html += '<div class="empty">No extensions match your filter.</div>';
   } else {
     html += '<div class="health-grid">';
     filtered.forEach(function(p) {
-      var isProbing = probingAll || !!probingIds[p.internalName];
-      var isDead = p.totalRequests > 0 && p.successRequests === 0;
-
-      // Status badge
-      var statusBadge;
-      if (isProbing) {
-        statusBadge = '<span class="badge" style="background:var(--accent-light);color:var(--accent);border:1px solid var(--accent);animation:pulse 1s ease-in-out infinite;">&#9899; Testing…</span>';
-      } else if (!p.enabled) {
-        statusBadge = '<span class="badge gray">Disabled</span>';
-      } else if (p.successRequests > 0) {
-        statusBadge = '<span class="badge green">&#9679; OK &mdash; ' + p.lastStreamCount + ' links</span>';
-      } else if (isDead) {
-        statusBadge = '<span class="badge red">&#10005; Dead &mdash; 0 streams</span>';
-      } else {
-        statusBadge = '<span class="badge gray">&#9675; Untested</span>';
-      }
-
-      var ratePct = p.totalRequests > 0 ? Math.round((p.successRequests / p.totalRequests) * 100) : 0;
-      var lastStr = p.lastSuccessTime > 0 ? fmtTimeAgo(p.lastSuccessTime) : "never";
-
-      var borderStyle = "";
-      if (isProbing) borderStyle = "border-color:var(--accent);";
-      else if (isDead && p.enabled) borderStyle = "border-color:rgba(239,68,68,0.4);";
-      else if (p.successRequests > 0) borderStyle = "border-color:rgba(16,185,129,0.35);";
-
-      html += '<div class="health-card" style="' + borderStyle + '">';
-
-      // Header: Avatar + Title + Status Badge
-      html += '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;">';
+      var s = hStatus(p);
+      var isProbing = !!probingIds[p.internalName];
+      var badge = isProbing ? '<span class="badge" style="background:var(--accent-light);color:var(--accent);border:1px solid var(--accent);animation:pulse 1s ease-in-out infinite;">Testing…</span>'
+        : (!p.enabled ? '<span class="badge gray">Disabled</span> ' : '') + (healthBadge[s] || healthBadge.unknown);
+      var border = s === "dead" ? "border-color:rgba(239,68,68,0.4);" : s === "working" ? "border-color:rgba(16,185,129,0.35);" : s === "proxy" ? "border-color:rgba(59,130,246,0.4);" : "";
       var iconSrc = p.iconUrl;
       if (!iconSrc && Array.isArray(plugins)) {
-        var foundPlg = plugins.find(function(x) { return x.internalName === p.internalName; });
-        if (foundPlg && foundPlg.iconUrl) iconSrc = foundPlg.iconUrl;
+        var fp = plugins.find(function(x) { return x.internalName === p.internalName; });
+        if (fp && fp.iconUrl) iconSrc = fp.iconUrl;
       }
+      var letter = esc((p.pluginName || p.internalName || '?').charAt(0).toUpperCase());
 
+      html += '<div class="health-card" style="' + border + '">';
+      html += '<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:8px;">';
       html += '<div style="display:flex;align-items:center;gap:8px;min-width:0;">';
       if (iconSrc) {
         html += '<img class="ricon" src="' + esc(iconSrc) + '" onerror="this.style.display=\'none\';this.nextElementSibling.style.display=\'flex\'" alt="" style="width:34px;height:34px;border-radius:8px;object-fit:cover;flex:0 0 34px;">';
-        html += '<div class="rletter" style="display:none;width:34px;height:34px;border-radius:8px;font-size:13px;' + (isDead && p.enabled ? 'background:rgba(239,68,68,0.2);color:var(--red);' : isProbing ? 'background:var(--accent-light);color:var(--accent);' : '') + '">' + esc((p.pluginName || p.internalName || '?').charAt(0).toUpperCase()) + '</div>';
+        html += '<div class="rletter" style="display:none;width:34px;height:34px;border-radius:8px;font-size:13px;">' + letter + '</div>';
       } else {
-        html += '<div class="rletter" style="width:34px;height:34px;border-radius:8px;font-size:13px;' + (isDead && p.enabled ? 'background:rgba(239,68,68,0.2);color:var(--red);' : isProbing ? 'background:var(--accent-light);color:var(--accent);' : '') + '">' + esc((p.pluginName || p.internalName || '?').charAt(0).toUpperCase()) + '</div>';
+        html += '<div class="rletter" style="width:34px;height:34px;border-radius:8px;font-size:13px;">' + letter + '</div>';
       }
-      html += '<div style="min-width:0;">';
-      html += '<div class="rname" style="font-size:13.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(p.pluginName || p.internalName) + '</div>';
-      html += '<div style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(p.internalName) + '</div>';
-      html += '</div>';
-      html += '</div>';
-      html += statusBadge;
-      html += '</div>';
+      html += '<div style="min-width:0;"><div class="rname" style="font-size:13.5px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(p.pluginName || p.internalName) + '</div>';
+      html += '<div style="font-size:10px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">' + esc(p.internalName) + '</div></div>';
+      html += '</div>' + badge + '</div>';
 
-      // Middle: Health stats
-      html += '<div style="margin-top:6px;">';
-      if (isProbing) {
-        html += '<div class="muted" style="font-size:11px;">Probing streams… please wait</div>';
-      } else if (p.totalRequests > 0) {
-        html += '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">';
-        html += '<div style="flex:1;height:4px;background:var(--border);border-radius:2px;overflow:hidden;">';
-        html += '<div style="height:100%;border-radius:2px;background:' + (ratePct > 50 ? 'var(--green)' : ratePct > 0 ? 'var(--amber)' : 'var(--red)') + ';width:' + ratePct + '%;"></div>';
-        html += '</div>';
-        html += '<span style="font-size:11px;font-weight:700;">' + ratePct + '%</span>';
-        html += '</div>';
-        html += '<div class="muted" style="font-size:10.5px;">' + p.successRequests + '/' + p.totalRequests + ' calls &middot; ' + p.totalStreams + ' streams &middot; ' + lastStr + '</div>';
-      } else {
-        html += '<div class="muted" style="font-size:11px;">Not yet tested</div>';
-      }
-      if (p.lastError && !isProbing) {
-        html += '<div style="font-size:10.5px;color:var(--red);margin-top:4px;word-break:break-all;background:var(--red-bg);padding:4px 6px;border-radius:6px;">&#x26A0; ' + esc(p.lastError) + '</div>';
+      html += '<div style="margin-top:6px;font-size:10.5px;" class="muted">';
+      var rate = p.totalRequests > 0 ? Math.round((p.successRequests / p.totalRequests) * 100) + '% of ' + p.totalRequests + ' requests' : 'no user requests yet';
+      html += 'Links ' + (p.lastSuccessTime > 0 ? fmtTimeAgo(p.lastSuccessTime) : 'never') + ' &middot; ' + rate;
+      if (p.lastProbeTime > 0) {
+        var pr = 'Probed ' + fmtTimeAgo(p.lastProbeTime) + ': direct ' + (p.lastDirectProbeStreams >= 0 ? p.lastDirectProbeStreams : '–');
+        if (p.lastProxyProbeStreams >= 0) pr += ', ' + (p.lastProxyCountry || '') + ' proxy ' + p.lastProxyProbeStreams;
+        else if (p.lastProxyProbeStreams === -2) pr += ', proxy unavailable';
+        html += '<br>' + esc(pr);
       }
       html += '</div>';
-
-      // Footer: Action buttons
-      html += '<div style="display:flex;align-items:center;justify-content:space-between;padding-top:8px;border-top:1px solid var(--divider);margin-top:auto;gap:8px;">';
-      if (isProbing) {
-        html += '<button class="pill small" disabled style="opacity:0.6;min-height:28px;">Testing…</button>';
-      } else {
-        html += '<button class="pill small" onclick="probeSingleSource(\'' + jsa(p.internalName) + '\',\'' + jsa(p.pluginName||p.internalName) + '\')" style="min-height:28px;" title="Test this source now">Test</button>';
+      if (p.lastProbeNote && !isProbing && s !== "working") {
+        html += '<div style="font-size:10.5px;color:var(--text-dim);margin-top:4px;word-break:break-word;background:var(--divider);padding:4px 6px;border-radius:6px;">' + esc(p.lastProbeNote) + '</div>';
+      } else if (p.lastError && !isProbing && s !== "working") {
+        html += '<div style="font-size:10.5px;color:var(--red);margin-top:4px;word-break:break-word;background:var(--red-bg);padding:4px 6px;border-radius:6px;">&#x26A0; ' + esc(p.lastError) + '</div>';
       }
+
+      html += '<div style="display:flex;align-items:center;justify-content:space-between;padding-top:8px;border-top:1px solid var(--divider);margin-top:auto;gap:8px;flex-wrap:wrap;">';
+      html += '<button class="pill small" ' + (isProbing ? 'disabled style="opacity:0.6;min-height:28px;"' : 'style="min-height:28px;"') + ' onclick="probeSingleSource(\'' + jsa(p.internalName) + '\',\'' + jsa(p.pluginName || p.internalName) + '\')" title="Probe now: home page → links, direct then via proxy">' + (isProbing ? 'Testing…' : 'Test') + '</button>';
+      var au = isAutoUninstall(p.internalName);
+      html += '<label style="display:flex;align-items:center;gap:4px;font-size:10.5px;cursor:pointer" title="Uninstall automatically when dead for the configured number of days">' +
+        '<input type="checkbox" ' + (au ? 'checked ' : '') + 'onchange="toggleAutoUninstall(\'' + jsa(p.internalName) + '\', this.checked)"> Auto-remove</label>';
       html += '<div class="row" style="gap:6px;align-items:center;">';
-      if (!isProbing && (isDead || !p.enabled)) {
-        html += '<button class="iconbtn small danger-btn" onclick="uninstallPlugin(\'' + jsa(p.internalName) + '\',\'' + jsa(p.pluginName||p.internalName) + '\')" title="Uninstall plugin">' + svgTrash + '</button>';
+      if (s === "dead" || !p.enabled) {
+        html += '<button class="iconbtn small danger-btn" onclick="uninstallPlugin(\'' + jsa(p.internalName) + '\',\'' + jsa(p.pluginName || p.internalName) + '\')" title="Uninstall">' + svgTrash + '</button>';
       }
-      html += '<label class="switch" title="' + (p.enabled ? "Disable" : "Enable") + ' provider">';
-      html += '<input type="checkbox" ' + (p.enabled ? "checked" : "") + ' onchange="togglePluginHealth(\'' + jsa(p.internalName) + '\')">';
-      html += '<span class="track"></span>';
-      html += '</label>';
-      html += '<span style="font-size:10.5px;font-weight:700;' + (p.enabled ? 'color:var(--green)' : 'color:var(--muted)') + '">' + (p.enabled ? 'Active' : 'Off') + '</span>';
+      html += '<label class="switch" title="' + (p.enabled ? "Disable" : "Enable") + '"><input type="checkbox" ' + (p.enabled ? "checked" : "") + ' onchange="togglePluginHealth(\'' + jsa(p.internalName) + '\')"><span class="track"></span></label>';
+      html += '</div></div>';
       html += '</div>';
-      html += '</div>';
-
-      html += '</div>'; // close health-card
     });
-    html += '</div>'; // close health-grid
+    html += '</div>';
   }
+  html += '</div>';
 
-  html += '</div>'; // close main card
+  // Keep focus in the days input while the view refreshes during a run
+  var active = document.activeElement;
+  var keepDays = active && active.id === "au-days" ? active.value : null;
   el("view").innerHTML = html;
+  if (keepDays !== null && el("au-days")) { el("au-days").value = keepDays; el("au-days").focus(); }
 }
+
+// Old benchmark/probe modals (markup still present) — probing no longer takes a query
+function closeBenchmarkModal() { var m = el("benchmark-modal"); if (m) m.classList.remove("open"); }
+function submitBenchmark() { closeBenchmarkModal(); probeAllSources(); }
+function openBenchmarkModal() { probeAllSources(); }
+function closeProbeModal() { var m = el("probe-modal"); if (m) m.classList.remove("open"); }
+function submitProbe() { closeProbeModal(); }
 
 function setStreamHealthFilter(f) { streamHealthFilter = f; renderStreamHealth(); }
 function setStreamHealthSearch(q) {
@@ -4341,6 +4344,210 @@ function loadGoalStats() {
       if (fillEl) fillEl.style.width = Math.min(100, Math.max(0, pct)) + "%";
     })
     .catch(function() {});
+}
+
+
+// ── Geo Proxy Tab ─────────────────────────────────────────────────────────────
+var geoData = null;
+var geoSearch = "";
+var geoDirty = false;     // settings form edited, don't overwrite on refresh
+var geoTimer = null;
+
+function loadGeo() {
+  api("/geo").then(function(d) {
+    geoData = d;
+    if (tab === "proxy") renderGeo();
+  }).catch(function(e) { if (tab === "proxy") toast("Failed to load proxy status: " + e.message); });
+  if (!geoTimer) geoTimer = setInterval(function() { if (tab === "proxy") loadGeo(); }, 10000);
+}
+
+function geoVal(id) { var x = el(id); return x ? x.value : ""; }
+function geoChk(id) { var x = el(id); return !!(x && x.checked); }
+
+function saveGeoSettings() {
+  var rules = {};
+  geoVal("geo-rules").split("\n").forEach(function(line) {
+    var t = line.trim(); if (!t || t.charAt(0) === "#") return;
+    var parts = t.split(/[\s=:,]+/);
+    if (parts.length >= 2) rules[parts[0]] = parts[1];
+  });
+  var body = {
+    enabled: geoChk("geo-enabled"),
+    datacenterFallback: geoChk("geo-dcfb"),
+    allowDatacenter: geoChk("geo-dc"),
+    poolSize: parseInt(geoVal("geo-pool"), 10) || 6,
+    maxPoolSize: parseInt(geoVal("geo-maxpool"), 10) || 30,
+    maxStreamsPerProxy: parseInt(geoVal("geo-perproxy"), 10) || 3,
+    blockTtlHours: parseInt(geoVal("geo-ttl"), 10) || 12,
+    defaultCountry: geoVal("geo-default").trim().toUpperCase(),
+    domainRules: rules,
+    customProxies: geoVal("geo-custom").split("\n").map(function(s) { return s.trim(); }).filter(function(s) { return s && s.charAt(0) !== "#"; })
+  };
+  api("/geo/settings", { method: "POST", body: JSON.stringify(body) })
+    .then(function(res) { toast(res.message || "Saved"); geoDirty = false; loadGeo(); })
+    .catch(function(e) { toast("Error: " + e.message); });
+}
+
+function geoOverride(plugin) {
+  var mode = geoVal("geo-mode-" + plugin);
+  var country = geoVal("geo-cc-" + plugin).trim().toUpperCase();
+  api("/geo/override", { method: "POST", body: JSON.stringify({ plugin: plugin, mode: mode, country: country || null }) })
+    .then(function(res) { toast(res.message || "Saved"); loadGeo(); })
+    .catch(function(e) { toast("Error: " + e.message); });
+}
+
+function geoClearPlugin(plugin) {
+  api("/geo/clear", { method: "POST", body: JSON.stringify({ plugin: plugin }) })
+    .then(function(res) { toast(res.message || "Cleared"); loadGeo(); })
+    .catch(function(e) { toast("Error: " + e.message); });
+}
+
+function geoClearHost(host) {
+  api("/geo/clear-host", { method: "POST", body: JSON.stringify({ country: "", key: host }) })
+    .then(function(res) { toast(res.message || "Forgot " + host); loadGeo(); })
+    .catch(function(e) { toast("Error: " + e.message); });
+}
+
+function geoRefill() {
+  var c = (prompt("Build a proxy pool for which country? (2-letter code, e.g. IN)", "IN") || "").trim().toUpperCase();
+  if (!c) return;
+  api("/geo/refill", { method: "POST", body: JSON.stringify({ country: c }) })
+    .then(function(res) { toast(res.message || "Refilling"); setTimeout(loadGeo, 4000); })
+    .catch(function(e) { toast("Error: " + e.message); });
+}
+
+function geoRemoveProxy(country, key) {
+  api("/geo/remove-proxy", { method: "POST", body: JSON.stringify({ country: country, key: key }) })
+    .then(function(res) { toast(res.message || "Removed"); loadGeo(); })
+    .catch(function(e) { toast("Error: " + e.message); });
+}
+
+function setGeoSearch(q) {
+  var active = document.activeElement;
+  var typing = active && active.id === "geo-search";
+  geoSearch = q; renderGeo();
+  var box = el("geo-search");
+  if (box && typing) { box.focus(); box.setSelectionRange(box.value.length, box.value.length); }
+}
+
+function renderGeo() {
+  var d = geoData;
+  if (!d) { el("view").innerHTML = '<div class="card"><div class="muted">Loading proxy status…</div></div>'; loadGeo(); return; }
+  // Don't wipe a settings form that is being edited
+  if (geoDirty && el("geo-rules")) { renderGeoLive(); return; }
+  var s = d.settings || {};
+  var html = '';
+
+  html += '<div class="card" style="margin-bottom:14px">';
+  html += '<h2>&#127760; Geo proxy routing</h2>';
+  html += '<div class="hint">Requests go out directly. When a site refuses this server (403 / 450 / 451 / Cloudflare challenge, or the connection is cut) the request is retried through a residential proxy of the extension\'s country (from its name, home-page sections or language), and the host is then proxied for every extension. Relayed live streams keep one proxy per channel with a hot standby; channels are spread across the pool.</div>';
+  html += '<div class="row" style="gap:16px;flex-wrap:wrap;margin:10px 0">';
+  html += '<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="geo-enabled" ' + (s.enabled ? 'checked' : '') + ' onchange="geoDirty=true"> Enabled</label>';
+  html += '<label style="display:flex;gap:6px;align-items:center" title="Use datacenter IPs while a country has under 3 working residential proxies"><input type="checkbox" id="geo-dcfb" ' + (s.datacenterFallback ? 'checked' : '') + ' onchange="geoDirty=true"> Datacenter fallback</label>';
+  html += '<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="geo-dc" ' + (s.allowDatacenter ? 'checked' : '') + ' onchange="geoDirty=true"> Always allow datacenter</label>';
+  html += '</div>';
+  html += '<div class="row" style="gap:12px;flex-wrap:wrap">';
+  [["geo-pool", "Pool size / country", s.poolSize], ["geo-maxpool", "Max pool (live load)", s.maxPoolSize], ["geo-perproxy", "Live channels per proxy", s.maxStreamsPerProxy], ["geo-ttl", "Remember blocks (hours)", s.blockTtlHours]].forEach(function(f) {
+    html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted">' + f[1] + '<input id="' + f[0] + '" type="number" value="' + f[2] + '" style="width:120px" oninput="geoDirty=true"></label>';
+  });
+  html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted">Default country<input id="geo-default" type="text" maxlength="2" placeholder="none" value="' + esc(s.defaultCountry || "") + '" style="width:90px" oninput="geoDirty=true"></label>';
+  html += '</div>';
+  var rules = Object.keys(s.domainRules || {}).map(function(k) { return k + " " + s.domainRules[k]; }).join("\n");
+  html += '<div class="row" style="gap:12px;flex-wrap:wrap;margin-top:10px;align-items:flex-start">';
+  html += '<label style="flex:1;min-width:240px;font-size:11px" class="muted">Domain rules — host suffix + country (for hosts geo-locked whoever asks)<textarea id="geo-rules" rows="5" style="width:100%;font-family:monospace;font-size:12px" oninput="geoDirty=true">' + esc(rules) + '</textarea></label>';
+  html += '<label style="flex:1;min-width:280px;font-size:11px" class="muted">Private / paid proxies — preferred, never evicted. One per line: <code>IN socks5://user:pass@host:port *50</code> (<code>*N</code> = capacity in live channels &times; per-proxy limit; use a high value for a rotating residential gateway)<textarea id="geo-custom" rows="5" style="width:100%;font-family:monospace;font-size:12px" oninput="geoDirty=true">' + esc((s.customProxies || []).join("\n")) + '</textarea></label>';
+  html += '</div>';
+  html += '<div class="row" style="gap:8px;margin-top:10px"><button class="primary small" onclick="saveGeoSettings()">Save settings</button><button class="ghost small" onclick="geoDirty=false;loadGeo()">Discard</button><button class="ghost small" onclick="geoRefill()">Build pool for a country…</button></div>';
+  html += '</div>';
+
+  html += '<div id="geo-live"></div>';
+  el("view").innerHTML = html;
+  renderGeoLive();
+}
+
+function renderGeoLive() {
+  var d = geoData; if (!d) return;
+  var html = '';
+
+  // Pools
+  html += '<div class="card" style="margin-bottom:14px"><h2>Proxy pools</h2>';
+  if (!d.countries || !d.countries.length) html += '<div class="muted">No pools yet — they are built on demand when a site blocks this server.</div>';
+  (d.countries || []).forEach(function(c) {
+    html += '<div style="margin-top:10px"><div class="row" style="justify-content:space-between;align-items:center"><b>' + esc(c.country) + '</b><span class="muted" style="font-size:12px">' + c.healthy + ' healthy' + (c.refilling ? ' &middot; refilling…' : '') + (c.lastRefill ? ' &middot; refilled ' + fmtTimeAgo(c.lastRefill) : '') + '</span></div>';
+    if (!c.proxies.length) { html += '<div class="muted" style="font-size:12px">empty</div>'; }
+    else {
+      html += '<div style="overflow-x:auto"><table style="width:100%;font-size:12px;border-collapse:collapse"><tr class="muted" style="text-align:left"><th>Proxy</th><th>Type</th><th>ISP</th><th>Latency</th><th>Live</th><th>OK / fail</th><th></th></tr>';
+      c.proxies.forEach(function(p) {
+        var kind = p.custom ? '<span class="badge" style="background:rgba(234,179,8,0.15);color:#eab308">private' + (p.capacity > 1 ? ' &times;' + p.capacity : '') + '</span>' : (p.residential ? '<span class="badge green">residential</span>' : '<span class="badge gray">datacenter</span>');
+        var down = p.consecutiveFailures >= 2;
+        html += '<tr style="border-top:1px solid var(--divider);' + (down ? 'opacity:0.5' : '') + '"><td style="font-family:monospace">' + esc(p.endpoint.type + "://" + p.endpoint.host + ":" + p.endpoint.port) + '</td><td>' + kind + '</td><td>' + esc(p.isp || "") + '</td><td>' + (p.latencyMs || 0) + ' ms</td><td>' + (p.activeStreams || 0) + '</td><td>' + p.successes + ' / ' + p.failures + '</td>' +
+          '<td><a href="#" style="color:var(--red)" onclick="geoRemoveProxy(\'' + jsa(c.country) + '\',\'' + jsa(p.endpoint.type + "://" + p.endpoint.host + ":" + p.endpoint.port) + '\');return false;">remove</a></td></tr>';
+      });
+      html += '</table></div>';
+    }
+    html += '</div>';
+  });
+  html += '</div>';
+
+  // Live stream leases
+  if (d.leases && d.leases.length) {
+    html += '<div class="card" style="margin-bottom:14px"><h2>Live channels through proxies (' + d.leases.length + ')</h2>';
+    d.leases.forEach(function(l) {
+      html += '<div style="font-size:12px;padding:4px 0;border-bottom:1px solid var(--divider)"><b>' + esc(l.country) + '</b> <span style="font-family:monospace">' + esc(l.key) + '</span><br><span class="muted">primary ' + esc(l.primary || "none") + ' &middot; standby ' + esc(l.standby || "none") + ' &middot; idle ' + l.idleSec + 's</span></div>';
+    });
+    html += '</div>';
+  }
+
+  // Extension routes
+  var rows = (d.plugins || []).filter(function(p) {
+    if (!geoSearch) return true;
+    var q = geoSearch.toLowerCase();
+    return (p.displayName + " " + p.plugin + " " + (p.country || "") + " " + (p.blockedHosts || []).join(" ")).toLowerCase().indexOf(q) >= 0;
+  });
+  html += '<div class="card" style="margin-bottom:14px"><h2>Routes</h2>';
+  html += '<input type="text" id="geo-search" placeholder="Search extensions, countries or hosts…" value="' + esc(geoSearch) + '" oninput="setGeoSearch(this.value)" style="margin-bottom:10px">';
+  html += '<div style="overflow-x:auto"><table style="width:100%;font-size:12px;border-collapse:collapse"><tr class="muted" style="text-align:left"><th>Extension</th><th>Country</th><th>Mode</th><th>Proxied hosts</th><th>Proxy ok / fail</th><th></th></tr>';
+  rows.slice(0, 300).forEach(function(p) {
+    var shared = p.plugin === "*";
+    var hosts = (p.blockedHosts || []).map(function(h) {
+      return esc(h) + (shared ? ' <a href="#" style="color:var(--red)" onclick="geoClearHost(\'' + jsa(h.split(" ")[0]) + '\');return false;" title="Forget">&times;</a>' : '');
+    }).join(", ");
+    if (p.proxiedAll) hosts = '<b>all traffic</b> (probe)' + (hosts ? ", " + hosts : "");
+    html += '<tr style="border-top:1px solid var(--divider)">';
+    html += '<td><b>' + esc(p.displayName) + '</b>' + (shared ? '' : '<div class="muted" style="font-size:10px">' + esc(p.plugin) + '</div>') + '</td>';
+    if (shared) {
+      html += '<td colspan="2" class="muted">learned per host, for every extension</td>';
+    } else {
+      html += '<td><input id="geo-cc-' + esc(p.plugin) + '" type="text" maxlength="2" value="' + esc(p.overrideCountry || "") + '" placeholder="' + esc(p.detectedCountry || "–") + '" style="width:46px" title="Detected: ' + esc((p.detectedCountry || "none") + " (" + p.countrySource + ")") + '"> <span class="muted" style="font-size:10px">' + esc(p.country || "none") + '</span></td>';
+      html += '<td><select id="geo-mode-' + esc(p.plugin) + '" onchange="geoOverride(\'' + jsa(p.plugin) + '\')">' +
+        ["auto", "always", "off"].map(function(m) { return '<option value="' + m + '"' + (p.mode === m ? ' selected' : '') + '>' + m + '</option>'; }).join("") + '</select> ' +
+        '<a href="#" onclick="geoOverride(\'' + jsa(p.plugin) + '\');return false;" style="font-size:11px">save</a></td>';
+    }
+    html += '<td style="max-width:320px;word-break:break-word">' + (hosts || '<span class="muted">—</span>') + '</td>';
+    html += '<td>' + p.proxiedOk + ' / ' + p.proxiedFail + '</td>';
+    html += '<td>' + (!shared && (p.blockedHosts.length || p.proxiedAll) ? '<a href="#" onclick="geoClearPlugin(\'' + jsa(p.plugin) + '\');return false;" style="font-size:11px">forget</a>' : '') + '</td>';
+    html += '</tr>';
+  });
+  html += '</table></div>';
+  if (rows.length > 300) html += '<div class="muted" style="font-size:11px;margin-top:6px">Showing 300 of ' + rows.length + ' — search to narrow down.</div>';
+  html += '</div>';
+
+  // Events
+  if (d.events && d.events.length) {
+    html += '<div class="card"><h2>Recent routing events</h2>';
+    d.events.slice(0, 40).forEach(function(e) {
+      html += '<div style="font-size:12px;padding:3px 0;border-bottom:1px solid var(--divider)"><span class="muted">' + fmtTimeAgo(e.at) + '</span> ' + (e.plugin ? '<b>' + esc(e.plugin) + '</b> ' : '') + esc(e.message) + '</div>';
+    });
+    html += '</div>';
+  }
+
+  var box = el("geo-live");
+  if (box) {
+    var active = document.activeElement;
+    var typing = active && active.id === "geo-search";
+    box.innerHTML = html;
+    if (typing && el("geo-search")) { var g = el("geo-search"); g.focus(); g.setSelectionRange(g.value.length, g.value.length); }
+  }
 }
 
 // ── Boot ──────────────────────────────────────────────────────────────────────
