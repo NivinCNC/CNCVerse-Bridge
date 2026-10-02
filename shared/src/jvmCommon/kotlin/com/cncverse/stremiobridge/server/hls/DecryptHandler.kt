@@ -71,6 +71,9 @@ object DecryptHandler {
             val proxyUrl: String? = null
 
             withContext(Dispatchers.IO) {
+              // One upstream fetch+decrypt per segment, shared by every viewer asking for it at once
+              val decrypted = SegmentCache.singleFlight(segmentCacheKey) {
+                SegmentCache.getSegment(segmentCacheKey)?.let { return@singleFlight it }
                 // Fetch init and segment
                 val (initContent, segmentContent) = try {
                     fetchSegments(decodedInitUrl, decodedSegmentUrl, customHeaders, proxyUrl)
@@ -94,7 +97,7 @@ object DecryptHandler {
                 // VLC/Stremio FIX: excludeInit=true - segments should NOT include init
                 // Init is served separately via EXT-X-MAP pointing to /init_decrypt
                 // This prevents conflict between cleaned init (EXT-X-MAP) and encrypted init in segments
-                val decrypted = try {
+                val out = try {
                     CencDecryptor.decryptSegment(
                         initSegment = initContent,
                         mediaSegment = segmentContent,
@@ -109,7 +112,9 @@ object DecryptHandler {
                 }
 
                 // Cache the decrypted segment
-                SegmentCache.putSegment(segmentCacheKey, decrypted)
+                SegmentCache.putSegment(segmentCacheKey, out)
+                out
+              }
 
                 // Prefetch next segments
                 prefetchNextSegments(
@@ -126,6 +131,8 @@ object DecryptHandler {
 
         } catch (e: CancellationException) {
             // Client disconnect - ignore
+        } catch (e: HttpClientManager.GeoBlockedException) {
+            respondGeoBlocked(call, e)
         } catch (e: Exception) {
             ServerState.warn("DECRYPT_ERR: ${e.message}")
             try {
@@ -193,6 +200,8 @@ object DecryptHandler {
 
         } catch (e: CancellationException) {
             // Client disconnect - ignore
+        } catch (e: HttpClientManager.GeoBlockedException) {
+            respondGeoBlocked(call, e)
         } catch (e: Exception) {
             ServerState.warn("INIT_DECRYPT_ERR: ${e.message}")
             try {
@@ -316,6 +325,9 @@ object DecryptHandler {
 
             prefetchScope.launch {
                 try {
+                  // Shares the in-flight fetch with any viewer asking for this segment meanwhile
+                  SegmentCache.singleFlight(segmentCacheKey) {
+                    SegmentCache.getSegment(segmentCacheKey)?.let { return@singleFlight it }
                     val initCacheKey = initUrl?.substringBefore("?")
                     val initContent = initCacheKey?.let { SegmentCache.getInitSegment(it) }
                         ?: initUrl?.let {
@@ -337,6 +349,8 @@ object DecryptHandler {
                     )
 
                     SegmentCache.putSegment(segmentCacheKey, decrypted)
+                    decrypted
+                  }
                 } catch (e: Exception) {
                     // Silently ignore prefetch errors
                 } finally {

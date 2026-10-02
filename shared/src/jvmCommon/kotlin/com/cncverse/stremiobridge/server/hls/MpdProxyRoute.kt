@@ -49,8 +49,9 @@ private suspend fun handleMpdProxy(call: ApplicationCall, converter: MpdConverte
         val queryParams = call.request.queryParameters.entries().associate { it.key to it.value.firstOrNull().orEmpty() }
         val customHeaders = HttpClientManager.extractHeadersFromParams(queryParams)
 
-        val mpdContent = SegmentCache.getMpd(decodedUrl) ?: withContext(Dispatchers.IO) {
-            HttpClientManager.getString(url = decodedUrl, headers = customHeaders, proxyUrl = null)
+        // Live manifests refresh every few seconds for every viewer — fetch once, share the result
+        val mpdContent = SegmentCache.getMpd(decodedUrl) ?: SegmentCache.singleFlight("mpd:" + decodedUrl) {
+            SegmentCache.getMpd(decodedUrl) ?: HttpClientManager.getString(url = decodedUrl, headers = customHeaders, proxyUrl = null)
                 .also { SegmentCache.putMpd(decodedUrl, it) }
         }
 
@@ -87,6 +88,8 @@ private suspend fun handleMpdProxy(call: ApplicationCall, converter: MpdConverte
         call.respondText(hlsContent, ContentType.parse("application/vnd.apple.mpegurl"))
 
     } catch (e: kotlinx.coroutines.CancellationException) {
+    } catch (e: HttpClientManager.GeoBlockedException) {
+        respondGeoBlocked(call, e)
     } catch (e: Exception) {
         ServerState.warn("MPD_PROXY_ERR: ${e.message} | url=$mpdUrl")
         try { call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "MPD proxy error: ${e.message}")) } catch (_: Exception) {}
@@ -129,6 +132,8 @@ private suspend fun handleSubtitleProxy(call: ApplicationCall) {
         call.respondText(content, contentType)
 
     } catch (e: kotlinx.coroutines.CancellationException) {
+    } catch (e: HttpClientManager.GeoBlockedException) {
+        respondGeoBlocked(call, e)
     } catch (e: Exception) {
         ServerState.warn("SUBTITLE_PROXY_ERR: ${e.message}")
         try { call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "Subtitle proxy error: ${e.message}")) } catch (_: Exception) {}

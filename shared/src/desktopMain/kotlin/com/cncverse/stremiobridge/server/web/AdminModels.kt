@@ -279,8 +279,6 @@ data class AdminGeoCountry(
     val proxies: List<com.cncverse.stremiobridge.network.geo.PooledProxySnapshot>,
 )
 
-@Serializable
-data class AdminGeoSession(val key: String, val primary: String?, val standby: String?)
 
 @Serializable
 data class AdminGeoInfo(
@@ -288,7 +286,7 @@ data class AdminGeoInfo(
     val countries: List<AdminGeoCountry>,
     val plugins: List<com.cncverse.stremiobridge.network.geo.PluginGeoStatus>,
     val events: List<com.cncverse.stremiobridge.network.geo.GeoEvent>,
-    val sessions: List<AdminGeoSession>,
+    val leases: List<com.cncverse.stremiobridge.network.geo.StreamLeaseInfo>,
 )
 
 @Serializable

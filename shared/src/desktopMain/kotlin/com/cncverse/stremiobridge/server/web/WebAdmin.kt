@@ -655,7 +655,7 @@ object WebAdmin {
                         }.sortedBy { it.country },
                         plugins = geo.pluginStatuses(),
                         events = geo.recentEvents().take(60),
-                        sessions = geo.activeSessions().map { (k, v) -> AdminGeoSession(k, v.first, v.second) },
+                        leases = geo.activeLeases(),
                     )
                 )
             }

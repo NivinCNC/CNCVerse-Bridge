@@ -1,6 +1,7 @@
 package com.cncverse.stremiobridge.server.hls
 
 import java.util.concurrent.ConcurrentHashMap
+import kotlinx.coroutines.async
 
 /**
  * Cache system for segments, init segments, and MPD manifests.
@@ -107,6 +108,32 @@ object SegmentCache {
     fun markPrefetching(key: String): Boolean = prefetchingUrls.add(key)
 
     fun unmarkPrefetching(key: String) = prefetchingUrls.remove(key)
+
+    // ==================== Single-flight ====================
+
+    /**
+     * Upstream fetches in progress, by cache key. When many viewers watch the
+     * same live channel they ask for the same segment within milliseconds;
+     * only the first triggers an upstream fetch (through the channel's proxy),
+     * the rest await its result — upstream/proxy bandwidth stays one copy per
+     * segment however many people watch. The fetch runs in its own scope so a
+     * viewer disconnecting never cancels it for the others.
+     */
+    private val inFlight = ConcurrentHashMap<String, kotlinx.coroutines.Deferred<Any>>()
+    private val flightScope = kotlinx.coroutines.CoroutineScope(
+        kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.IO
+    )
+
+    @Suppress("UNCHECKED_CAST")
+    suspend fun <T : Any> singleFlight(key: String, load: suspend () -> T): T {
+        val deferred = inFlight.computeIfAbsent(key) {
+            flightScope.async(start = kotlinx.coroutines.CoroutineStart.LAZY) { load() as Any }.also { d ->
+                d.invokeOnCompletion { inFlight.remove(key, d) }
+            }
+        }
+        deferred.start()
+        return deferred.await() as T
+    }
 
     // ==================== Cleanup ====================
 

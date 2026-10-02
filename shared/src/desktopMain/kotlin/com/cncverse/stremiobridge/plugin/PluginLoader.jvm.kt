@@ -138,11 +138,13 @@ actual class PluginLoader {
 
     /** Reconfigures the global NiceHttp `app` client used by plugins with AdaptiveHostDns + CloudflareKiller. */
     private fun configureAppClientNetwork() {
-        java.net.ProxySelector.setDefault(
-            com.cncverse.stremiobridge.network.geo.GeoRouter.Selector(com.cncverse.stremiobridge.network.UltrasurfProxySelector)
-        )
+        val current = java.net.ProxySelector.getDefault()
+        if (current !is com.cncverse.stremiobridge.network.geo.GeoRouter.Selector) {
+            // Wrap (not replace) the system selector so http.proxyHost etc. still apply when not geo-routed
+            java.net.ProxySelector.setDefault(com.cncverse.stremiobridge.network.geo.GeoRouter.Selector(current))
+            ServerState.info("Installed geo proxy selector as JVM default (covers all OkHttpClient instances)")
+        }
         com.cncverse.stremiobridge.network.geo.NetContext.stackResolver = { PluginCallContext.getCallingPluginName() }
-        ServerState.info("Installed UltrasurfProxySelector as JVM default (covers all OkHttpClient instances)")
 
         val cfKiller = com.lagradost.cloudstream3.network.CloudflareKiller()
 
@@ -162,7 +164,6 @@ actual class PluginLoader {
 
             val newOk = existingOk.newBuilder()
                 .addInterceptor(cfKiller)
-                .addInterceptor(com.cncverse.stremiobridge.network.DomainProxyInterceptor.ULTRASURF_IN)
                 .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
                 .dns(AdaptiveHostDns)
                 .fastFallback(true)
@@ -173,7 +174,7 @@ actual class PluginLoader {
                 .eventListenerFactory(LeakSafeEventListener.FACTORY)
                 .build()
             okClientField.set(currentNiceClient, newOk)
-            ServerState.info("Configured AdaptiveHostDns + CloudflareKiller + UltrasurfIN proxy on app.client (global)")
+            ServerState.info("Configured AdaptiveHostDns + CloudflareKiller + geo proxy routing on app.client (global)")
         } catch (t: Throwable) {
             ServerState.warn("Failed to configure global app.client: ${t.message}")
         }
@@ -203,7 +204,6 @@ actual class PluginLoader {
                     if (!alreadyHas) {
                         val patched = existing.newBuilder()
                             .addInterceptor(cfKiller)
-                            .addInterceptor(com.cncverse.stremiobridge.network.DomainProxyInterceptor.ULTRASURF_IN)
                             .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
                             .dns(AdaptiveHostDns)
                             .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
@@ -211,7 +211,7 @@ actual class PluginLoader {
                             .build()
                         runCatching { baseClientField.set(target, patched) }
                         runCatching { baseClientField.set(null, patched) }
-                        ServerState.info("Configured CloudflareKiller + UltrasurfIN proxy on NiceHttp Requests.baseClient")
+                        ServerState.info("Configured CloudflareKiller + geo proxy routing on NiceHttp Requests.baseClient")
                     }
                 }
             } else {
@@ -250,11 +250,12 @@ actual class PluginLoader {
                 if (existing.interceptors.none { it is com.lagradost.cloudstream3.network.CloudflareKiller }) {
                     val patched = existing.newBuilder()
                         .addInterceptor(cfKiller)
-                        .addInterceptor(com.cncverse.stremiobridge.network.DomainProxyInterceptor.ULTRASURF_IN)
                         .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
+                        // Tags each call with its plugin — without it geo routing sees no plugin
+                        .eventListenerFactory(LeakSafeEventListener.FACTORY)
                         .build()
                     okField.set(requests, patched)
-                    ServerState.info("[CF] Patched CloudflareKiller + UltrasurfIN proxy into com.horis.cncverse.UtilsKt.app")
+                    ServerState.info("[CF] Patched CloudflareKiller + geo proxy routing into com.horis.cncverse.UtilsKt.app")
                 }
             }
 
@@ -744,6 +745,7 @@ private class LeakSafeEventListener : EventListener() {
         // where the call gets tagged with its plugin for geo proxy routing.
         val FACTORY: Factory = Factory { call ->
             com.cncverse.stremiobridge.network.geo.NetContext.attributeCall(call)
+            if (System.getenv("CNC_GEO_DEBUG") == "1") com.cncverse.stremiobridge.state.ServerState.info("[GeoProxy:debug] newCall " + call.request().url.host + " plugin=" + com.cncverse.stremiobridge.network.geo.NetContext.currentPlugin() + " thread=" + Thread.currentThread().name)
             LeakSafeEventListener()
         }
     }

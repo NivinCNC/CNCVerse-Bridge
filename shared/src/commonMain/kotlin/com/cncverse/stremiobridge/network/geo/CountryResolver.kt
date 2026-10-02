@@ -19,7 +19,7 @@ object CountryResolver {
             "gujarati", "odia", "bhojpuri", "bollywood", "tollywood", "kollywood", "mollywood", "sandalwood",
             "desi", "jio", "jiotv", "jiocinema", "hotstar", "zee5", "sonyliv", "ipl",
         ),
-        "BD" to listOf("bangladesh", "bangladeshi", "dhaka"),
+        "BD" to listOf("bangladesh", "bangladeshi", "dhaka", "bdix", "bangla"),
         "PK" to listOf("pakistan", "pakistani", "urdu"),
         "LK" to listOf("sri lanka", "sinhala"),
         "NP" to listOf("nepal", "nepali"),
@@ -80,9 +80,13 @@ object CountryResolver {
             RegexOption.IGNORE_CASE)
     }
 
+    /** "BdixDhakaFlix" → "Bdix Dhaka Flix" so CamelCase names match whole words. */
+    private fun splitWords(s: String): String =
+        s.replace(Regex("(?<=\\p{Ll})(?=\\p{Lu})|(?<=\\p{L})(?=\\p{N})|(?<=\\p{N})(?=\\p{L})|[_.]"), " ")
+
     private fun bestCountry(texts: List<String>): String? {
         if (texts.isEmpty()) return null
-        val joined = texts.joinToString(" \u0000 ")
+        val joined = texts.joinToString(" \u0000 ") { splitWords(it) }
         val counts = patterns.mapValues { (_, rx) -> rx.findAll(joined).count() }.filterValues { it > 0 }
         if (counts.isEmpty()) return null
         val top = counts.maxOf { it.value }

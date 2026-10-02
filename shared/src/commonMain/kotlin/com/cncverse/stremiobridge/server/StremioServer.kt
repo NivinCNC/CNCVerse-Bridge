@@ -2147,7 +2147,21 @@ object StremioServer {
                         withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
                             try {
                                 ServerState.info("[${api.name}] Loading links for $dataUrl")
-                                val links = api.loadLinks(dataUrl)
+                                var links = api.loadLinks(dataUrl)
+                                // Catalog items opened straight from a row (defaultVideoId) carry the
+                                // item URL, not the load() data — e.g. Netflix mirrors need the title
+                                // that only load() adds. Resolve it once and retry.
+                                if (links.isEmpty() && !api.supportedTypes.all { it == "tv" }) {
+                                    val info = runCatching { api.load(dataUrl) }.getOrNull()
+                                    val resolved = info?.let { mi ->
+                                        mi.dataUrl.takeIf { it.isNotBlank() && it != dataUrl }
+                                            ?: mi.episodes?.firstOrNull()?.dataUrl
+                                    }
+                                    if (resolved != null && resolved != dataUrl) {
+                                        ServerState.info("[${api.name}] Retrying with load() data")
+                                        links = api.loadLinks(resolved)
+                                    }
+                                }
                                 StreamTracker.record(api.pluginInternalName, api.internalName, api.name, links.size, null)
                                 if (links.isNotEmpty()) {
                                     ServerState.info("[STREAM_SUCCESS] [${api.name}] Resolved ${links.size} streamable link(s)")

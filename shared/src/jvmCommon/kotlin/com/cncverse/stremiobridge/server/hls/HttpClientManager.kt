@@ -7,7 +7,7 @@ import java.net.InetSocketAddress
 import java.net.Proxy
 import java.util.concurrent.TimeUnit
 import com.cncverse.stremiobridge.state.ServerState
-import com.cncverse.stremiobridge.network.DomainProxyInterceptor
+import io.ktor.server.response.respondText
 
 /**
  * Manager singleton per OkHttp client
@@ -52,74 +52,91 @@ object HttpClientManager {
     private fun pluginOf(headers: Map<String, String>): String? =
         headers.entries.firstOrNull { it.key.equals(PLUGIN_HEADER, ignoreCase = true) }?.value?.takeIf { it.isNotBlank() }
 
-    private val PROXY_RETRY_CODES = setOf(403, 407, 429, 451, 502, 503, 504)
+    /** Codes after which a stream proxy is swapped for its standby. */
+    private val PROXY_RETRY_CODES = setOf(403, 407, 429, 450, 451, 502, 503, 504)
+
+    private val geo get() = com.cncverse.stremiobridge.network.geo.GeoRouter
 
     /**
-     * Executes a relay request. Streams of plugins that are routed through a
-     * geo proxy use a sticky proxy with a hot standby (see
-     * [com.cncverse.stremiobridge.network.geo.GeoRouter.StickySession]): a
-     * failing proxy is swapped for the standby within the same request. If the
-     * direct fetch of a proxied plugin's CDN is refused, the CDN host is
-     * learned as blocked and retried through the pool.
+     * Executes a relay request.
+     *
+     * Hosts the geo router sends through a proxy use a per-channel lease
+     * ([com.cncverse.stremiobridge.network.geo.GeoRouter.StreamLease]): one
+     * proxy per live channel, channels spread over the pool by load, and a hot
+     * standby that takes over within the same request when the primary fails.
+     * Other hosts go direct; a geo refusal (450/451, or 403 for a domain-rule
+     * host / an extension already on a proxy) teaches the router and the
+     * request is retried through the pool.
      */
     private fun routed(request: Request, proxyUrl: String?, url: String?, plugin: String?): Response {
-        if (proxyUrl != null || plugin == null || url?.let { DomainProxyInterceptor.ULTRASURF_IN.proxyUrlFor(it) } != null) {
-            return createClient(proxyUrl, url).newCall(request).execute()
-        }
-        val host = request.url.host
-        val geo = com.cncverse.stremiobridge.network.geo.GeoRouter
-        geo.streamSession(plugin, host)?.let { session ->
-            viaSession(session, request)?.let { return it }
+        if (proxyUrl != null) return createClient(proxyUrl, url).newCall(request).execute()
+        geo.streamLease(plugin, request.url)?.let { lease ->
+            viaLease(lease, request)?.let { return it }
             return baseClient.newCall(request).execute()
         }
-        // Not routed yet: direct first; a refusal on a plugin that already needs a
-        // proxy elsewhere means its CDN is geo-blocked too.
         val direct = try {
             baseClient.newCall(request).execute()
         } catch (e: java.io.IOException) {
-            val session = geo.learnStreamHostBlocked(plugin, host) ?: throw e
-            return viaSession(session, request) ?: throw e
+            val lease = geo.learnStreamBlocked(plugin, request.url, null) ?: throw e
+            return viaLease(lease, request) ?: throw e
         }
-        if (direct.code != 403 && direct.code != 451) return direct
-        val session = geo.learnStreamHostBlocked(plugin, host) ?: return direct
-        val viaProxy = viaSession(session, request) ?: return direct
+        if (direct.code !in com.cncverse.stremiobridge.network.geo.GeoRouter.GEO_BLOCK_CODES) return direct
+        val lease = geo.learnStreamBlocked(plugin, request.url, direct.code) ?: return direct
+        val viaProxy = viaLease(lease, request) ?: return direct
+        if (viaProxy.code in com.cncverse.stremiobridge.network.geo.GeoRouter.GEO_BLOCK_CODES) {
+            // Proxies refused too — keep the original refusal (450/451 → the player gets 451)
+            viaProxy.close()
+            return direct
+        }
         direct.close()
         return viaProxy
     }
 
-    private fun viaSession(
-        session: com.cncverse.stremiobridge.network.geo.GeoRouter.StickySession,
+    private fun viaLease(
+        lease: com.cncverse.stremiobridge.network.geo.GeoRouter.StreamLease,
         request: Request,
     ): Response? {
+        var lastBlocked: Response? = null
         repeat(3) {
-            val p = session.current() ?: return null
+            val p = lease.current() ?: return lastBlocked
             val started = System.currentTimeMillis()
             try {
                 val resp = com.cncverse.stremiobridge.network.geo.ProxyPool
                     .clientFor(p.endpoint, streaming = true).newCall(request).execute()
                 if (resp.code in PROXY_RETRY_CODES) {
-                    resp.close()
-                    session.failover(p, "HTTP ${resp.code}")
+                    lastBlocked?.close()
+                    lastBlocked = resp
+                    lease.failover(
+                        p, "HTTP ${resp.code}",
+                        penalize = resp.code !in com.cncverse.stremiobridge.network.geo.GeoRouter.GEO_BLOCK_CODES && resp.code != 429,
+                        banForHost = resp.code in com.cncverse.stremiobridge.network.geo.GeoRouter.HARD_BLOCK_CODES,
+                    )
                 } else {
+                    lastBlocked?.close()
                     com.cncverse.stremiobridge.network.geo.ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
                     return resp
                 }
             } catch (e: java.io.IOException) {
-                session.failover(p, e.javaClass.simpleName)
+                lease.failover(p, e.javaClass.simpleName)
             }
         }
-        return null
+        return lastBlocked
     }
 
-    fun createClient(proxyUrl: String? = null, url: String? = null): OkHttpClient {
-        val resolvedProxy = proxyUrl
-            ?: url?.let { DomainProxyInterceptor.ULTRASURF_IN.proxyUrlFor(it) }
+    /** Thrown for 450/451 so the relay can answer the player with 451 instead of a 500. */
+    class GeoBlockedException(val code: Int, url: String) :
+        Exception("HTTP $code: blocked for this IP (${url.take(80)})")
 
-        if (resolvedProxy.isNullOrBlank()) {
+    private fun httpError(response: Response): Exception =
+        if (response.code == 450 || response.code == 451) GeoBlockedException(response.code, response.request.url.toString())
+        else Exception("HTTP ${response.code}: ${response.message}")
+
+    fun createClient(proxyUrl: String? = null, url: String? = null): OkHttpClient {
+        if (proxyUrl.isNullOrBlank()) {
             return baseClient
         }
         return try {
-            val proxy = parseProxy(resolvedProxy)
+            val proxy = parseProxy(proxyUrl)
             baseClient.newBuilder()
                 .proxy(proxy)
                 .build()
@@ -140,7 +157,7 @@ object HttpClientManager {
 
         return routed(request, proxyUrl, url, pluginOf(headers)).use { response ->
             if (!response.isSuccessful) {
-                throw Exception("HTTP ${response.code}: ${response.message}")
+                throw httpError(response)
             }
             response.body?.string() ?: throw Exception("Empty response body")
         }
@@ -158,7 +175,7 @@ object HttpClientManager {
 
         return routed(request, proxyUrl, url, pluginOf(headers)).use { response ->
             if (!response.isSuccessful) {
-                throw Exception("HTTP ${response.code}: ${response.message}")
+                throw httpError(response)
             }
             response.body?.bytes() ?: throw Exception("Empty response body")
         }
@@ -177,7 +194,7 @@ object HttpClientManager {
         val response = routed(request, proxyUrl, url, pluginOf(headers))
         if (!response.isSuccessful) {
             response.close()
-            throw Exception("HTTP ${response.code}: ${response.message}")
+            throw httpError(response)
         }
         return response
     }
@@ -197,7 +214,7 @@ object HttpClientManager {
 
         return routed(request, proxyUrl, url, pluginOf(headers)).use { response ->
             if (!response.isSuccessful) {
-                throw Exception("HTTP ${response.code}: ${response.message}")
+                throw httpError(response)
             }
             response.body?.string() ?: throw Exception("Empty response body")
         }
@@ -406,5 +423,24 @@ object HttpClientManager {
             // Default: nessun header aggiuntivo
             else -> emptyMap()
         }
+    }
+}
+
+/**
+ * Upstream refused this server's IP (and every proxy tried): tell the player
+ * with 451 Unavailable For Legal Reasons rather than a generic 500.
+ */
+internal suspend fun respondGeoBlocked(
+    call: io.ktor.server.application.ApplicationCall,
+    e: HttpClientManager.GeoBlockedException,
+) {
+    ServerState.warn("GEO_BLOCKED (${e.code}): ${e.message}")
+    runCatching {
+        call.response.headers.append(io.ktor.http.HttpHeaders.AccessControlAllowOrigin, "*")
+        call.respondText(
+            "Unavailable in this region (upstream returned ${e.code}); no working proxy for it right now.",
+            io.ktor.http.ContentType.Text.Plain,
+            io.ktor.http.HttpStatusCode(451, "Unavailable For Legal Reasons"),
+        )
     }
 }

@@ -38,14 +38,63 @@ import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
-/** A public proxy endpoint. Only HTTP (CONNECT-capable) and SOCKS5 are usable from the JVM. */
+/** A proxy endpoint. Only HTTP (CONNECT-capable) and SOCKS5 are usable from the JVM. */
 @Serializable
-data class ProxyEndpoint(val type: String, val host: String, val port: Int) {
+data class ProxyEndpoint(
+    val type: String,
+    val host: String,
+    val port: Int,
+    /** Credentials of private proxies — never serialized (they live in the settings). */
+    @kotlinx.serialization.Transient val username: String? = null,
+    @kotlinx.serialization.Transient val password: String? = null,
+) {
     val key: String get() = "$type://$host:$port"
     fun toJavaProxy(): Proxy = Proxy(
         if (type == "socks5") Proxy.Type.SOCKS else Proxy.Type.HTTP,
         InetSocketAddress(host, port),
     )
+    override fun toString(): String = key
+}
+
+/**
+ * Proxy credentials: HTTP proxies authenticate through OkHttp's
+ * proxyAuthenticator; SOCKS5 goes through the JVM-wide Authenticator, which
+ * answers only for registered proxy host:port pairs.
+ */
+internal object ProxyCredentials {
+    private val socks = ConcurrentHashMap<String, java.net.PasswordAuthentication>()
+    @Volatile private var installed = false
+
+    fun register(ep: ProxyEndpoint) {
+        if (ep.username == null || ep.type != "socks5") return
+        socks["${ep.host}:${ep.port}"] = java.net.PasswordAuthentication(ep.username, (ep.password ?: "").toCharArray())
+        install()
+    }
+
+    @Synchronized
+    private fun install() {
+        if (installed) return
+        installed = true
+        java.net.Authenticator.setDefault(object : java.net.Authenticator() {
+            override fun getPasswordAuthentication(): java.net.PasswordAuthentication? {
+                // Only SOCKS handshakes to a registered private proxy — never site/HTTP auth
+                if (!requestingProtocol.orEmpty().startsWith("SOCKS", ignoreCase = true)) return null
+                return socks["$requestingHost:$requestingPort"]
+            }
+        })
+    }
+
+    fun apply(builder: OkHttpClient.Builder, ep: ProxyEndpoint): OkHttpClient.Builder {
+        if (ep.username != null && ep.type == "http") {
+            val cred = okhttp3.Credentials.basic(ep.username, ep.password ?: "")
+            builder.proxyAuthenticator { _, response ->
+                if (response.request.header("Proxy-Authorization") != null) null
+                else response.request.newBuilder().header("Proxy-Authorization", cred).build()
+            }
+        }
+        register(ep)
+        return builder
+    }
 }
 
 /** A validated proxy in a country pool. */
@@ -55,17 +104,23 @@ class PooledProxy(
     val residential: Boolean,
     val isp: String?,
     @Volatile var exitIp: String?,
+    /** Admin-added private/paid proxy: preferred, never evicted (only marked down until it recovers). */
+    val custom: Boolean = false,
+    /** Live channels it may carry, as a multiple of maxStreamsPerProxy (rotating gateways: many). */
+    val capacity: Int = 1,
 ) {
     @Volatile var latencyMs: Long = 0
     @Volatile var consecutiveFailures: Int = 0
     val successes = AtomicInteger(0)
     val failures = AtomicInteger(0)
+    /** Live channels currently leased to this proxy (see GeoRouter.StreamLease). */
+    val activeStreams = AtomicInteger(0)
     @Volatile var lastOk: Long = 0
     @Volatile var lastChecked: Long = 0
     val addedAt: Long = System.currentTimeMillis()
 
     /** Lower is better: latency plus a heavy penalty per recent failure, residential preferred. */
-    val score: Long get() = latencyMs + consecutiveFailures * 4_000L + (if (residential) 0 else 2_500L)
+    val score: Long get() = latencyMs + consecutiveFailures * 4_000L + (if (residential) 0 else 2_500L) - (if (custom) 10_000L else 0L)
 }
 
 @Serializable
@@ -82,11 +137,14 @@ data class PooledProxySnapshot(
     val lastOk: Long = 0,
     val lastChecked: Long = 0,
     val addedAt: Long = 0,
+    val activeStreams: Int = 0,
+    val custom: Boolean = false,
+    val capacity: Int = 1,
 )
 
 fun PooledProxy.snapshot() = PooledProxySnapshot(
     endpoint, country, residential, isp, exitIp, latencyMs, consecutiveFailures,
-    successes.get(), failures.get(), lastOk, lastChecked, addedAt,
+    successes.get(), failures.get(), lastOk, lastChecked, addedAt, activeStreams.get(), custom, capacity,
 )
 
 /**
@@ -102,7 +160,14 @@ object ProxyPool {
 
     // ── Tunables (admin settings feed into these via GeoRouter) ──────────────
     @Volatile var targetSize = 6
+    @Volatile var maxSize = 30
+    /** Per-country size raised by live-stream demand (never below [targetSize]). */
+    private val dynamicTarget = ConcurrentHashMap<String, Int>()
+
+    fun targetFor(country: String): Int = maxOf(targetSize, dynamicTarget[country] ?: 0).coerceAtMost(maxOf(maxSize, targetSize))
     @Volatile var allowDatacenter = false
+    /** Use datacenter proxies only while a country has too few working residential ones. */
+    @Volatile var datacenterFallback = true
     private const val MIN_HEALTHY = 3
     private const val HEALTH_INTERVAL_MS = 3 * 60_000L
     private const val SOURCE_TTL_MS = 30 * 60_000L
@@ -139,7 +204,7 @@ object ProxyPool {
     fun clientFor(ep: ProxyEndpoint, streaming: Boolean = false): OkHttpClient {
         val key = ep.key + (if (streaming) "#s" else "")
         return proxyClients.getOrPut(key) {
-            OkHttpClient.Builder()
+            ProxyCredentials.apply(OkHttpClient.Builder(), ep)
                 .proxy(ep.toJavaProxy())
                 .connectionPool(proxyConnectionPool)
                 .connectTimeout(10, TimeUnit.SECONDS)
@@ -178,6 +243,10 @@ object ProxyPool {
         if (healthy(country).size < MIN_HEALTHY) refillAsync(country)
     }
 
+    /** Still in its pool and not marked down. */
+    fun isUsable(p: PooledProxy): Boolean =
+        p.consecutiveFailures < MAX_FAILURES && pools[p.country]?.contains(p) == true
+
     fun healthy(country: String): List<PooledProxy> =
         pools[country].orEmpty().filter { it.consecutiveFailures < MAX_FAILURES }
 
@@ -185,12 +254,75 @@ object ProxyPool {
      * Up to [n] proxies for [country], best first, spreading load across the
      * top few. Empty when the pool is still being built.
      */
-    fun pick(country: String, n: Int = 2, exclude: Set<String> = emptySet()): List<PooledProxy> {
+    fun pick(country: String, n: Int = 2, exclude: Set<String> = emptySet(), host: String? = null): List<PooledProxy> {
         demand(country)
-        val ranked = healthy(country).filter { it.endpoint.key !in exclude }.sortedBy { it.score }
+        val banned = host?.let { bannedFor(it) }.orEmpty()
+        val ranked = healthy(country).filter { it.endpoint.key !in exclude && it.endpoint.key !in banned }.sortedBy { it.score }
         if (ranked.isEmpty()) return emptyList()
         val head = ranked.take(3).shuffled()
         return (head + ranked.drop(3)).take(n)
+    }
+
+    /**
+     * Proxy for a live channel: under its stream cap first, then residential
+     * (CDNs like Jio refuse datacenter IPs even in-country), then the one
+     * carrying the fewest channels, then latency.
+     */
+    fun leastLoaded(country: String, exclude: Set<String>, host: String? = null, cap: Int = Int.MAX_VALUE): PooledProxy? {
+        demand(country)
+        val banned = host?.let { bannedFor(it) }.orEmpty()
+        return healthy(country)
+            .filter { it.endpoint.key !in exclude && it.endpoint.key !in banned }
+            .minWithOrNull(
+                compareBy<PooledProxy> { cap != Int.MAX_VALUE && it.activeStreams.get() >= cap.toLong() * it.capacity }
+                    .thenBy { !it.custom }
+                    .thenBy { !it.residential }
+                    .thenBy { it.activeStreams.get().toDouble() / it.capacity }
+                    .thenBy { it.score }
+            )
+    }
+
+    // ── Per-host bans: a proxy whose IP a given site refuses ─────────────────
+
+    private val hostBans = ConcurrentHashMap<String, Long>()
+    private const val HOST_BAN_MS = 6 * 60 * 60_000L
+
+    /** [p] got a geo refusal from [host]; don't use it for that host for a while. */
+    fun banForHost(host: String, p: PooledProxy) {
+        hostBans["$host|${p.endpoint.key}"] = System.currentTimeMillis() + HOST_BAN_MS
+        if (hostBans.size > 5_000) {
+            val now = System.currentTimeMillis()
+            hostBans.entries.removeIf { it.value < now }
+        }
+    }
+
+    private fun bannedFor(host: String): Set<String> {
+        if (hostBans.isEmpty()) return emptySet()
+        val now = System.currentTimeMillis()
+        val prefix = "$host|"
+        return hostBans.entries.filter { it.key.startsWith(prefix) && it.value > now }.mapTo(HashSet()) { it.key.substring(prefix.length) }
+    }
+
+    /**
+     * Grows the [country] pool so [liveChannels] fit at [perProxy] each, plus
+     * two spare (standbys / failover headroom), capped at [maxSize].
+     */
+    fun ensureCapacity(country: String, liveChannels: Int, perProxy: Int) {
+        val per = perProxy.coerceAtLeast(1)
+        // Private proxies take their share first (a rotating gateway may carry most of it)
+        val privateSlots = healthy(country).filter { it.custom }.sumOf { it.capacity.toLong() * per }.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
+        val publicChannels = (liveChannels - privateSlots).coerceAtLeast(0)
+        val wanted = ((publicChannels + per - 1) / per) + 2
+        val prev = dynamicTarget[country] ?: 0
+        if (wanted > prev) {
+            dynamicTarget[country] = wanted
+            if (healthy(country).size < targetFor(country)) {
+                ServerState.info("[GeoProxy] $country: $liveChannels live channel(s) → growing pool to ${targetFor(country)}")
+                refillAsync(country)
+            }
+        } else if (wanted < prev - 2) {
+            dynamicTarget[country] = wanted // shrink lazily; extra proxies just age out
+        }
     }
 
     /** Like [pick], but waits (up to [timeoutMs]) for a pool to be built — for health probes. */
@@ -213,7 +345,8 @@ object ProxyPool {
     fun reportFailure(p: PooledProxy, reason: String?) {
         p.failures.incrementAndGet()
         p.consecutiveFailures++
-        if (p.consecutiveFailures >= MAX_FAILURES) evict(p, reason ?: "failures")
+        // Private proxies stay in the pool (marked down) and come back on the next good health check
+        if (p.consecutiveFailures >= MAX_FAILURES && !p.custom) evict(p, reason ?: "failures")
     }
 
     /** Called by the JVM ProxySelector when a connect through a pooled proxy fails. */
@@ -231,7 +364,7 @@ object ProxyPool {
         val list = pools[p.country] ?: return
         if (list.remove(p)) {
             dropClient(p.endpoint)
-            rejected[p.endpoint.key] = System.currentTimeMillis() + 60 * 60_000L
+            rejected[p.endpoint.key] = System.currentTimeMillis() + 30 * 60_000L
             ServerState.info("[GeoProxy] ${p.country}: dropped ${p.endpoint.key} ($reason) — ${healthy(p.country).size} left")
             if (healthy(p.country).size < MIN_HEALTHY) refillAsync(p.country)
         }
@@ -258,7 +391,8 @@ object ProxyPool {
             val pool = pools.getOrPut(country) { CopyOnWriteArrayList() }
             list.forEach { s ->
                 if (pool.none { it.endpoint == s.endpoint }) {
-                    pool += PooledProxy(s.endpoint, country, s.residential, s.isp, s.exitIp).apply {
+                    val res = s.residential && IpClassifier.Info(null, false, s.isp, 0).residential
+                    pool += PooledProxy(s.endpoint, country, res, s.isp, s.exitIp).apply {
                         latencyMs = s.latencyMs
                         lastOk = s.lastOk
                         lastChecked = 0 // force a re-check soon
@@ -269,7 +403,71 @@ object ProxyPool {
         }
     }
 
+    private fun residentialHealthy(country: String) = healthy(country).count { it.residential }
+
+    data class CustomProxy(val country: String, val endpoint: ProxyEndpoint, val capacity: Int)
+
+    /**
+     * Parses one admin line: `IN socks5://user:pass@host:port *50` — country,
+     * proxy URL (http or socks5, credentials optional) and an optional
+     * capacity (`*N`, live channels as a multiple of maxStreamsPerProxy).
+     * Returns null for an invalid line.
+     */
+    fun parseCustom(line: String): CustomProxy? {
+        val parts = line.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+        if (parts.isEmpty() || parts[0].startsWith("#")) return null
+        val country = parts.firstOrNull { Regex("^[A-Za-z]{2}$").matches(it) }?.uppercase() ?: return null
+        val url = parts.firstOrNull { "://" in it } ?: return null
+        val capacity = parts.firstOrNull { Regex("^[*x]\\d+$").matches(it) }?.drop(1)?.toIntOrNull()?.coerceIn(1, 1000) ?: 1
+        val uri = runCatching { java.net.URI(url) }.getOrNull() ?: return null
+        val type = when (uri.scheme?.lowercase()) {
+            "socks5", "socks5h", "socks" -> "socks5"
+            "http", "https" -> "http"
+            else -> return null
+        }
+        val host = uri.host ?: return null
+        val port = if (uri.port > 0) uri.port else return null
+        val userInfo = uri.rawUserInfo?.let { java.net.URLDecoder.decode(it, "UTF-8") }
+        val user = userInfo?.substringBefore(':')?.takeIf { it.isNotEmpty() }
+        val pass = userInfo?.substringAfter(':', "")
+        return CustomProxy(country, ProxyEndpoint(type, host, port, user, pass), capacity)
+    }
+
+    /** Replaces the admin-added private proxies (from the geo settings). */
+    fun setCustom(lines: List<String>) {
+        val wanted = lines.mapNotNull { parseCustom(it) }
+        val wantedKeys = wanted.map { it.country + "|" + it.endpoint.key }.toSet()
+        // Drop removed ones
+        pools.forEach { (country, list) ->
+            list.filter { it.custom && (country + "|" + it.endpoint.key) !in wantedKeys }.forEach {
+                list.remove(it); dropClient(it.endpoint)
+            }
+        }
+        for (c in wanted) {
+            val list = pools.getOrPut(c.country) { CopyOnWriteArrayList() }
+            val existing = list.firstOrNull { it.endpoint.key == c.endpoint.key }
+            if (existing != null && existing.custom && existing.endpoint == c.endpoint && existing.capacity == c.capacity) continue
+            existing?.let { list.remove(it); dropClient(it.endpoint) }
+            list += PooledProxy(c.endpoint, c.country, residential = true, isp = "private", exitIp = null,
+                custom = true, capacity = c.capacity).apply { lastChecked = 0 } // checked on the next pass
+            demand.putIfAbsent(c.country, System.currentTimeMillis())
+        }
+    }
+
+    private val lastRefillRequest = ConcurrentHashMap<String, Long>()
+
+    /** Background refill, at most once a minute per country (every request may ask). */
     fun refillAsync(country: String) {
+        if (isRefilling(country)) return
+        val now = System.currentTimeMillis()
+        var go = false
+        lastRefillRequest.compute(country) { _, prev ->
+            if (prev == null || now - prev >= 60_000L) { go = true; now } else prev
+        }
+        if (go) refillNow(country)
+    }
+
+    private fun refillNow(country: String) {
         scope.launch { runCatching { refill(country) } }
     }
 
@@ -278,6 +476,8 @@ object ProxyPool {
     private suspend fun maintain() {
         val now = System.currentTimeMillis()
         // Forget countries nobody asked for in a while
+        // Countries with private proxies are always kept
+        pools.forEach { (c, l) -> if (l.any { it.custom }) demand[c] = now }
         demand.entries.removeIf { now - it.value > DEMAND_TTL_MS }
         rejected.entries.removeIf { it.value < now }
         pools.keys.filter { !demand.containsKey(it) }.forEach { c ->
@@ -287,7 +487,7 @@ object ProxyPool {
             val pool = pools[country].orEmpty()
             val due = pool.filter { now - it.lastChecked > HEALTH_INTERVAL_MS }
             if (due.isNotEmpty()) healthCheck(due)
-            if (healthy(country).size < targetSize) {
+            if (healthy(country).size < targetFor(country)) {
                 val last = lastRefill[country] ?: 0L
                 val backoff = if (healthy(country).size < MIN_HEALTHY) 2 * 60_000L else 10 * 60_000L
                 if (now - last > backoff) refill(country)
@@ -320,7 +520,7 @@ object ProxyPool {
         lock.withLock {
             lastRefill[country] = System.currentTimeMillis()
             val pool = pools.getOrPut(country) { CopyOnWriteArrayList() }
-            val need = targetSize - healthy(country).size
+            val need = targetFor(country) - healthy(country).size
             if (need <= 0) return
 
             val have = pool.map { it.endpoint.key }.toSet()
@@ -334,8 +534,10 @@ object ProxyPool {
             // Classify proxy IPs (country + residential) before spending time on validation
             val info = IpClassifier.classify(candidates.map { it.host }.distinct(), directClient, json)
             val inCountry = candidates.filter { info[it.host]?.countryCode == country }
-            val residential = inCountry.filter { info[it.host]?.hosting == false }
-            val ordered = residential + (if (allowDatacenter) inCountry.filter { info[it.host]?.hosting == true } else emptyList())
+            val residential = inCountry.filter { info[it.host]?.residential == true }
+            // Residential first; datacenter IPs only when allowed outright or as a fallback while residential runs short
+            val dcAllowed = allowDatacenter || (datacenterFallback && residentialHealthy(country) < MIN_HEALTHY)
+            val ordered = residential + (if (dcAllowed) inCountry.filter { info[it.host]?.residential != true } else emptyList())
             ServerState.info(
                 "[GeoProxy] $country: ${candidates.size} candidates, ${inCountry.size} in-country, " +
                     "${residential.size} residential — validating"
@@ -350,7 +552,7 @@ object ProxyPool {
                     sem.withPermit {
                         if (added.get() >= need) return@withPermit null
                         val r = probeThrough(ep)
-                        if (r == null) { rejected[ep.key] = System.currentTimeMillis() + 60 * 60_000L; null }
+                        if (r == null) { rejected[ep.key] = System.currentTimeMillis() + 15 * 60_000L; null }
                         else { added.incrementAndGet(); ep to r }
                     }
                 }
@@ -368,8 +570,8 @@ object ProxyPool {
                     continue
                 }
                 val proxyInfo = info[ep.host]
-                val isResidential = (exit?.hosting ?: proxyInfo?.hosting) == false
-                if (!isResidential && !allowDatacenter) continue
+                val isResidential = (exit ?: proxyInfo)?.residential == true
+                if (!isResidential && !dcAllowed) continue
                 if (pool.any { it.endpoint == ep }) continue
                 pool += PooledProxy(ep, country, isResidential, exit?.isp ?: proxyInfo?.isp, r.exitIp).apply {
                     latencyMs = r.latencyMs
@@ -379,7 +581,7 @@ object ProxyPool {
                 }
                 accepted++
             }
-            ServerState.info("[GeoProxy] $country: +$accepted proxies (pool ${healthy(country).size}/$targetSize)")
+            ServerState.info("[GeoProxy] $country: +$accepted proxies (pool ${healthy(country).size}/${targetFor(country)})")
         }
     }
 
@@ -389,7 +591,7 @@ object ProxyPool {
 
     /** HTTPS request through [ep]; returns the exit IP or null when the proxy is unusable. */
     suspend fun probeThrough(ep: ProxyEndpoint): ProbeResult? {
-        val client = OkHttpClient.Builder()
+        val client = ProxyCredentials.apply(OkHttpClient.Builder(), ep)
             .proxy(ep.toJavaProxy())
             .connectionPool(proxyConnectionPool)
             .connectTimeout(8, TimeUnit.SECONDS)
@@ -510,7 +712,20 @@ internal object ProxySources {
 
 /** ip-api.com batch lookups (country + hosting flag), rate-limited and cached. */
 internal object IpClassifier {
-    data class Info(val countryCode: String?, val hosting: Boolean?, val isp: String?, val at: Long)
+    data class Info(val countryCode: String?, val hosting: Boolean?, val isp: String?, val at: Long, val org: String? = null) {
+        /**
+         * ip-api's hosting flag misses many clouds (Cloudflare WARP exits, Google Cloud,
+         * Indian DCs like CtrlS) — the ISP/org/AS name settles it.
+         */
+        val residential: Boolean get() = hosting == false && !DATACENTER_NAME.containsMatchIn(listOfNotNull(isp, org).joinToString(" "))
+    }
+
+    private val DATACENTER_NAME = Regex(
+        "cloudflare|oracle|amazon|aws|google|microsoft|azure|digitalocean|vultr|choopa|linode|akamai|ovh|hetzner|" +
+            "contabo|ctrls|alibaba|tencent|huawei cloud|leaseweb|m247|datacamp|cdn77|zenlayer|hostinger|hosting|" +
+            "data ?cent|datacenter|server|cloud|vps|colo|ipxo|g-core|gcore|scaleway|ionos|godaddy|netcup|kamatera",
+        RegexOption.IGNORE_CASE,
+    )
 
     private val cache = ConcurrentHashMap<String, Info>()
     private const val TTL_MS = 24 * 60 * 60_000L
@@ -539,7 +754,7 @@ internal object IpClassifier {
         nextAllowed = System.currentTimeMillis() + 4_500
         val body = json.encodeToString(JsonArray.serializer(), JsonArray(ips.map { JsonPrimitive(it) }))
         val req = Request.Builder()
-            .url("http://ip-api.com/batch?fields=query,status,countryCode,isp,hosting")
+            .url("http://ip-api.com/batch?fields=query,status,countryCode,isp,org,as,hosting")
             .post(body.toRequestBody("application/json".toMediaType()))
             .build()
         runCatching {
@@ -559,6 +774,7 @@ internal object IpClassifier {
                         o["hosting"]?.jsonPrimitive?.booleanOrNull,
                         o["isp"]?.jsonPrimitive?.contentOrNull,
                         now,
+                        listOfNotNull(o["org"]?.jsonPrimitive?.contentOrNull, o["as"]?.jsonPrimitive?.contentOrNull).joinToString(" "),
                     )
                     cache[ip] = info
                     ip to info

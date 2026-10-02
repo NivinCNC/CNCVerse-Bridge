@@ -26,11 +26,35 @@ data class GeoProxySettings(
     val enabled: Boolean = true,
     /** Use datacenter proxies when a country has no working residential ones. */
     val allowDatacenter: Boolean = false,
+    /** Fall back to datacenter proxies while a country has under 3 working residential ones. */
+    val datacenterFallback: Boolean = true,
+    /** Minimum healthy proxies kept per country in use. */
     val poolSize: Int = 6,
+    /** Upper bound per country when live streams push the pool to grow. */
+    val maxPoolSize: Int = 30,
+    /** Live channels one proxy may carry before the next one is used (bandwidth spread). */
+    val maxStreamsPerProxy: Int = 3,
     /** How long a learned "this host blocks the server IP" stays before direct is retried. */
     val blockTtlHours: Int = 12,
     /** Country used for extensions whose country can't be detected ("" = none → no proxy). */
     val defaultCountry: String = "",
+    /**
+     * Host suffix → country, for hosts that are geo-locked whatever extension
+     * asks for them.
+     */
+    val domainRules: Map<String, String> = DEFAULT_DOMAIN_RULES,
+    /**
+     * Private/paid proxies, one per line: `IN socks5://user:pass@host:port *50`.
+     * Preferred over the public pool, never evicted. A rotating residential
+     * gateway with a high `*N` capacity carries many live channels.
+     */
+    val customProxies: List<String> = emptyList(),
+)
+
+val DEFAULT_DOMAIN_RULES: Map<String, String> = mapOf(
+    "tv.imgcdn.kim" to "IN",
+    "jio.com" to "IN",
+    "workers.dev" to "IN",
 )
 
 /** Admin override for one extension. mode: auto | off | always. */
@@ -41,12 +65,16 @@ data class PluginGeoOverride(val mode: String = "auto", val country: String? = n
 private data class GeoStateFile(
     val settings: GeoProxySettings = GeoProxySettings(),
     val overrides: Map<String, PluginGeoOverride> = emptyMap(),
-    /** "plugin|host" → expiry. */
-    val hostBlocks: Map<String, Long> = emptyMap(),
+    /** host → where it works from. An IP block belongs to the host, so every extension shares it. */
+    val hostRoutes: Map<String, HostRoute> = emptyMap(),
     /** plugin → expiry: the health probe found it only works through a proxy. */
     val pluginProxy: Map<String, Long> = emptyMap(),
     val pools: Map<String, List<PooledProxySnapshot>> = emptyMap(),
 )
+
+/** A host that refuses the server IP: proxy country, expiry, and the extensions seen using it. */
+@Serializable
+data class HostRoute(val country: String, val until: Long, val plugins: Set<String> = emptySet())
 
 @Serializable
 data class PluginGeoStatus(
@@ -67,18 +95,31 @@ data class PluginGeoStatus(
 @Serializable
 data class GeoEvent(val at: Long, val plugin: String?, val message: String)
 
+@Serializable
+data class StreamLeaseInfo(
+    val key: String,
+    val country: String,
+    val primary: String?,
+    val standby: String?,
+    val idleSec: Long,
+)
+
 /**
  * Decides, per plugin and host, whether a request goes out directly or
- * through a residential proxy of the plugin's country.
+ * through a residential proxy of the right country.
  *
- *  - unknown host: try direct; if it is refused (403/451) or the connection
- *    is cut/times out, retry through the country pool. When the proxy works
- *    the (plugin, host) pair is remembered for [GeoProxySettings.blockTtlHours]
+ *  - unknown host: try direct; if it is refused (403/450/451) or the
+ *    connection is cut/times out, retry through the country pool. When the
+ *    proxy works the host is remembered for [GeoProxySettings.blockTtlHours]
  *    and goes proxy-first from then on.
  *  - remembered host / plugin marked by the health probe / admin "always":
  *    proxy first, direct as the last resort.
  *  - admin "off", no detectable country, or the proxy did not help either:
  *    direct only.
+ *
+ * The country is the domain rule's (e.g. jio.com → IN) when the host matches
+ * one — learned under "*" so every extension shares it — otherwise the
+ * extension's own country.
  */
 object GeoRouter {
 
@@ -88,9 +129,9 @@ object GeoRouter {
     @Volatile var settings = GeoProxySettings()
         private set
     private val overrides = ConcurrentHashMap<String, PluginGeoOverride>()
-    private val hostBlocks = ConcurrentHashMap<String, Long>()
+    private val hostBlocks = ConcurrentHashMap<String, HostRoute>()
     private val pluginProxy = ConcurrentHashMap<String, Long>()
-    /** "plugin|host" → until: the proxy did not help, stop retrying for a while. */
+    /** host → until: the proxy did not help, stop retrying for a while. */
     private val noHelp = ConcurrentHashMap<String, Long>()
 
     private class PluginInfo(val displayName: String, val country: String?, val source: String)
@@ -105,7 +146,17 @@ object GeoRouter {
     @Volatile private var dirty = false
 
     private const val NO_HELP_MS = 30 * 60_000L
-    private val BLOCK_CODES = setOf(403, 451)
+    /** Shared scope key for hosts covered by a domain rule. */
+    private const val ANY = "*"
+    /**
+     * Status codes meaning "this IP may not have it". Jio answers 450 to
+     * foreign IPs, 451 is the standard code, 403 is what most sites use.
+     */
+    val GEO_BLOCK_CODES = setOf(403, 450, 451)
+    /** Unambiguous geo/legal blocks — worth a proxy even with no other evidence. */
+    val HARD_BLOCK_CODES = setOf(450, 451)
+    /** CNC_GEO_DEBUG=1 logs every routing decision. */
+    private val DEBUG = System.getenv("CNC_GEO_DEBUG") == "1"
 
     // ── Lifecycle / persistence ──────────────────────────────────────────────
 
@@ -122,7 +173,7 @@ object GeoRouter {
             settings = s.settings
             overrides.putAll(s.overrides)
             val now = System.currentTimeMillis()
-            s.hostBlocks.filterValues { it > now }.let { hostBlocks.putAll(it) }
+            s.hostRoutes.filterValues { it.until > now }.let { hostBlocks.putAll(it) }
             s.pluginProxy.filterValues { it > now }.let { pluginProxy.putAll(it) }
             ProxyPool.restore(s.pools)
         }.onFailure { ServerState.warn("[GeoProxy] could not read geo_proxy.json: ${it.message}") }
@@ -131,7 +182,8 @@ object GeoRouter {
         ProxyPool.start()
         scope.launch {
             while (isActive) {
-                delay(60_000)
+                delay(30_000)
+                runCatching { expireLeases() }
                 if (dirty) save()
             }
         }
@@ -140,7 +192,10 @@ object GeoRouter {
 
     private fun applySettings() {
         ProxyPool.targetSize = settings.poolSize.coerceIn(2, 20)
+        ProxyPool.maxSize = settings.maxPoolSize.coerceIn(ProxyPool.targetSize, 60)
         ProxyPool.allowDatacenter = settings.allowDatacenter
+        ProxyPool.datacenterFallback = settings.datacenterFallback
+        ProxyPool.setCustom(settings.customProxies)
     }
 
     @Synchronized
@@ -151,9 +206,9 @@ object GeoRouter {
         val state = GeoStateFile(
             settings = settings,
             overrides = HashMap(overrides),
-            hostBlocks = hostBlocks.filterValues { it > now },
+            hostRoutes = hostBlocks.filterValues { it.until > now },
             pluginProxy = pluginProxy.filterValues { it > now },
-            pools = ProxyPool.snapshot().mapValues { (_, l) -> l.filter { it.consecutiveFailures == 0 } },
+            pools = ProxyPool.snapshot().mapValues { (_, l) -> l.filter { it.consecutiveFailures == 0 && !it.custom } },
         )
         runCatching {
             val tmp = File(f.parentFile, f.name + ".tmp")
@@ -168,10 +223,17 @@ object GeoRouter {
     private fun markDirty() { dirty = true }
 
     fun updateSettings(s: GeoProxySettings) {
+        val rules = s.domainRules
+            .mapKeys { it.key.trim().lowercase().removePrefix("*.").removePrefix(".") }
+            .mapValues { it.value.trim().uppercase() }
+            .filter { (k, v) -> k.isNotEmpty() && '.' in k && Regex("^[A-Z]{2}$").matches(v) }
         settings = s.copy(
             poolSize = s.poolSize.coerceIn(2, 20),
+            maxPoolSize = s.maxPoolSize.coerceIn(s.poolSize.coerceIn(2, 20), 60),
+            maxStreamsPerProxy = s.maxStreamsPerProxy.coerceIn(1, 50),
             blockTtlHours = s.blockTtlHours.coerceIn(1, 24 * 14),
             defaultCountry = s.defaultCountry.trim().uppercase().take(2),
+            domainRules = rules,
         )
         applySettings()
         save()
@@ -187,9 +249,17 @@ object GeoRouter {
 
     /** Forgets everything learned about [plugin] (blocked hosts, probe result). */
     fun clearLearned(plugin: String) {
-        hostBlocks.keys.removeIf { it.startsWith("$plugin|") }
-        noHelp.keys.removeIf { it.startsWith("$plugin|") }
+        // Hosts only this extension used are forgotten; shared ones just lose it as a user
+        hostBlocks.entries.removeIf { (_, r) -> r.plugins == setOf(plugin) }
+        hostBlocks.replaceAll { _, r -> if (plugin in r.plugins) r.copy(plugins = r.plugins - plugin) else r }
         pluginProxy.remove(plugin)
+        markDirty()
+    }
+
+    /** Forgets a learned host (admin). */
+    fun clearHost(host: String) {
+        hostBlocks.remove(host)
+        noHelp.remove(host)
         markDirty()
     }
 
@@ -225,6 +295,13 @@ object GeoRouter {
         return settings.defaultCountry.takeIf { it.length == 2 }
     }
 
+    /** Country of the domain rule matching [host] (suffix match), if any. */
+    fun ruleCountry(host: String): String? {
+        val h = host.lowercase()
+        return settings.domainRules.entries.firstOrNull { (d, _) -> h == d || h.endsWith(".$d") }?.value
+    }
+
+
     private fun countrySource(plugin: String): String = when {
         overrides[plugin]?.country != null -> "admin"
         plugins[plugin]?.country != null -> plugins[plugin]!!.source
@@ -234,10 +311,9 @@ object GeoRouter {
 
     private fun activeCountries(): Set<String> {
         val now = System.currentTimeMillis()
-        val ps = hostBlocks.filterValues { it > now }.keys.map { it.substringBefore('|') } +
-            pluginProxy.filterValues { it > now }.keys +
-            overrides.filterValues { it.mode == "always" }.keys
-        return ps.mapNotNull { countryFor(it) }.toSet()
+        val fromBlocks = hostBlocks.values.filter { it.until > now }.map { it.country }
+        val ps = pluginProxy.filterValues { it > now }.keys + overrides.filterValues { it.mode == "always" }.keys
+        return (fromBlocks + ps.mapNotNull { countryFor(it) }).toSet()
     }
 
     // ── Decisions ────────────────────────────────────────────────────────────
@@ -245,38 +321,42 @@ object GeoRouter {
     enum class Decision { DIRECT, DIRECT_THEN_PROXY, PROXY_FIRST }
 
     fun decide(plugin: String?, mode: RouteMode, host: String): Pair<Decision, String?> {
-        if (!settings.enabled || plugin == null) {
-            return if (mode == RouteMode.FORCE_PROXY && plugin != null && countryFor(plugin) != null)
-                Decision.PROXY_FIRST to countryFor(plugin) else Decision.DIRECT to null
-        }
         if (mode == RouteMode.FORCE_DIRECT) return Decision.DIRECT to null
-        val o = overrides[plugin]
+        val rule = ruleCountry(host)
+        if (!settings.enabled) {
+            val c = rule ?: plugin?.let { countryFor(it) }
+            return if (mode == RouteMode.FORCE_PROXY && c != null) Decision.PROXY_FIRST to c else Decision.DIRECT to null
+        }
+        val o = plugin?.let { overrides[it] }
         if (o?.mode == "off") return Decision.DIRECT to null
-        val country = countryFor(plugin) ?: return Decision.DIRECT to null
         val now = System.currentTimeMillis()
-        if (mode == RouteMode.FORCE_PROXY || o?.mode == "always" ||
-            (pluginProxy[plugin] ?: 0L) > now ||
-            (hostBlocks["$plugin|$host"] ?: 0L) > now
+        // A host known to refuse the server IP is proxied for every extension, from where it worked
+        val learned = hostBlocks[host]?.takeIf { it.until > now }
+        val country = learned?.country ?: rule ?: plugin?.let { countryFor(it) } ?: return Decision.DIRECT to null
+        if (learned != null || mode == RouteMode.FORCE_PROXY || o?.mode == "always" ||
+            (plugin != null && (pluginProxy[plugin] ?: 0L) > now)
         ) return Decision.PROXY_FIRST to country
-        if ((noHelp["$plugin|$host"] ?: 0L) > now) return Decision.DIRECT to null
+        if ((noHelp[host] ?: 0L) > now) return Decision.DIRECT to null
         return Decision.DIRECT_THEN_PROXY to country
     }
 
-    /** True when any plugin is currently routed through a proxy (cheap gate for the ProxySelector). */
+    /** True when anything is currently routed through a proxy (cheap gate for the ProxySelector). */
     fun hasProxyRoutes(): Boolean =
         hostBlocks.isNotEmpty() || pluginProxy.isNotEmpty() || overrides.values.any { it.mode == "always" }
 
-    private fun markBlocked(plugin: String, host: String) {
+    private fun markBlocked(plugin: String?, host: String, country: String) {
         val until = System.currentTimeMillis() + settings.blockTtlHours * 3_600_000L
-        if (hostBlocks.put("$plugin|$host", until) == null) {
-            event(plugin, "$host blocks the server IP — routing via ${countryFor(plugin)} proxy")
+        val prev = hostBlocks[host]
+        hostBlocks[host] = HostRoute(country, until, (prev?.plugins ?: emptySet()) + setOfNotNull(plugin))
+        if (prev == null || prev.until < System.currentTimeMillis()) {
+            event(plugin, "$host blocks the server IP — routing via $country proxy (all extensions)")
         }
-        counters.getOrPut(plugin) { Counters() }.blocked.incrementAndGet()
+        counters.getOrPut(plugin ?: ANY) { Counters() }.blocked.incrementAndGet()
         markDirty()
     }
 
-    private fun markNoHelp(plugin: String, host: String) {
-        noHelp["$plugin|$host"] = System.currentTimeMillis() + NO_HELP_MS
+    private fun markNoHelp(host: String) {
+        noHelp[host] = System.currentTimeMillis() + NO_HELP_MS
     }
 
     /** Result of a health probe: the plugin only produces streams through a proxy. */
@@ -314,37 +394,51 @@ object GeoRouter {
             e.message?.contains("timeout", ignoreCase = true) == true
 
     /**
-     * Sends [req] through up to two pooled proxies of [country]. Returns the
-     * first response that isn't a proxy-level failure, or null.
+     * Sends [req] through up to three pooled proxies of [country]. A proxy
+     * whose answer is itself a geo block (or a proxy-level error) is skipped
+     * for the next one. Returns the first usable response, the last blocked
+     * one when nothing better came back, or null when no proxy answered.
      */
     fun viaPool(plugin: String?, country: String, req: Request): Response? {
         val tried = HashSet<String>()
-        repeat(2) {
-            val p = ProxyPool.pick(country, 1, tried).firstOrNull() ?: return null
+        var lastBlocked: Response? = null
+        repeat(3) {
+            val p = ProxyPool.pick(country, 1, tried, req.url.host).firstOrNull() ?: return lastBlocked
             tried += p.endpoint.key
             val started = System.currentTimeMillis()
             try {
                 val resp = ProxyPool.clientFor(p.endpoint).newCall(req).execute()
-                // 407 / gateway errors come from the proxy itself, not the site
-                if (resp.code == 407 || resp.code == 502 || resp.code == 504) {
-                    resp.close()
-                    ProxyPool.reportFailure(p, "HTTP ${resp.code}")
-                } else {
-                    ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
-                    plugin?.let { counters.getOrPut(it) { Counters() }.ok.incrementAndGet() }
-                    return resp
+                when {
+                    // 407 / gateway errors come from the proxy itself, not the site
+                    resp.code == 407 || resp.code == 502 || resp.code == 504 -> {
+                        resp.close()
+                        ProxyPool.reportFailure(p, "HTTP ${resp.code}")
+                    }
+                    // This proxy's IP is refused by this site (e.g. datacenter range) — ban it for this host, try another
+                    resp.code in GEO_BLOCK_CODES -> {
+                        lastBlocked?.close()
+                        lastBlocked = resp
+                        if (resp.code in HARD_BLOCK_CODES || resp.header("cf-mitigated") != null) ProxyPool.banForHost(req.url.host, p)
+                        ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
+                    }
+                    else -> {
+                        lastBlocked?.close()
+                        ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
+                        counters.getOrPut(plugin ?: ANY) { Counters() }.ok.incrementAndGet()
+                        return resp
+                    }
                 }
             } catch (e: IOException) {
                 ProxyPool.reportFailure(p, e.javaClass.simpleName)
             }
-            plugin?.let { counters.getOrPut(it) { Counters() }.fail.incrementAndGet() }
+            counters.getOrPut(plugin ?: ANY) { Counters() }.fail.incrementAndGet()
         }
-        return null
+        return lastBlocked
     }
 
     /**
-     * OkHttp application interceptor for the plugin clients. Must sit after
-     * CloudflareKiller and the fixed-domain Ultrasurf interceptor.
+     * OkHttp application interceptor for the plugin clients (after
+     * CloudflareKiller). Every plugin request passes through here.
      */
     object ProxyInterceptor : okhttp3.Interceptor {
         override fun intercept(chain: okhttp3.Interceptor.Chain): Response {
@@ -354,6 +448,7 @@ object GeoRouter {
             val mode = tag?.mode ?: NetContext.currentMode()
             val host = req.url.host
             val (decision, country) = decide(plugin, mode, host)
+            if (DEBUG) ServerState.info("[GeoProxy:debug] intercept host=$host plugin=$plugin mode=$mode tagged=${tag != null} -> $decision $country")
             when (decision) {
                 Decision.DIRECT -> return chain.proceed(req)
 
@@ -365,18 +460,19 @@ object GeoRouter {
                 Decision.DIRECT_THEN_PROXY -> {
                     if (!retryable(req)) return chain.proceed(req)
                     val c = country!!
-                    val p = plugin!!
                     val direct = try {
                         chain.proceed(req)
                     } catch (e: IOException) {
                         if (!blockish(e)) throw e
-                        when (val r = retryViaProxy(p, c, host, req)) {
+                        when (val r = retryViaProxy(plugin, c, host, req)) {
                             null -> throw e
                             else -> return r
                         }
                     }
-                    if (direct.code !in BLOCK_CODES || direct.header("cf-mitigated") != null) return direct
-                    val viaProxy = retryViaProxy(p, c, host, req) ?: return direct
+                    // A Cloudflare challenge (403 + cf-mitigated) counts too: datacenter IPs get challenged where
+                    // residential ones pass, and the proxy answer is only kept if it is not a challenge itself
+                    if (direct.code !in GEO_BLOCK_CODES) return direct
+                    val viaProxy = retryViaProxy(plugin, c, host, req) ?: return direct
                     direct.close()
                     return viaProxy
                 }
@@ -388,18 +484,18 @@ object GeoRouter {
          * verified: request one for [country] (built in the background) and
          * keep the direct result; later requests retry once it exists.
          */
-        private fun retryViaProxy(plugin: String, country: String, host: String, req: Request): Response? {
+        private fun retryViaProxy(plugin: String?, country: String, host: String, req: Request): Response? {
             if (ProxyPool.healthy(country).isEmpty()) {
                 ProxyPool.demand(country)
                 return null
             }
             val viaProxy = viaPool(plugin, country, req)
-            if (viaProxy != null && viaProxy.code < 400) {
-                markBlocked(plugin, host)
+            if (viaProxy != null && viaProxy.code < 400 && viaProxy.header("cf-mitigated") == null) {
+                markBlocked(plugin, host, country)
                 return viaProxy
             }
             viaProxy?.close()
-            markNoHelp(plugin, host)
+            markNoHelp(host)
             return null
         }
     }
@@ -409,105 +505,178 @@ object GeoRouter {
      * themselves (no interceptor of ours). Only proxy-first routes apply here —
      * there is no response to inspect, so nothing is learned at this level.
      */
-    class Selector(private val delegate: java.net.ProxySelector) : java.net.ProxySelector() {
+    class Selector(private val delegate: java.net.ProxySelector?) : java.net.ProxySelector() {
         override fun select(uri: java.net.URI?): List<java.net.Proxy> {
-            val fixed = delegate.select(uri)
-            if (!fixed.isNullOrEmpty() && fixed.any { it.type() != java.net.Proxy.Type.DIRECT }) return fixed
-            val host = uri?.host ?: return listOf(java.net.Proxy.NO_PROXY)
+            geoSelect(uri)?.let { return it }
+            val fallback = runCatching { delegate?.select(uri) }.getOrNull()
+            return if (fallback.isNullOrEmpty()) listOf(java.net.Proxy.NO_PROXY) else fallback
+        }
+
+        private fun geoSelect(uri: java.net.URI?): List<java.net.Proxy>? {
+            val host = uri?.host ?: return null
             val mode = NetContext.currentMode()
-            if (!hasProxyRoutes() && mode != RouteMode.FORCE_PROXY) return listOf(java.net.Proxy.NO_PROXY)
-            val plugin = NetContext.resolvePlugin() ?: return listOf(java.net.Proxy.NO_PROXY)
+            if (!hasProxyRoutes() && mode != RouteMode.FORCE_PROXY) return null
+            val plugin = NetContext.resolvePlugin()
+            if (plugin == null && ruleCountry(host) == null) return null
             val (decision, country) = decide(plugin, mode, host)
-            if (decision != Decision.PROXY_FIRST || country == null) return listOf(java.net.Proxy.NO_PROXY)
-            val picked = ProxyPool.pick(country, 2).map { it.endpoint.toJavaProxy() }
+            if (decision != Decision.PROXY_FIRST || country == null) return null
+            val picked = ProxyPool.pick(country, 2, host = host).map { it.endpoint.toJavaProxy() }
+            if (picked.isEmpty()) return null
             return picked + java.net.Proxy.NO_PROXY
         }
 
         override fun connectFailed(uri: java.net.URI?, sa: java.net.SocketAddress?, ioe: IOException?) {
             val addr = sa as? java.net.InetSocketAddress ?: return
             ProxyPool.reportConnectFailed(addr.hostString, addr.port)
-            delegate.connectFailed(uri, sa, ioe)
+            runCatching { delegate?.connectFailed(uri, sa, ioe) }
         }
     }
 
-    // ── Live streams: sticky proxy with a hot standby ────────────────────────
+    // ── Live streams: load-balanced leases with a hot standby ────────────────
 
     /**
-     * A relayed live stream keeps using one proxy (CDNs often pin tokens to
-     * the IP) with a second, already-validated proxy on standby. When the
-     * primary fails the standby takes over immediately and a new standby is
-     * picked.
+     * One relayed live channel (all its viewers share it — the segment cache
+     * fetches each segment once). It keeps one proxy (CDN tokens are often
+     * pinned to an IP) with a different, already-validated proxy on standby.
+     * Channels are spread over the pool by load, so many simultaneous streams
+     * never pile onto one proxy's bandwidth; the pool grows with the number of
+     * live channels.
      */
-    class StickySession(val country: String) {
+    class StreamLease(val key: String, val country: String, val host: String) {
         @Volatile var primary: PooledProxy? = null
+            private set
         @Volatile var standby: PooledProxy? = null
+            private set
         @Volatile var lastUsed = System.currentTimeMillis()
 
         @Synchronized
         fun current(): PooledProxy? {
             lastUsed = System.currentTimeMillis()
+            // Hot path (every segment of every viewer): keep a working pair without rescanning the pool
+            val p = primary
+            val s = standby
+            if (p != null && s != null && ProxyPool.isUsable(p) && ProxyPool.isUsable(s)) return p
             val healthy = ProxyPool.healthy(country).map { it.endpoint.key }.toSet()
-            if (primary?.endpoint?.key !in healthy) { primary = standby?.takeIf { it.endpoint.key in healthy }; standby = null }
-            if (primary == null) primary = ProxyPool.pick(country, 1).firstOrNull()
-            if (standby == null || standby?.endpoint?.key !in healthy || standby == primary) {
-                standby = ProxyPool.pick(country, 1, setOfNotNull(primary?.endpoint?.key)).firstOrNull()
+            if (primary != null && primary!!.endpoint.key !in healthy) {
+                setPrimary(standby?.takeIf { it.endpoint.key in healthy })
+                standby = null
+            }
+            val cap = settings.maxStreamsPerProxy
+            if (primary == null) setPrimary(ProxyPool.leastLoaded(country, emptySet(), host, cap))
+            if (standby == null || standby!!.endpoint.key !in healthy || standby == primary) {
+                standby = ProxyPool.leastLoaded(country, setOfNotNull(primary?.endpoint?.key), host, cap)
             }
             return primary
         }
 
+        private fun setPrimary(p: PooledProxy?) {
+            if (p === primary) return
+            primary?.activeStreams?.decrementAndGet()
+            p?.activeStreams?.incrementAndGet()
+            primary = p
+        }
+
         @Synchronized
-        fun failover(failed: PooledProxy, reason: String) {
-            ProxyPool.reportFailure(failed, reason)
-            if (primary == failed) {
-                primary = standby
+        fun failover(failed: PooledProxy, reason: String, penalize: Boolean = true, banForHost: Boolean = false) {
+            // A site-level refusal (expired token, 403) is not the proxy's fault — switch without penalty
+            if (penalize) ProxyPool.reportFailure(failed, reason)
+            // 450/451 = this site refuses that IP outright — don't hand it to this host again for a while
+            if (banForHost) ProxyPool.banForHost(host, failed)
+            if (primary === failed) {
+                val next = standby?.takeIf { it !== failed }
                 standby = null
-                ServerState.info("[GeoProxy] stream failover ${failed.endpoint.key} → ${primary?.endpoint?.key ?: "none"} ($reason)")
+                setPrimary(next)
+                ServerState.info("[GeoProxy] stream $key: ${failed.endpoint.key} → ${next?.endpoint?.key ?: "none"} ($reason)")
             }
+        }
+
+        @Synchronized
+        fun release() {
+            setPrimary(null)
+            standby = null
         }
     }
 
-    private val sessions = ConcurrentHashMap<String, StickySession>()
+    private val leases = ConcurrentHashMap<String, StreamLease>()
+    private const val LEASE_IDLE_MS = 2 * 60_000L
 
-    /** Session for a relayed stream of [plugin] from [host], or null when it should go direct. */
-    fun streamSession(plugin: String?, host: String): StickySession? {
-        if (plugin.isNullOrBlank()) return null
-        val (decision, country) = decide(plugin, RouteMode.AUTO, host)
+    /** Live channel key: CDN host + the channel's directory (segments/renditions share it). */
+    fun channelKey(url: okhttp3.HttpUrl): String {
+        val segs = url.pathSegments
+        val dir = if (segs.size > 1) segs.dropLast(1).take(4).joinToString("/") else ""
+        return url.host + "/" + dir
+    }
+
+    /**
+     * Lease for a relayed stream, or null when it should go direct.
+     * [plugin] may be null for streams on domain-rule hosts.
+     */
+    fun streamLease(plugin: String?, url: okhttp3.HttpUrl): StreamLease? {
+        val (decision, country) = decide(plugin, RouteMode.AUTO, url.host)
         if (decision != Decision.PROXY_FIRST || country == null) return null
+        val key = channelKey(url)
+        leases[key]?.let { return it }
+        val lease = leases.computeIfAbsent(key) { StreamLease(key, country, url.host) }
+        ProxyPool.ensureCapacity(country, leasesFor(country), settings.maxStreamsPerProxy)
+        return lease
+    }
+
+    private fun leasesFor(country: String) = leases.values.count { it.country == country }
+
+    private fun expireLeases() {
         val now = System.currentTimeMillis()
-        if (sessions.size > 200) sessions.entries.removeIf { now - it.value.lastUsed > 15 * 60_000L }
-        return sessions.getOrPut("$plugin|$host") { StickySession(country) }
+        leases.entries.removeIf { (_, l) ->
+            (now - l.lastUsed > LEASE_IDLE_MS).also { if (it) l.release() }
+        }
     }
 
     /** True when some of [plugin]'s traffic already goes through a proxy. */
     private fun usesProxy(plugin: String): Boolean {
         val now = System.currentTimeMillis()
         return (pluginProxy[plugin] ?: 0L) > now || overrides[plugin]?.mode == "always" ||
-            hostBlocks.any { it.key.startsWith("$plugin|") && it.value > now }
+            hostBlocks.values.any { plugin in it.plugins && it.until > now }
     }
 
     /**
-     * The direct relay of [plugin]'s stream from [host] was refused. When the
-     * plugin already needs a proxy elsewhere, its CDN is treated as blocked
-     * too and a session is returned; otherwise null (keep the direct result).
+     * The direct relay of a stream from [url] was refused with [code] (null =
+     * connection failure). A hard geo block (450/451), a domain-rule host, or
+     * a plugin that already needs a proxy elsewhere marks the host blocked and
+     * returns a lease; otherwise null (keep the direct result).
      */
-    fun learnStreamHostBlocked(plugin: String, host: String): StickySession? {
-        if (!settings.enabled || overrides[plugin]?.mode == "off" || !usesProxy(plugin)) return null
-        val country = countryFor(plugin) ?: return null
+    fun learnStreamBlocked(plugin: String?, url: okhttp3.HttpUrl, code: Int?): StreamLease? {
+        if (!settings.enabled || (plugin != null && overrides[plugin]?.mode == "off")) return null
+        val host = url.host
+        val convincing = code in HARD_BLOCK_CODES || ruleCountry(host) != null || (plugin != null && usesProxy(plugin))
+        if (!convincing) return null
+        val country = ruleCountry(host) ?: plugin?.let { countryFor(it) } ?: return null
         if (ProxyPool.healthy(country).isEmpty()) { ProxyPool.demand(country); return null }
-        markBlocked(plugin, host)
-        return streamSession(plugin, host)
+        markBlocked(plugin, host, country)
+        return streamLease(plugin, url)
     }
 
-    fun activeSessions(): Map<String, Pair<String?, String?>> =
-        sessions.filterValues { System.currentTimeMillis() - it.lastUsed < 15 * 60_000L }
-            .mapValues { (_, s) -> s.primary?.endpoint?.key to s.standby?.endpoint?.key }
+    fun activeLeases(): List<StreamLeaseInfo> {
+        val now = System.currentTimeMillis()
+        return leases.values.map {
+            StreamLeaseInfo(it.key, it.country, it.primary?.endpoint?.key, it.standby?.endpoint?.key, (now - it.lastUsed) / 1000)
+        }.sortedBy { it.key }
+    }
 
     // ── Admin view ───────────────────────────────────────────────────────────
 
     fun pluginStatuses(): List<PluginGeoStatus> {
         val now = System.currentTimeMillis()
         val names = plugins.keys + overrides.keys
-        return names.map { p ->
+        val shared = PluginGeoStatus(
+            plugin = ANY,
+            displayName = "Learned blocked hosts (all extensions)",
+            country = null,
+            countrySource = "rules",
+            blockedHosts = hostBlocks.filter { it.value.until > now }.map { it.key + " (" + it.value.country + ")" }.sorted(),
+            proxiedOk = counters[ANY]?.ok?.get() ?: 0,
+            proxiedFail = counters[ANY]?.fail?.get() ?: 0,
+            directBlocked = counters[ANY]?.blocked?.get() ?: 0,
+        )
+        return listOf(shared) + names.map { p ->
             val c = counters[p]
             PluginGeoStatus(
                 plugin = p,
@@ -518,7 +687,7 @@ object GeoRouter {
                 mode = overrides[p]?.mode ?: "auto",
                 overrideCountry = overrides[p]?.country,
                 proxiedAll = (pluginProxy[p] ?: 0L) > now,
-                blockedHosts = hostBlocks.filter { it.key.startsWith("$p|") && it.value > now }.keys.map { it.substringAfter('|') },
+                blockedHosts = hostBlocks.filter { p in it.value.plugins && it.value.until > now }.keys.sorted(),
                 proxiedOk = c?.ok?.get() ?: 0,
                 proxiedFail = c?.fail?.get() ?: 0,
                 directBlocked = c?.blocked?.get() ?: 0,
