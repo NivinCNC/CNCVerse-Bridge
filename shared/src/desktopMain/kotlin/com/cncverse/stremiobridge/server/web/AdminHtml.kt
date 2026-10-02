@@ -1917,7 +1917,7 @@ function renderStatusPill() {
 function render() {
   if (!summary) return;
   if (tab === "server") renderServer();
-  else if (tab === "extensions") renderExtensions();
+  else if (tab === "extensions") { /* refreshed only after the admin acts (no timed re-render: it closed lists and reset clicks) */ }
   else if (tab === "health") { /* rendered on open / after loadStreamHealth — poll re-renders would steal the search box focus */ }
   else if (tab === "cache") { updateCacheTelemetryInPlace(); }
   else if (tab === "credits") { /* user-edited form — never re-render from poll */ }
@@ -2696,13 +2696,8 @@ var openSourceLists = {};  // plugin id -> Sources list expanded (kept across re
 
 function togglePlugin(id) {
   api("/plugins/toggle", {method:"POST", body: JSON.stringify({internalName: id})})
-    .then(function(newPlugins) {
-      if (Array.isArray(newPlugins)) {
-        plugins = newPlugins;
-        if (tab === "extensions") renderExtensions();
-      }
-      poll();
-    }).catch(function(e) { toast("Toggle failed: " + e.message); });
+    .then(function() { loadPlugins(); renderStatusPill(); })
+    .catch(function(e) { toast("Toggle failed: " + e.message); });
 }
 
 function updatePluginCardState(id, state, progress, error) {
@@ -4339,11 +4334,26 @@ function fmtTimeAgo(ts) {
   return Math.floor(diffHour / 24) + "d ago";
 }
 
+// Fetches the plugin list and the summary (installed/enabled/sources) together and
+// renders the Extensions tab once — called after admin actions, never on a timer.
 function loadPlugins() {
-  api("/plugins").then(function(list) {
+  return api("/plugins").then(function(list) {
     plugins = list;
+    return api("/summary").then(function(s) { summary = s; }).catch(function() {});
+  }).then(function() {
     if (tab === "extensions") renderExtensions();
+    watchInstalls();
   }).catch(function() {});
+}
+
+// While an install/update runs, re-check every 3 s so its card shows progress;
+// stops by itself as soon as nothing is installing.
+var installWatch = null;
+function watchInstalls() {
+  var busy = Array.isArray(plugins) && plugins.some(function(p) { return p.installState === "Installing"; });
+  if (busy && !installWatch) {
+    installWatch = setTimeout(function() { installWatch = null; loadPlugins(); }, 3000);
+  }
 }
 
 function loadGoalStats() {
@@ -4601,8 +4611,7 @@ pollTimer = setInterval(poll, 3000);
 // Log poll: every 3s when on logs tab; also keeps logsData fresh in background
 logTimer = setInterval(function() { pollLogs(); }, 3000);
 
-// Plugin refresh: every 3s when on extensions tab (picks up install state changes)
-setInterval(function() { if (tab === "extensions") loadPlugins(); }, 3000);
+// Extensions tab: no polling — see loadPlugins()/watchInstalls()
 
 // 30-min client-side refresh trigger (belt-and-suspenders alongside server-side check)
 setTimeout(function() {
