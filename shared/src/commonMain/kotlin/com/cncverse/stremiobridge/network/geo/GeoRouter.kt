@@ -348,7 +348,7 @@ object GeoRouter {
         if (mode == RouteMode.FORCE_DIRECT) return Decision.DIRECT to null
         val rule = ruleCountry(host)
         if (!settings.enabled) {
-            val c = rule ?: plugin?.let { countryFor(it) }
+            val c = rule ?: plugin?.let { countryFor(it) } ?: (if (mode == RouteMode.FORCE_PROXY) "IN" else null)
             return if (mode == RouteMode.FORCE_PROXY && c != null) Decision.PROXY_FIRST to c else Decision.DIRECT to null
         }
         val o = plugin?.let { overrides[it] }
@@ -356,7 +356,9 @@ object GeoRouter {
         val now = System.currentTimeMillis()
         // A host known to refuse the server IP is proxied for every extension, from where it worked
         val learned = hostBlocks[host]?.takeIf { it.until > now }
-        val country = learned?.country ?: rule ?: plugin?.let { countryFor(it) } ?: return Decision.DIRECT to null
+        // A forced-proxy probe of an extension with no known country tries India (Ultrasurf first)
+        val country = learned?.country ?: rule ?: plugin?.let { countryFor(it) }
+            ?: (if (mode == RouteMode.FORCE_PROXY) "IN" else null) ?: return Decision.DIRECT to null
         // Domain-rule hosts (jio.com, tv.imgcdn.kim…) are known to need it: proxy first (Ultrasurf for IN)
         if (learned != null || rule != null || mode == RouteMode.FORCE_PROXY || o?.mode == "always" ||
             (plugin != null && (pluginProxy[plugin] ?: 0L) > now)

@@ -56,6 +56,8 @@ data class AdminInstalledPluginInfo(
     val autoUninstall: Boolean = false,
     val proxyCountry: String? = null,
     val proxyMode: String = "auto",
+    /** Sources of a multi-source plugin with their own global on/off (empty for single-source). */
+    val sources: List<AdminSourceInfo> = emptyList(),
 )
 
 @Serializable
@@ -298,3 +300,9 @@ data class AdminGeoCountryRequest(val country: String, val key: String? = null)
 
 @Serializable
 data class AdminGeoPluginRequest(val plugin: String)
+
+@Serializable
+data class AdminHomeAuditRequest(val uninstall: Boolean = false)
+
+@Serializable
+data class AdminSourceInfo(val id: String, val name: String, val enabled: Boolean)

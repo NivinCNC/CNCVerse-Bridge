@@ -165,6 +165,9 @@ object StremioServer {
     private const val REFRESH_INTERVAL_MS = 30L * 60L * 1000L // 30 minutes
 
     val disabledPlugins: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    /** Sources (multi-source plugins) switched on individually, even while their plugin is off. */
+    val enabledSources: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private val enabledSourcesFile: java.io.File? get() = disabledPluginsFile?.let { java.io.File(it.parentFile, "enabled_sources.json") }
     private var disabledPluginsFile: File? = null
 
     /**
@@ -699,6 +702,12 @@ object StremioServer {
                 ServerState.warn("Failed to load disabled plugins: ${e.message}")
             }
         }
+        enabledSourcesFile?.takeIf { it.exists() }?.let { f ->
+            runCatching {
+                enabledSources.clear()
+                enabledSources.addAll(serverJson.decodeFromString<Set<String>>(f.readText()))
+            }.onFailure { ServerState.warn("Failed to load enabled sources: ${it.message}") }
+        }
     }
 
     internal fun saveDisabledPlugins() {
@@ -706,6 +715,7 @@ object StremioServer {
         try {
             val json = serverJson.encodeToString(disabledPlugins)
             file.writeText(json)
+            enabledSourcesFile?.writeText(serverJson.encodeToString(enabledSources.toSet()))
         } catch (e: Exception) {
             ServerState.warn("Failed to save disabled plugins: ${e.message}")
         }
@@ -862,7 +872,12 @@ object StremioServer {
         val result = mutableSetOf(internalName)
         // Collect canonical IDs from the matching loaded API(s)
         val matchingApis = loadedApis.filter { canonicalIds(it).contains(internalName) }
-        matchingApis.flatMapTo(result) { canonicalIds(it) }
+        // Per-source entries of multi-source plugins are the admin's own choices — the
+        // plugin switch never clears them (only single-source plugins alias their API id)
+        matchingApis.flatMapTo(result) { api ->
+            if ((apisPerPlugin()[api.pluginInternalName] ?: 1) > 1 && api.internalName != internalName) listOf(api.pluginInternalName)
+            else canonicalIds(api)
+        }
         // Add unambiguous slug(s) so legacy slug entries are cleaned up on enable
         matchingApis.forEach { api ->
             unambiguousSlug(api)?.let { slug ->
@@ -897,6 +912,12 @@ object StremioServer {
      * without touching sibling plugins that share the same display name.
      */
     fun togglePluginDisabled(internalName: String): Boolean {
+        if (isSourceId(internalName)) {
+            val api = loadedApis.first { it.internalName == internalName }
+            val nowDisabled = !isGloballyDisabled(api)
+            setSourceDisabled(internalName, nowDisabled)
+            return !nowDisabled
+        }
         val isCurrentlyDisabled = disabledPlugins.contains(internalName) ||
             loadedApis.any { api -> canonicalIds(api).contains(internalName) && isGloballyDisabled(api) }
         return if (isCurrentlyDisabled) {
@@ -909,6 +930,33 @@ object StremioServer {
             false
         }
     }
+
+    /**
+     * Global on/off for one source of a multi-source plugin, independent of the
+     * plugin switch: an enabled source stays on even while its plugin is off,
+     * a disabled one stays off when the plugin is switched on.
+     */
+    fun setSourceDisabled(apiInternalName: String, disabled: Boolean) {
+        if (disabled) {
+            disabledPlugins.add(apiInternalName)
+            enabledSources.remove(apiInternalName)
+        } else {
+            disabledPlugins.remove(apiInternalName)
+            enabledSources.add(apiInternalName)
+        }
+        saveDisabledPlugins()
+    }
+
+    /** Number of home-page items cached for [api] (any type/section), 0 when none. */
+    fun cachedHomeItems(api: MainApiWrapper): Int {
+        val key = apiKey(api)
+        return homePageCatalogCache.entries.filter { (k, _) -> k.contains(":cnc_${key}_") }.sumOf { it.value.size }
+    }
+
+    /** True when [id] is the per-source id of a plugin that has several sources. */
+    fun isSourceId(id: String): Boolean =
+        loadedApis.any { it.internalName == id && it.internalName != it.pluginInternalName } &&
+            (apisPerPlugin()[loadedApis.first { it.internalName == id }.pluginInternalName] ?: 1) > 1
 
     /** Sets a plugin's global enabled state and persists it. */
     fun setPluginDisabled(internalName: String, disabled: Boolean = true) {
@@ -929,7 +977,10 @@ object StremioServer {
         if (installed.isEmpty()) return
         val canonicalNames = installed.map { it.internalName }.toSet()
         val before = disabledPlugins.size
-        val stale = disabledPlugins.filter { it !in canonicalNames }.toSet()
+        // Per-source entries ("<plugin>_<source>") of installed plugins are kept
+        val isKept = { id: String -> id in canonicalNames || canonicalNames.any { id.startsWith(it + "_") } }
+        val stale = disabledPlugins.filter { !isKept(it) }.toSet()
+        enabledSources.removeIf { !isKept(it) }
         if (stale.isNotEmpty()) {
             stale.forEach { disabledPlugins.remove(it) }
             saveDisabledPlugins()
@@ -945,6 +996,12 @@ object StremioServer {
      * loaded plugin shares the same display name), preventing cross-repo collisions.
      */
     fun isGloballyDisabled(api: MainApiWrapper): Boolean {
+        // A source's own choice wins over its plugin's (multi-source plugins: PlayFy = Live
+        // Events + Highlights + one source per playlist enabled in its settings)
+        if (api.internalName != api.pluginInternalName) {
+            if (disabledPlugins.contains(api.internalName)) return true
+            if (enabledSources.contains(api.internalName)) return false
+        }
         // Primary check: canonical unique IDs
         if (canonicalIds(api).any { disabledPlugins.contains(it) }) return true
         // Legacy fallback: slug, but only if it's unambiguous
@@ -5710,6 +5767,8 @@ interface MainApiWrapper {
     val apiLang: String? get() = null
     /** Language from the repo manifest. */
     val pluginLanguage: String? get() = null
+    /** False for search-only providers (no home page by design). */
+    val hasHomePage: Boolean get() = true
     suspend fun getMainPageSections(): List<String>
     fun clearCache() {}
 

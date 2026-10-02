@@ -633,6 +633,21 @@ object WebAdmin {
                 call.respond(AdminActionResult(true, "Auto-uninstall after ${com.cncverse.stremiobridge.maintenance.Maintenance.autoUninstallDays} day(s) without links"))
             }
 
+            get("/maintenance/home-audit") {
+                if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
+                call.respond(com.cncverse.stremiobridge.maintenance.HomePageAudit.state)
+            }
+
+            post("/maintenance/home-audit") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val req = runCatching { call.receive<AdminHomeAuditRequest>() }.getOrDefault(AdminHomeAuditRequest())
+                val audit = com.cncverse.stremiobridge.maintenance.HomePageAudit
+                if (audit.isRunning()) return@post call.respond(AdminActionResult(false, "A home-page audit is already running"))
+                scope().launch { audit.run(uninstall = req.uninstall) }
+                call.respond(AdminActionResult(true,
+                    "Home-page audit started" + if (req.uninstall) " — extensions dead directly and via proxy will be uninstalled" else " (report only)"))
+            }
+
             post("/maintenance/auto-uninstall/all") {
                 if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
                 val req = runCatching { call.receive<AdminAutoUninstallToggle>() }.getOrNull()
@@ -952,6 +967,11 @@ object WebAdmin {
                 autoUninstall = com.cncverse.stremiobridge.maintenance.Maintenance.optedIn(inst.internalName),
                 proxyCountry = com.cncverse.stremiobridge.network.geo.GeoRouter.countryFor(inst.internalName),
                 proxyMode = com.cncverse.stremiobridge.network.geo.GeoRouter.overrideMode(inst.internalName),
+                sources = StremioServer.loadedApis.filter { it.pluginInternalName == inst.internalName }
+                    .takeIf { it.size > 1 }
+                    ?.map { AdminSourceInfo(it.internalName, it.name, !StremioServer.isGloballyDisabled(it)) }
+                    ?.sortedBy { it.name.lowercase() }
+                    .orEmpty(),
             )
         }
 

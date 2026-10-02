@@ -400,3 +400,120 @@ object Maintenance {
         return names
     }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Home-page audit: uninstall extensions whose home page loads neither directly
+// nor through a proxy of their country.
+// ─────────────────────────────────────────────────────────────────────────────
+
+@Serializable
+data class HomeAuditRow(
+    val plugin: String,
+    val api: String,
+    val verdict: String,   // ok | dead | inconclusive | skipped
+    val note: String,
+)
+
+@Serializable
+data class HomeAuditState(
+    val running: Boolean = false,
+    val total: Int = 0,
+    val done: Int = 0,
+    val startedAt: Long = 0,
+    val finishedAt: Long = 0,
+    val uninstall: Boolean = false,
+    val deadPlugins: List<String> = emptyList(),
+    val uninstalled: List<String> = emptyList(),
+    val rows: List<HomeAuditRow> = emptyList(),
+)
+
+object HomePageAudit {
+    @Volatile var state = HomeAuditState()
+        private set
+    private val mutex = Mutex()
+    private const val TIMEOUT_MS = 60_000L
+
+    fun isRunning() = mutex.isLocked
+
+    private suspend fun homeItems(api: MainApiWrapper, mode: RouteMode): Pair<Int, Boolean> =
+        withContext(Dispatchers.IO + NetContext.RouteModeElement(mode)) {
+            val type = api.supportedTypes.firstOrNull() ?: "movie"
+            val r = withTimeoutOrNull(TIMEOUT_MS) { runCatching { api.getMainPage(1, type, null) }.getOrDefault(emptyList()) }
+            if (r == null) 0 to true else r.size to false
+        }
+
+    private suspend fun check(api: MainApiWrapper): HomeAuditRow {
+        val plugin = api.pluginInternalName
+        if (!api.hasHomePage) return HomeAuditRow(plugin, api.name, "skipped", "search-only (no home page)")
+        // Loaded fine recently (pre-warm / users) — no need to fetch it again
+        val cached = StremioServer.cachedHomeItems(api)
+        if (cached > 0) return HomeAuditRow(plugin, api.name, "ok", "$cached items (cached home page)")
+        val (direct, directTimeout) = homeItems(api, RouteMode.FORCE_DIRECT)
+        if (direct > 0) return HomeAuditRow(plugin, api.name, "ok", "$direct items directly")
+        val country = GeoRouter.countryFor(plugin) ?: "IN"
+        ProxyPool.pickAwait(country, timeoutMs = 60_000)
+        if (ProxyPool.healthy(country).none { it.residential || it.custom }) {
+            return HomeAuditRow(plugin, api.name, "inconclusive", "empty directly; no residential $country proxy")
+        }
+        GeoRouter.resetProbeMisses(plugin)
+        val (proxied, proxyTimeout) = homeItems(api, RouteMode.FORCE_PROXY)
+        val misses = GeoRouter.probeMisses(plugin)
+        if (proxied > 0) {
+            GeoRouter.markPluginNeedsProxy(plugin, true)
+            return HomeAuditRow(plugin, api.name, "ok", "$proxied items via $country proxy")
+        }
+        if (directTimeout || proxyTimeout || misses > 0) {
+            return HomeAuditRow(plugin, api.name, "inconclusive",
+                "empty; " + listOfNotNull(if (directTimeout) "direct timed out" else null,
+                    if (proxyTimeout) "proxy timed out" else null,
+                    if (misses > 0) "$misses request(s) found no proxy" else null).joinToString(", "))
+        }
+        return HomeAuditRow(plugin, api.name, "dead", "home page empty directly and via $country proxy")
+    }
+
+    /** Audits every loaded API; with [uninstall], removes plugins whose every home page is dead. */
+    suspend fun run(uninstall: Boolean): HomeAuditState {
+        if (!mutex.tryLock()) return state
+        try {
+            val apis = StremioServer.loadedApis.toList()
+            state = HomeAuditState(running = true, total = apis.size, startedAt = System.currentTimeMillis(), uninstall = uninstall)
+            ServerState.info("[HomeAudit] checking ${apis.size} API(s) — direct, then via proxy")
+            val rows = java.util.concurrent.ConcurrentLinkedQueue<HomeAuditRow>()
+            val done = AtomicInteger()
+            val sem = Semaphore(4)
+            coroutineScope {
+                apis.map { api ->
+                    launch(Dispatchers.IO) {
+                        sem.withPermit {
+                            val row = runCatching { check(api) }
+                                .getOrElse { HomeAuditRow(api.pluginInternalName, api.name, "inconclusive", "error: ${it.message}") }
+                            rows += row
+                            state = state.copy(done = done.incrementAndGet())
+                        }
+                    }
+                }.joinAll()
+            }
+            // A plugin goes only if every home-page API it has is dead (none ok / inconclusive)
+            val byPlugin = rows.groupBy { it.plugin }
+            val dead = byPlugin.filter { (_, r) ->
+                val relevant = r.filter { it.verdict != "skipped" }
+                relevant.isNotEmpty() && relevant.all { it.verdict == "dead" }
+            }.keys.sorted()
+            state = state.copy(deadPlugins = dead, rows = rows.sortedWith(compareBy({ it.verdict }, { it.plugin })))
+            if (uninstall && dead.isNotEmpty()) {
+                ServerState.warn("[HomeAudit] uninstalling ${dead.size} extension(s) with a dead home page: ${dead.joinToString()}")
+                BridgeRuntime.uninstallPlugins(dead)
+                StreamTracker.forget(dead)
+                dead.forEach { GeoRouter.clearLearned(it) }
+                state = state.copy(uninstalled = dead)
+            }
+            state = state.copy(running = false, finishedAt = System.currentTimeMillis())
+            ServerState.info("[HomeAudit] done: ${rows.count { it.verdict == "ok" }} ok, ${rows.count { it.verdict == "dead" }} dead APIs, " +
+                "${rows.count { it.verdict == "inconclusive" }} inconclusive; ${dead.size} plugin(s) " + if (uninstall) "uninstalled" else "would be uninstalled")
+            return state
+        } finally {
+            if (state.running) state = state.copy(running = false, finishedAt = System.currentTimeMillis())
+            mutex.unlock()
+        }
+    }
+}

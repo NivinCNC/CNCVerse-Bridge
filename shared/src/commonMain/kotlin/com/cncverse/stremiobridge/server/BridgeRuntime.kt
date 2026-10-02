@@ -241,8 +241,9 @@ object BridgeRuntime {
                 val newlyInstalledNames = RepoState.installedPlugins.value
                     .filter { it.repoUrl == repoUrl && it.internalName !in before }
                     .map { it.internalName }.toSet()
+                // Plugin level only: per-source entries would override the plugin switch
+                // (enabling the plugin later must turn its sources on)
                 StremioServer.loadedApis.filter { it.pluginInternalName in newlyInstalledNames || it.internalName in newlyInstalledNames }.forEach { api ->
-                    StremioServer.setPluginDisabled(api.internalName, disabled = true)
                     StremioServer.setPluginDisabled(api.pluginInternalName, disabled = true)
                 }
             }

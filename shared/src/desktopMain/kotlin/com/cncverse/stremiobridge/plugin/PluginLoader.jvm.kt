@@ -782,6 +782,7 @@ private class DirectMainApiWrapper(
     override val staticSectionNames: List<String> get() = runCatching { api.mainPage.map { it.name } }.getOrDefault(emptyList())
     override val apiLang: String? get() = runCatching { api.lang }.getOrNull()
     override val pluginLanguage: String? get() = plugin.language
+    override val hasHomePage: Boolean get() = runCatching { api.hasMainPage }.getOrDefault(true)
 
     override val supportedTypes: List<String> get() {
         val hasLive = api.supportedTypes.any { it.name.equals("Live", ignoreCase = true) }

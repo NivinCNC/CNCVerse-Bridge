@@ -2511,6 +2511,19 @@ function renderUnifiedSourceRow(p, installedList) {
     html += '<div class="muted" style="font-size:11px;font-style:italic;">No description provided</div>';
   }
 
+  // Multi-source plugins (e.g. PlayFy: Live Events, Highlights + one source per playlist in
+  // its settings): each source has its own global switch, independent of the plugin switch.
+  if (inst && inst.sources && inst.sources.length > 1) {
+    var onCount = inst.sources.filter(function(s) { return s.enabled; }).length;
+    html += '<details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-size:11.5px">Sources: ' + onCount + ' of ' + inst.sources.length + ' on</summary>';
+    html += '<div style="display:flex;flex-direction:column;gap:4px;margin-top:6px;max-height:220px;overflow-y:auto">';
+    inst.sources.forEach(function(s) {
+      html += '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"><input type="checkbox" ' + (s.enabled ? 'checked ' : '') +
+        'onchange="togglePlugin(\'' + jsa(s.id) + '\')"> ' + esc(s.name) + '</label>';
+    });
+    html += '</div></details>';
+  }
+
   // Bottom action bar
   html += '<div style="display:flex;align-items:center;justify-content:space-between;padding-top:10px;border-top:1px solid var(--divider);margin-top:auto;gap:8px;">';
 
