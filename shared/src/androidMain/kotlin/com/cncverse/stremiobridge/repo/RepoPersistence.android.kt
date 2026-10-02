@@ -81,3 +81,10 @@ actual fun saveCachedAvailablePlugins(plugins: List<com.cncverse.stremiobridge.s
     val raw = runCatching { androidRepoJson.encodeToString(plugins) }.getOrNull() ?: return
     prefs.edit().putString(KEY_AVAILABLE_PLUGINS_CACHE, raw).apply()
 }
+
+actual fun getExtensionSetting(key: String): String? =
+    com.lagradost.cloudstream3.CloudStreamApp.getSettings()[key]
+
+actual fun setExtensionSetting(key: String, value: String?) {
+    com.lagradost.cloudstream3.CloudStreamApp.setKey(key, value)
+}

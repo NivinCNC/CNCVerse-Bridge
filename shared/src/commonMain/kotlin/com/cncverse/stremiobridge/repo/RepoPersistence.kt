@@ -11,6 +11,11 @@ expect fun saveRepoUrls(urls: List<String>)
 expect fun loadExtensionSettings(): Map<String, String>
 expect fun saveExtensionSettings(settings: Map<String, String>)
 
+/** One key of the live, shared extension-settings map (the one plugins use). */
+expect fun getExtensionSetting(key: String): String?
+/** Updates one key of the live settings map and persists it (null removes it). */
+expect fun setExtensionSetting(key: String, value: String?)
+
 expect fun loadCachedRepoEntries(): List<com.cncverse.stremiobridge.state.RepoEntry>
 expect fun saveCachedRepoEntries(entries: List<com.cncverse.stremiobridge.state.RepoEntry>)
 

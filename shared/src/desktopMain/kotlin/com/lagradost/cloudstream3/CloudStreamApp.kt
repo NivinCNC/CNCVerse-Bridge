@@ -19,15 +19,19 @@ class CloudStreamApp {
          */
         @PublishedApi
         internal fun getSettings(): MutableMap<String, String> {
-            if (inMemorySettings == null) {
-                inMemorySettings = SettingsHookMap().also { map ->
+            inMemorySettings?.let { return it }
+            synchronized(this) {
+                return inMemorySettings ?: SettingsHookMap().also { map ->
                     map.putAll(loadExtensionSettings())
+                    inMemorySettings = map
                 }
             }
-            return inMemorySettings!!
         }
 
-        private class SettingsHookMap : LinkedHashMap<String, String>() {
+        // Concurrent: plugins on many threads read/write it at once. A plain
+        // LinkedHashMap silently dropped entries under concurrent puts, and the
+        // next save then persisted the loss (plugin settings vanishing).
+        private class SettingsHookMap : java.util.concurrent.ConcurrentHashMap<String, String>() {
             override fun get(key: String): String? {
                 if (!PluginCallContext.suppressSettingsHook.get()) {
                     val caller = PluginCallContext.getCallingPluginName()
@@ -81,7 +85,35 @@ class CloudStreamApp {
             } else {
                 settings[path] = value.toString()
             }
-            saveExtensionSettings(settings)
+            scheduleSave()
+        }
+
+        private val saveExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor { r ->
+            Thread(r, "ext-settings-writer").apply { isDaemon = true }
+        }
+        private val savePending = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        init {
+            Runtime.getRuntime().addShutdownHook(Thread { flushSettings() })
+        }
+
+        /**
+         * Coalesces bursts of setKey calls (cookies, channel caches, a dialog
+         * clearing + re-adding 40 keys) into one write of the settings file
+         * a second later, instead of rewriting the whole file on every call.
+         */
+        private fun scheduleSave() {
+            if (savePending.compareAndSet(false, true)) {
+                saveExecutor.schedule({ flushSettings() }, 1, java.util.concurrent.TimeUnit.SECONDS)
+            }
+        }
+
+        /** Writes pending settings now (also runs on shutdown). */
+        fun flushSettings() {
+            if (!savePending.getAndSet(false)) return
+            val settings = inMemorySettings ?: return
+            runCatching { saveExtensionSettings(settings) }
+                .onFailure { System.err.println("ext settings save failed: ${it.message}") }
         }
 
         fun getContext(): Context? {
