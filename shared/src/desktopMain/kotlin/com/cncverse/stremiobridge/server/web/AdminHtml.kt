@@ -4043,8 +4043,17 @@ function saveAutoUninstallDays() {
 }
 
 function isAutoUninstall(id) {
-  if (!maintData || !maintData.optedIn) return false;
+  if (!maintData) return false;
+  if (maintData.autoUninstallAll) return true;
+  if (!maintData.optedIn) return false;
   return maintData.optedIn.some(function(o) { return o.internalName === id; });
+}
+
+function toggleAutoUninstallAll(on) {
+  if (on && !confirm("Auto-uninstall every installed extension that stays dead (no links directly or via a residential proxy) for " + ((maintData && maintData.autoUninstallDays) || 3) + " days?")) { loadMaintenance(); return; }
+  api("/maintenance/auto-uninstall/all", { method: "POST", body: JSON.stringify({ internalName: "*", enabled: on }) })
+    .then(function(res) { toast(res.message || "Saved"); loadMaintenance(); })
+    .catch(function(e) { toast("Error: " + e.message); });
 }
 
 function toggleAutoUninstall(id, on) {
@@ -4121,7 +4130,7 @@ function renderMaintenanceCard() {
   html += '<div class="stat-card"><div class="stat-label">Auto-uninstall after</div><div class="row" style="gap:6px;align-items:center;margin-top:4px;">' +
     '<input id="au-days" type="number" min="1" max="90" value="' + (m.autoUninstallDays || 3) + '" style="width:70px">' +
     '<span class="muted" style="font-size:12px">days</span><button class="ghost small" onclick="saveAutoUninstallDays()">Save</button></div>' +
-    '<div class="stat-sub">only for extensions switched on below</div></div>';
+    '<label class="stat-sub" style="display:flex;gap:5px;align-items:center;cursor:pointer"><input type="checkbox" ' + (m.autoUninstallAll ? "checked" : "") + ' onchange="toggleAutoUninstallAll(this.checked)"> all installed extensions</label></div>';
   html += '</div>';
 
   if (m.running) {
@@ -4134,7 +4143,7 @@ function renderMaintenanceCard() {
   }
 
   if (m.optedIn && m.optedIn.length) {
-    html += '<div style="margin-top:14px"><div class="drawer-section-label" style="padding:0 0 6px 0">AUTO-UNINSTALL ON (' + m.optedIn.length + ')</div><div class="pillrow">';
+    html += '<div style="margin-top:14px"><div class="drawer-section-label" style="padding:0 0 6px 0">' + (m.autoUninstallAll ? 'DEAD — HEADING FOR REMOVAL (' : 'AUTO-UNINSTALL ON (') + m.optedIn.length + ')</div><div class="pillrow">';
     m.optedIn.forEach(function(o) {
       var due = (o.dueInDays === null || o.dueInDays === undefined) ? '' :
         (o.dueInDays <= 0 ? ' &middot; removing next run' : ' &middot; removed in ' + o.dueInDays.toFixed(1) + 'd if still dead');
@@ -4382,6 +4391,7 @@ function saveGeoSettings() {
     defaultCountry: geoVal("geo-default").trim().toUpperCase(),
     warpProxy: geoVal("geo-warp").trim(),
     ultrasurfProxy: geoVal("geo-ultra").trim(),
+    ultrasurfDomains: geoVal("geo-ultra-domains").split(/[\s,]+/).map(function(s) { return s.trim(); }).filter(function(s) { return s; }),
     domainRules: rules,
     customProxies: geoVal("geo-custom").split("\n").map(function(s) { return s.trim(); }).filter(function(s) { return s && s.charAt(0) !== "#"; })
   };
@@ -4455,6 +4465,7 @@ function renderGeo() {
   html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted">Default country<input id="geo-default" type="text" maxlength="2" placeholder="none" value="' + esc(s.defaultCountry || "") + '" style="width:90px" oninput="geoDirty=true"></label>';
   html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted" title="Default route for normal traffic (Cloudflare WARP local SOCKS). Blank = direct.">WARP (default route)<input id="geo-warp" type="text" placeholder="socks5://127.0.0.1:40000" value="' + esc(s.warpProxy || "") + '" style="width:210px" oninput="geoDirty=true"></label>';
   html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted" title="Tried first for India (Jio etc.), before public IN proxies. Blank = off.">Ultrasurf (India first)<input id="geo-ultra" type="text" placeholder="socks5://127.0.0.1:9667" value="' + esc(s.ultrasurfProxy || "") + '" style="width:210px" oninput="geoDirty=true"></label>';
+  html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted" title="Hosts (and their subdomains) that always go through Ultrasurf — never public proxies.">Always via Ultrasurf<input id="geo-ultra-domains" type="text" placeholder="workers.dev" value="' + esc((s.ultrasurfDomains || []).join(", ")) + '" style="width:210px" oninput="geoDirty=true"></label>';
   html += '</div>';
   var rules = Object.keys(s.domainRules || {}).map(function(k) { return k + " " + s.domainRules[k]; }).join("\n");
   html += '<div class="row" style="gap:12px;flex-wrap:wrap;margin-top:10px;align-items:flex-start">';

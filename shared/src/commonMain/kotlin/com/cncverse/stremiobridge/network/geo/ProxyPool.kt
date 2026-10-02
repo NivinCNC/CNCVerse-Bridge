@@ -264,7 +264,13 @@ object ProxyPool {
      * Up to [n] proxies for [country], best first, spreading load across the
      * top few. Empty when the pool is still being built.
      */
+    /** Usable built-in tunnels (Ultrasurf), whatever country pool holds them. */
+    private fun builtins(): List<PooledProxy> =
+        pools.values.flatten().filter { it.builtin && it.consecutiveFailures < failLimit(it) }
+
     fun pick(country: String, n: Int = 2, exclude: Set<String> = emptySet(), host: String? = null, residentialOnly: Boolean = false): List<PooledProxy> {
+        // Hosts pinned to Ultrasurf (workers.dev…) never use anything else
+        if (host != null && GeoRouter.ultrasurfOnly(host)) return builtins().filter { it.endpoint.key !in exclude }.take(n)
         demand(country)
         val banned = host?.let { bannedFor(it) }.orEmpty()
         val ranked = healthy(country)
@@ -283,6 +289,7 @@ object ProxyPool {
      * carrying the fewest channels, then latency.
      */
     fun leastLoaded(country: String, exclude: Set<String>, host: String? = null, cap: Int = Int.MAX_VALUE): PooledProxy? {
+        if (host != null && GeoRouter.ultrasurfOnly(host)) return builtins().firstOrNull { it.endpoint.key !in exclude }
         demand(country)
         val banned = host?.let { bannedFor(it) }.orEmpty()
         return healthy(country)
@@ -304,6 +311,7 @@ object ProxyPool {
 
     /** [p] got a geo refusal from [host]; don't use it for that host for a while. */
     fun banForHost(host: String, p: PooledProxy) {
+        if (p.builtin && GeoRouter.ultrasurfOnly(host)) return // pinned: always Ultrasurf
         hostBans["$host|${p.endpoint.key}"] = System.currentTimeMillis() + HOST_BAN_MS
         if (hostBans.size > 5_000) {
             val now = System.currentTimeMillis()

@@ -577,7 +577,9 @@ object WebAdmin {
                 val installed = RepoState.installedPlugins.value.associateBy { it.internalName }
                 val now = System.currentTimeMillis()
                 val dayMs = 24.0 * 60 * 60_000
-                val opted = m.optedInAll().mapNotNull { (p, at) ->
+                // With "all installed" on, list only the dead ones (the ones actually heading for removal)
+                val scope = if (m.autoUninstallAll) installed.keys.associateWith { m.optedInAll()[it] ?: 0L } else m.optedInAll()
+                val opted = scope.mapNotNull { (p, at) ->
                     val ip = installed[p] ?: return@mapNotNull null
                     val s = StreamTracker.statOf(p)
                     val status = s?.status(now) ?: com.cncverse.stremiobridge.state.HealthStatus.UNKNOWN
@@ -585,6 +587,7 @@ object WebAdmin {
                         val since = maxOf(s.lastSuccessTime, s.firstSeen, at)
                         (m.autoUninstallDays * dayMs - (now - since)) / dayMs
                     } else null
+                    if (m.autoUninstallAll && due == null && !m.optedInAll().containsKey(p)) return@mapNotNull null
                     AdminAutoUninstallEntry(p, ip.displayName, at, status, s?.lastSuccessTime ?: 0, due)
                 }.sortedBy { it.displayName.lowercase() }
                 call.respond(
@@ -595,6 +598,7 @@ object WebAdmin {
                         lastRun = m.lastRun,
                         sweep = com.cncverse.stremiobridge.maintenance.HealthSweep.state,
                         autoUninstallDays = m.autoUninstallDays,
+                        autoUninstallAll = m.autoUninstallAll,
                         optedIn = opted,
                         history = m.history,
                     )
@@ -627,6 +631,15 @@ object WebAdmin {
                     ?: return@post call.respond(AdminActionResult(false, "Invalid request"))
                 com.cncverse.stremiobridge.maintenance.Maintenance.setAutoUninstallDays(req.days)
                 call.respond(AdminActionResult(true, "Auto-uninstall after ${com.cncverse.stremiobridge.maintenance.Maintenance.autoUninstallDays} day(s) without links"))
+            }
+
+            post("/maintenance/auto-uninstall/all") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val req = runCatching { call.receive<AdminAutoUninstallToggle>() }.getOrNull()
+                    ?: return@post call.respond(AdminActionResult(false, "Invalid request"))
+                com.cncverse.stremiobridge.maintenance.Maintenance.setAutoUninstallAll(req.enabled)
+                call.respond(AdminActionResult(true,
+                    if (req.enabled) "Auto-uninstall applies to all installed extensions" else "Auto-uninstall only for extensions switched on"))
             }
 
             post("/maintenance/auto-uninstall/toggle") {

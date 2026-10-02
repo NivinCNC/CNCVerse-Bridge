@@ -60,6 +60,8 @@ data class GeoProxySettings(
      * any public IN proxy and never evicted. Blank = not used.
      */
     val ultrasurfProxy: String = System.getenv("CNC_ULTRASURF_PROXY")?.trim().orEmpty(),
+    /** Host suffixes that always go through Ultrasurf (never public proxies, never skipped). */
+    val ultrasurfDomains: List<String> = listOf("workers.dev"),
 )
 
 val DEFAULT_DOMAIN_RULES: Map<String, String> = mapOf(
@@ -247,6 +249,8 @@ object GeoRouter {
             blockTtlHours = s.blockTtlHours.coerceIn(1, 24 * 14),
             defaultCountry = s.defaultCountry.trim().uppercase().take(2),
             domainRules = rules,
+            ultrasurfDomains = s.ultrasurfDomains.map { it.trim().lowercase().removePrefix("*.").removePrefix(".") }
+                .filter { it.isNotEmpty() && '.' in it }.distinct(),
         )
         applySettings()
         save()
@@ -308,9 +312,16 @@ object GeoRouter {
         return settings.defaultCountry.takeIf { it.length == 2 }
     }
 
+    /** Hosts pinned to Ultrasurf (settings.ultrasurfDomains, suffix match). */
+    fun ultrasurfOnly(host: String): Boolean {
+        val h = host.lowercase()
+        return settings.ultrasurfProxy.isNotBlank() && settings.ultrasurfDomains.any { d -> h == d || h.endsWith(".$d") }
+    }
+
     /** Country of the domain rule matching [host] (suffix match), if any. */
     fun ruleCountry(host: String): String? {
         val h = host.lowercase()
+        if (ultrasurfOnly(h)) return "IN"
         return settings.domainRules.entries.firstOrNull { (d, _) -> h == d || h.endsWith(".$d") }?.value
     }
 

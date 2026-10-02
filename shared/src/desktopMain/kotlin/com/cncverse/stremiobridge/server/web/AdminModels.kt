@@ -252,6 +252,7 @@ data class AdminMaintenanceInfo(
     val lastRun: com.cncverse.stremiobridge.maintenance.MaintenanceRun? = null,
     val sweep: com.cncverse.stremiobridge.maintenance.SweepState,
     val autoUninstallDays: Int,
+    val autoUninstallAll: Boolean = false,
     val optedIn: List<AdminAutoUninstallEntry> = emptyList(),
     val history: List<com.cncverse.stremiobridge.maintenance.AutoUninstallRecord> = emptyList(),
 )

@@ -227,6 +227,8 @@ private data class MaintenanceFile(
     val autoUninstallDays: Int = 3,
     /** Extensions opted in to auto-uninstall → opt-in time. */
     val autoUninstall: Map<String, Long> = emptyMap(),
+    /** Apply auto-uninstall to every installed extension, not only the opted-in ones. */
+    val autoUninstallAll: Boolean = false,
     val history: List<AutoUninstallRecord> = emptyList(),
     val lastRun: MaintenanceRun? = null,
 )
@@ -247,7 +249,8 @@ object Maintenance {
     val history: List<AutoUninstallRecord> get() = data.history
     val lastRun: MaintenanceRun? get() = data.lastRun
     fun isRunning() = runMutex.isLocked
-    fun optedIn(plugin: String) = data.autoUninstall.containsKey(plugin)
+    val autoUninstallAll: Boolean get() = data.autoUninstallAll
+    fun optedIn(plugin: String) = data.autoUninstallAll || data.autoUninstall.containsKey(plugin)
     fun optedInAll(): Map<String, Long> = data.autoUninstall
 
     fun init(cacheDir: String) {
@@ -274,6 +277,12 @@ object Maintenance {
     @Synchronized
     fun setAutoUninstallDays(days: Int) {
         data = data.copy(autoUninstallDays = days.coerceIn(1, 90))
+        save()
+    }
+
+    @Synchronized
+    fun setAutoUninstallAll(enabled: Boolean) {
+        data = data.copy(autoUninstallAll = enabled)
         save()
     }
 
@@ -355,7 +364,10 @@ object Maintenance {
     fun autoUninstallCandidates(now: Long = System.currentTimeMillis()): List<Pair<String, String>> {
         val windowMs = data.autoUninstallDays * 24L * 60 * 60_000L
         val installed = RepoState.installedPlugins.value.associateBy { it.internalName }
-        return data.autoUninstall.mapNotNull { (plugin, optedAt) ->
+        // "All installed" covers every extension; opt-in time then only counts where one was set
+        val scope: Map<String, Long> = if (data.autoUninstallAll)
+            installed.keys.associateWith { data.autoUninstall[it] ?: 0L } else data.autoUninstall
+        return scope.mapNotNull { (plugin, optedAt) ->
             val ip = installed[plugin] ?: return@mapNotNull null
             val s = StreamTracker.statOf(plugin) ?: return@mapNotNull null
             if (s.status(now) != HealthStatus.DEAD) return@mapNotNull null
