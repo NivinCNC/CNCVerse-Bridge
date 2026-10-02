@@ -102,9 +102,16 @@ object CountryResolver {
     ): Result {
         bestCountry(names.filter { it.isNotBlank() })?.let { return Result(it, "name") }
         bestCountry(sectionNames.filter { it.isNotBlank() })?.let { return Result(it, "homepage") }
+        val knownCountries = COUNTRY_WORDS.keys + LANGUAGE_COUNTRY.values
         for (lang in languages) {
-            val code = lang?.trim()?.lowercase()?.substringBefore('-')?.substringBefore('_') ?: continue
+            val raw = lang?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: continue
+            // Regional tags name the country outright: es-MX, pt_BR, en-IN
+            val region = raw.split('-', '_').getOrNull(1)?.uppercase()
+            if (region != null && region.length == 2 && region in knownCountries) return Result(region, "language:$raw")
+            val code = raw.substringBefore('-').substringBefore('_')
             LANGUAGE_COUNTRY[code]?.let { return Result(it, "language:$code") }
+            // Some repos put a country code in the language field ("mx" = Mexico)
+            if (code.length == 2 && code.uppercase() in knownCountries && code != "en") return Result(code.uppercase(), "language:$code")
         }
         return Result(null, "none")
     }
