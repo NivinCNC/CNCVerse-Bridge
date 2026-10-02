@@ -71,8 +71,19 @@ object HttpClientManager {
     private fun routed(request: Request, proxyUrl: String?, url: String?, plugin: String?): Response {
         if (proxyUrl != null) return createClient(proxyUrl, url).newCall(request).execute()
         geo.streamLease(plugin, request.url)?.let { lease ->
-            viaLease(lease, request)?.let { return it }
-            return baseClient.newCall(request).execute()
+            val viaProxy = viaLease(lease, request)
+            if (viaProxy != null && !com.cncverse.stremiobridge.network.geo.GeoRouter.geoBlocked(request.url.host, viaProxy.code)) return viaProxy
+            // Every proxy refused (or none answered): last resort is the default route (WARP).
+            // Its 450/451 is the clearest answer for the player (-> 451), so prefer it.
+            val direct = try { defaultRouteClient().newCall(request).execute() } catch (e: java.io.IOException) {
+                return viaProxy ?: throw e
+            }
+            val hard = com.cncverse.stremiobridge.network.geo.GeoRouter.HARD_BLOCK_CODES
+            return if (viaProxy == null || !com.cncverse.stremiobridge.network.geo.GeoRouter.geoBlocked(request.url.host, direct.code) || direct.code in hard) {
+                viaProxy?.close(); direct
+            } else {
+                direct.close(); viaProxy
+            }
         }
         val direct = try {
             baseClient.newCall(request).execute()
@@ -80,10 +91,10 @@ object HttpClientManager {
             val lease = geo.learnStreamBlocked(plugin, request.url, null) ?: throw e
             return viaLease(lease, request) ?: throw e
         }
-        if (direct.code !in com.cncverse.stremiobridge.network.geo.GeoRouter.GEO_BLOCK_CODES) return direct
+        if (!com.cncverse.stremiobridge.network.geo.GeoRouter.geoBlocked(request.url.host, direct.code)) return direct
         val lease = geo.learnStreamBlocked(plugin, request.url, direct.code) ?: return direct
         val viaProxy = viaLease(lease, request) ?: return direct
-        if (viaProxy.code in com.cncverse.stremiobridge.network.geo.GeoRouter.GEO_BLOCK_CODES) {
+        if (com.cncverse.stremiobridge.network.geo.GeoRouter.geoBlocked(request.url.host, viaProxy.code)) {
             // Proxies refused too — keep the original refusal (450/451 → the player gets 451)
             viaProxy.close()
             return direct
@@ -92,20 +103,36 @@ object HttpClientManager {
         return viaProxy
     }
 
+    @Volatile private var defaultRoute: Pair<java.net.Proxy?, OkHttpClient>? = null
+
+    /**
+     * Pinned to the default route (WARP, or direct) — bypasses the JVM selector,
+     * which would send geo-ruled hosts (jio.com…) through the proxy pool again.
+     */
+    private fun defaultRouteClient(): OkHttpClient {
+        val w = com.cncverse.stremiobridge.network.geo.GeoRouter.warp
+        defaultRoute?.takeIf { it.first == w }?.let { return it.second }
+        val c = baseClient.newBuilder().proxy(w ?: Proxy.NO_PROXY).build()
+        defaultRoute = w to c
+        return c
+    }
+
     private fun viaLease(
         lease: com.cncverse.stremiobridge.network.geo.GeoRouter.StreamLease,
         request: Request,
     ): Response? {
         var lastBlocked: Response? = null
+        val refused = ArrayList<com.cncverse.stremiobridge.network.geo.PooledProxy>(2)
         repeat(3) {
             val p = lease.current() ?: return lastBlocked
             val started = System.currentTimeMillis()
             try {
                 val resp = com.cncverse.stremiobridge.network.geo.ProxyPool
                     .clientFor(p.endpoint, streaming = true).newCall(request).execute()
-                if (resp.code in PROXY_RETRY_CODES) {
+                if (resp.code in PROXY_RETRY_CODES && !(resp.code == 403 && com.cncverse.stremiobridge.network.geo.GeoRouter.isToken403Host(request.url.host))) {
                     lastBlocked?.close()
                     lastBlocked = resp
+                    if (resp.code == 403) refused += p
                     lease.failover(
                         p, "HTTP ${resp.code}",
                         penalize = resp.code !in com.cncverse.stremiobridge.network.geo.GeoRouter.GEO_BLOCK_CODES && resp.code != 429,
@@ -114,6 +141,8 @@ object HttpClientManager {
                 } else {
                     lastBlocked?.close()
                     com.cncverse.stremiobridge.network.geo.ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
+                    // Another proxy got through, so the earlier 403s were about those IPs (e.g. Ultrasurf)
+                    refused.forEach { com.cncverse.stremiobridge.network.geo.ProxyPool.banForHost(request.url.host, it) }
                     return resp
                 }
             } catch (e: java.io.IOException) {

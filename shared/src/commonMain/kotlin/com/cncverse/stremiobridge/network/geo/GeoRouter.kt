@@ -49,6 +49,17 @@ data class GeoProxySettings(
      * gateway with a high `*N` capacity carries many live channels.
      */
     val customProxies: List<String> = emptyList(),
+    /**
+     * Default route for all "direct" traffic (server mode: Cloudflare WARP's local SOCKS,
+     * socks5://127.0.0.1:40000). Blank = really direct. Falls back to direct if it is down.
+     * Pool proxies never go through it — they connect straight from this server.
+     */
+    val warpProxy: String = System.getenv("CNC_WARP_PROXY")?.trim().orEmpty(),
+    /**
+     * Ultrasurf (local SOCKS, socks5://127.0.0.1:9667): India's first proxy, tried before
+     * any public IN proxy and never evicted. Blank = not used.
+     */
+    val ultrasurfProxy: String = System.getenv("CNC_ULTRASURF_PROXY")?.trim().orEmpty(),
 )
 
 val DEFAULT_DOMAIN_RULES: Map<String, String> = mapOf(
@@ -196,6 +207,8 @@ object GeoRouter {
         ProxyPool.allowDatacenter = settings.allowDatacenter
         ProxyPool.datacenterFallback = settings.datacenterFallback
         ProxyPool.setCustom(settings.customProxies)
+        ProxyPool.setBuiltin("IN", "ultrasurf", settings.ultrasurfProxy)
+        warp = parseLocalProxy(settings.warpProxy)
     }
 
     @Synchronized
@@ -333,11 +346,55 @@ object GeoRouter {
         // A host known to refuse the server IP is proxied for every extension, from where it worked
         val learned = hostBlocks[host]?.takeIf { it.until > now }
         val country = learned?.country ?: rule ?: plugin?.let { countryFor(it) } ?: return Decision.DIRECT to null
-        if (learned != null || mode == RouteMode.FORCE_PROXY || o?.mode == "always" ||
+        // Domain-rule hosts (jio.com, tv.imgcdn.kim…) are known to need it: proxy first (Ultrasurf for IN)
+        if (learned != null || rule != null || mode == RouteMode.FORCE_PROXY || o?.mode == "always" ||
             (plugin != null && (pluginProxy[plugin] ?: 0L) > now)
         ) return Decision.PROXY_FIRST to country
         if ((noHelp[host] ?: 0L) > now) return Decision.DIRECT to null
         return Decision.DIRECT_THEN_PROXY to country
+    }
+
+    /**
+     * Hosts whose 403 means "token expired", not "IP refused": Jio answers 450 to a
+     * blocked IP and 403 to a stale __hdnea__ token. Proxy/route switching can't fix
+     * an expired token — the 403 goes straight back so the caller refreshes it.
+     */
+    private val TOKEN_403_HOSTS = listOf("jio.com")
+
+    fun isToken403Host(host: String): Boolean {
+        val h = host.lowercase()
+        return TOKEN_403_HOSTS.any { h == it || h.endsWith(".$it") }
+    }
+
+    /** Does [code] from [host] mean this IP is refused (so another route may help)? */
+    fun geoBlocked(host: String, code: Int): Boolean =
+        code in HARD_BLOCK_CODES || (code == 403 && !isToken403Host(host))
+
+    /** WARP's local SOCKS endpoint (default route), or null. */
+    @Volatile var warp: java.net.Proxy? = null
+        private set
+
+    /** "socks5://host:port" / "http://host:port" → Proxy, or null when blank/invalid. */
+    fun parseLocalProxy(url: String?): java.net.Proxy? {
+        val u = url?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        val uri = runCatching { java.net.URI(u) }.getOrNull() ?: return null
+        val host = uri.host ?: return null
+        val port = uri.port.takeIf { it > 0 } ?: return null
+        val type = when (uri.scheme?.lowercase()) {
+            "socks5", "socks5h", "socks" -> java.net.Proxy.Type.SOCKS
+            "http", "https" -> java.net.Proxy.Type.HTTP
+            else -> return null
+        }
+        return java.net.Proxy(type, java.net.InetSocketAddress.createUnresolved(host, port))
+    }
+
+    /** Loopback / private / link-local hosts and local names — never routed anywhere. */
+    fun isLocalHost(host: String): Boolean {
+        val h = host.trim('[', ']').lowercase()
+        if (h == "localhost" || h.endsWith(".local") || h.endsWith(".localhost")) return true
+        if (!(Regex("^\\d{1,3}(\\.\\d{1,3}){3}$").matches(h) || ':' in h)) return false
+        val a = runCatching { java.net.InetAddress.getByName(h) }.getOrNull() ?: return false
+        return a.isLoopbackAddress || a.isSiteLocalAddress || a.isLinkLocalAddress || a.isAnyLocalAddress
     }
 
     /** True when anything is currently routed through a proxy (cheap gate for the ProxySelector). */
@@ -408,6 +465,7 @@ object GeoRouter {
     fun viaPool(plugin: String?, country: String, req: Request, residentialOnly: Boolean = false): Response? {
         val tried = HashSet<String>()
         var lastBlocked: Response? = null
+        val refused = ArrayList<PooledProxy>(2)
         repeat(3) {
             val p = ProxyPool.pick(country, 1, tried, req.url.host, residentialOnly).firstOrNull() ?: return lastBlocked
             tried += p.endpoint.key
@@ -421,16 +479,20 @@ object GeoRouter {
                         ProxyPool.reportFailure(p, "HTTP ${resp.code}")
                     }
                     // This proxy's IP is refused by this site (e.g. datacenter range) — ban it for this host, try another
-                    resp.code in GEO_BLOCK_CODES -> {
+                    geoBlocked(req.url.host, resp.code) -> {
                         lastBlocked?.close()
                         lastBlocked = resp
                         if (resp.code in HARD_BLOCK_CODES || resp.header("cf-mitigated") != null) ProxyPool.banForHost(req.url.host, p)
+                        else refused += p
                         ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
                     }
                     else -> {
                         lastBlocked?.close()
                         ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
                         counters.getOrPut(plugin ?: ANY) { Counters() }.ok.incrementAndGet()
+                        // The site answers from here, so a 403 from the earlier proxy was about its IP
+                        // (e.g. Ultrasurf on tv.imgcdn.kim) — skip it for this host for a while
+                        refused.forEach { ProxyPool.banForHost(req.url.host, it) }
                         return resp
                     }
                 }
@@ -462,7 +524,7 @@ object GeoRouter {
                     // Health probes only trust residential/private proxies (datacenter refusals prove nothing)
                     val probing = mode == RouteMode.FORCE_PROXY
                     val r = if (retryable(req)) viaPool(plugin, country!!, req, residentialOnly = probing) else null
-                    if (probing && (r == null || r.code in GEO_BLOCK_CODES || r.header("cf-mitigated") != null)) {
+                    if (probing && (r == null || geoBlocked(req.url.host, r.code) || r.header("cf-mitigated") != null)) {
                         // The "via proxy" probe did not really get through a proxy here
                         plugin?.let { probeMisses.getOrPut(it) { java.util.concurrent.atomic.AtomicInteger() }.incrementAndGet() }
                     }
@@ -484,7 +546,7 @@ object GeoRouter {
                     }
                     // A Cloudflare challenge (403 + cf-mitigated) counts too: datacenter IPs get challenged where
                     // residential ones pass, and the proxy answer is only kept if it is not a challenge itself
-                    if (direct.code !in GEO_BLOCK_CODES) return direct
+                    if (!geoBlocked(host, direct.code)) return direct
                     val viaProxy = retryViaProxy(plugin, c, host, req) ?: return direct
                     direct.close()
                     return viaProxy
@@ -521,6 +583,10 @@ object GeoRouter {
     class Selector(private val delegate: java.net.ProxySelector?) : java.net.ProxySelector() {
         override fun select(uri: java.net.URI?): List<java.net.Proxy> {
             geoSelect(uri)?.let { return it }
+            // Default route: WARP (falls back to direct when WARP is down). Local
+            // services (FlareSolverr, our own relay, LAN) always go direct.
+            val w = warp
+            if (w != null && uri?.host?.let { isLocalHost(it) } == false) return listOf(w, java.net.Proxy.NO_PROXY)
             val fallback = runCatching { delegate?.select(uri) }.getOrNull()
             return if (fallback.isNullOrEmpty()) listOf(java.net.Proxy.NO_PROXY) else fallback
         }
@@ -528,7 +594,7 @@ object GeoRouter {
         private fun geoSelect(uri: java.net.URI?): List<java.net.Proxy>? {
             val host = uri?.host ?: return null
             val mode = NetContext.currentMode()
-            if (!hasProxyRoutes() && mode != RouteMode.FORCE_PROXY) return null
+            if (!hasProxyRoutes() && mode != RouteMode.FORCE_PROXY && ruleCountry(host) == null) return null
             val plugin = NetContext.resolvePlugin()
             if (plugin == null && ruleCountry(host) == null) return null
             val (decision, country) = decide(plugin, mode, host)
@@ -538,7 +604,7 @@ object GeoRouter {
                 if (mode == RouteMode.FORCE_PROXY && plugin != null) probeMisses.getOrPut(plugin) { java.util.concurrent.atomic.AtomicInteger() }.incrementAndGet()
                 return null
             }
-            return picked + java.net.Proxy.NO_PROXY
+            return picked + listOfNotNull(warp) + java.net.Proxy.NO_PROXY
         }
 
         override fun connectFailed(uri: java.net.URI?, sa: java.net.SocketAddress?, ioe: IOException?) {

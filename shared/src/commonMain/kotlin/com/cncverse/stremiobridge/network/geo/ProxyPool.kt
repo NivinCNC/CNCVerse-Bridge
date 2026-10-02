@@ -108,6 +108,8 @@ class PooledProxy(
     val custom: Boolean = false,
     /** Live channels it may carry, as a multiple of maxStreamsPerProxy (rotating gateways: many). */
     val capacity: Int = 1,
+    /** Built-in local tunnel (Ultrasurf): tried before everything else for its country. */
+    val builtin: Boolean = false,
 ) {
     @Volatile var latencyMs: Long = 0
     @Volatile var consecutiveFailures: Int = 0
@@ -120,7 +122,7 @@ class PooledProxy(
     val addedAt: Long = System.currentTimeMillis()
 
     /** Lower is better: latency plus a heavy penalty per recent failure, residential preferred. */
-    val score: Long get() = latencyMs + consecutiveFailures * 4_000L + (if (residential) 0 else 2_500L) - (if (custom) 10_000L else 0L)
+    val score: Long get() = latencyMs + consecutiveFailures * 4_000L + (if (residential) 0 else 2_500L) - (if (custom) 10_000L else 0L) - (if (builtin) 20_000L else 0L)
 }
 
 @Serializable
@@ -140,11 +142,13 @@ data class PooledProxySnapshot(
     val activeStreams: Int = 0,
     val custom: Boolean = false,
     val capacity: Int = 1,
+    /** Built-in local tunnel (Ultrasurf): tried before everything else for its country. */
+    val builtin: Boolean = false,
 )
 
 fun PooledProxy.snapshot() = PooledProxySnapshot(
     endpoint, country, residential, isp, exitIp, latencyMs, consecutiveFailures,
-    successes.get(), failures.get(), lastOk, lastChecked, addedAt, activeStreams.get(), custom, capacity,
+    successes.get(), failures.get(), lastOk, lastChecked, addedAt, activeStreams.get(), custom, capacity, builtin,
 )
 
 /**
@@ -188,9 +192,11 @@ object ProxyPool {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var loopJob: Job? = null
 
-    /** Plain client for source lists and ip-api (goes out over the server's normal path). */
+    /** Plain client for source lists and ip-api. */
     private val directClient: OkHttpClient by lazy {
+        // Straight from this server (never via WARP): proxy lists, ip-api
         OkHttpClient.Builder()
+            .proxy(Proxy.NO_PROXY)
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .build()
@@ -261,8 +267,10 @@ object ProxyPool {
             .filter { it.endpoint.key !in exclude && it.endpoint.key !in banned && (!residentialOnly || it.residential || it.custom) }
             .sortedBy { it.score }
         if (ranked.isEmpty()) return emptyList()
-        val head = ranked.take(3).shuffled()
-        return (head + ranked.drop(3)).take(n)
+        // Built-in tunnels (Ultrasurf) always first; spread the rest over the best three
+        val (builtin, rest) = ranked.partition { it.builtin }
+        val head = rest.take(3).shuffled()
+        return (builtin + head + rest.drop(3)).take(n)
     }
 
     /**
@@ -277,6 +285,7 @@ object ProxyPool {
             .filter { it.endpoint.key !in exclude && it.endpoint.key !in banned }
             .minWithOrNull(
                 compareBy<PooledProxy> { cap != Int.MAX_VALUE && it.activeStreams.get() >= cap.toLong() * it.capacity }
+                    .thenBy { !it.builtin }
                     .thenBy { !it.custom }
                     .thenBy { !it.residential }
                     .thenBy { it.activeStreams.get().toDouble() / it.capacity }
@@ -435,13 +444,28 @@ object ProxyPool {
         return CustomProxy(country, ProxyEndpoint(type, host, port, user, pass), capacity)
     }
 
+    /**
+     * Installs (or removes, with a blank [url]) a built-in local tunnel such as
+     * Ultrasurf as the first proxy of [country]: preferred over everything,
+     * never evicted, effectively unlimited live-channel capacity.
+     */
+    fun setBuiltin(country: String, label: String, url: String) {
+        val list = pools.getOrPut(country) { CopyOnWriteArrayList() }
+        val parsed = parseCustom("$country $url")?.endpoint
+        list.filter { it.builtin && it.endpoint != parsed }.forEach { list.remove(it); dropClient(it.endpoint) }
+        if (parsed == null || list.any { it.builtin && it.endpoint == parsed }) return
+        list.add(0, PooledProxy(parsed, country, residential = true, isp = label, exitIp = null,
+            custom = true, capacity = 1000, builtin = true).apply { lastChecked = 0 })
+        demand.putIfAbsent(country, System.currentTimeMillis())
+    }
+
     /** Replaces the admin-added private proxies (from the geo settings). */
     fun setCustom(lines: List<String>) {
         val wanted = lines.mapNotNull { parseCustom(it) }
         val wantedKeys = wanted.map { it.country + "|" + it.endpoint.key }.toSet()
         // Drop removed ones
         pools.forEach { (country, list) ->
-            list.filter { it.custom && (country + "|" + it.endpoint.key) !in wantedKeys }.forEach {
+            list.filter { it.custom && !it.builtin && (country + "|" + it.endpoint.key) !in wantedKeys }.forEach {
                 list.remove(it); dropClient(it.endpoint)
             }
         }

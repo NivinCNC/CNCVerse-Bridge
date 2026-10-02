@@ -4380,6 +4380,8 @@ function saveGeoSettings() {
     maxStreamsPerProxy: parseInt(geoVal("geo-perproxy"), 10) || 3,
     blockTtlHours: parseInt(geoVal("geo-ttl"), 10) || 12,
     defaultCountry: geoVal("geo-default").trim().toUpperCase(),
+    warpProxy: geoVal("geo-warp").trim(),
+    ultrasurfProxy: geoVal("geo-ultra").trim(),
     domainRules: rules,
     customProxies: geoVal("geo-custom").split("\n").map(function(s) { return s.trim(); }).filter(function(s) { return s && s.charAt(0) !== "#"; })
   };
@@ -4440,7 +4442,7 @@ function renderGeo() {
 
   html += '<div class="card" style="margin-bottom:14px">';
   html += '<h2>&#127760; Geo proxy routing</h2>';
-  html += '<div class="hint">Requests go out directly. When a site refuses this server (403 / 450 / 451 / Cloudflare challenge, or the connection is cut) the request is retried through a residential proxy of the extension\'s country (from its name, home-page sections or language), and the host is then proxied for every extension. Relayed live streams keep one proxy per channel with a hot standby; channels are spread across the pool.</div>';
+  html += '<div class="hint">Normal traffic goes out through WARP. When a site refuses it (403 / 450 / 451 / Cloudflare challenge, or the connection is cut) the request is retried through a proxy of the extension\'s country (from its name, home-page sections or language): for India Ultrasurf first, then residential proxies, reached straight from this server (not via WARP). The host is then proxied for every extension; domain-rule hosts (Jio…) go proxy-first. Relayed live streams keep one proxy per channel with a hot standby; channels are spread across the pool.</div>';
   html += '<div class="row" style="gap:16px;flex-wrap:wrap;margin:10px 0">';
   html += '<label style="display:flex;gap:6px;align-items:center"><input type="checkbox" id="geo-enabled" ' + (s.enabled ? 'checked' : '') + ' onchange="geoDirty=true"> Enabled</label>';
   html += '<label style="display:flex;gap:6px;align-items:center" title="Use datacenter IPs while a country has under 3 working residential proxies"><input type="checkbox" id="geo-dcfb" ' + (s.datacenterFallback ? 'checked' : '') + ' onchange="geoDirty=true"> Datacenter fallback</label>';
@@ -4451,6 +4453,8 @@ function renderGeo() {
     html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted">' + f[1] + '<input id="' + f[0] + '" type="number" value="' + f[2] + '" style="width:120px" oninput="geoDirty=true"></label>';
   });
   html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted">Default country<input id="geo-default" type="text" maxlength="2" placeholder="none" value="' + esc(s.defaultCountry || "") + '" style="width:90px" oninput="geoDirty=true"></label>';
+  html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted" title="Default route for normal traffic (Cloudflare WARP local SOCKS). Blank = direct.">WARP (default route)<input id="geo-warp" type="text" placeholder="socks5://127.0.0.1:40000" value="' + esc(s.warpProxy || "") + '" style="width:210px" oninput="geoDirty=true"></label>';
+  html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted" title="Tried first for India (Jio etc.), before public IN proxies. Blank = off.">Ultrasurf (India first)<input id="geo-ultra" type="text" placeholder="socks5://127.0.0.1:9667" value="' + esc(s.ultrasurfProxy || "") + '" style="width:210px" oninput="geoDirty=true"></label>';
   html += '</div>';
   var rules = Object.keys(s.domainRules || {}).map(function(k) { return k + " " + s.domainRules[k]; }).join("\n");
   html += '<div class="row" style="gap:12px;flex-wrap:wrap;margin-top:10px;align-items:flex-start">';
@@ -4478,7 +4482,7 @@ function renderGeoLive() {
     else {
       html += '<div style="overflow-x:auto"><table style="width:100%;font-size:12px;border-collapse:collapse"><tr class="muted" style="text-align:left"><th>Proxy</th><th>Type</th><th>ISP</th><th>Latency</th><th>Live</th><th>OK / fail</th><th></th></tr>';
       c.proxies.forEach(function(p) {
-        var kind = p.custom ? '<span class="badge" style="background:rgba(234,179,8,0.15);color:#eab308">private' + (p.capacity > 1 ? ' &times;' + p.capacity : '') + '</span>' : (p.residential ? '<span class="badge green">residential</span>' : '<span class="badge gray">datacenter</span>');
+        var kind = p.builtin ? '<span class="badge" style="background:rgba(139,92,246,0.15);color:#a78bfa">ultrasurf</span>' : p.custom ? '<span class="badge" style="background:rgba(234,179,8,0.15);color:#eab308">private' + (p.capacity > 1 ? ' &times;' + p.capacity : '') + '</span>' : (p.residential ? '<span class="badge green">residential</span>' : '<span class="badge gray">datacenter</span>');
         var down = p.consecutiveFailures >= 2;
         html += '<tr style="border-top:1px solid var(--divider);' + (down ? 'opacity:0.5' : '') + '"><td style="font-family:monospace">' + esc(p.endpoint.type + "://" + p.endpoint.host + ":" + p.endpoint.port) + '</td><td>' + kind + '</td><td>' + esc(p.isp || "") + '</td><td>' + (p.latencyMs || 0) + ' ms</td><td>' + (p.activeStreams || 0) + '</td><td>' + p.successes + ' / ' + p.failures + '</td>' +
           '<td><a href="#" style="color:var(--red)" onclick="geoRemoveProxy(\'' + jsa(c.country) + '\',\'' + jsa(p.endpoint.type + "://" + p.endpoint.host + ":" + p.endpoint.port) + '\');return false;">remove</a></td></tr>';
