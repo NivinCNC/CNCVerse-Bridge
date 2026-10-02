@@ -142,6 +142,10 @@ object StremioServer {
      * Cached home page catalog results: "$type:$id:$genre" -> list of StremioMeta.
      */
     val homePageCatalogCache: MutableMap<String, List<StremioMeta>> = ConcurrentHashMap()
+    /** When each home-page cache entry was filled (live-only providers refresh after [LIVE_HOME_TTL_MS]). */
+    private val homePageCachedAt = ConcurrentHashMap<String, Long>()
+    private val homePageRefreshing: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    private const val LIVE_HOME_TTL_MS = 2 * 60_000L
 
     /**
      * Cached binary bytes for the official CNCVerse logo / favicon.
@@ -1967,6 +1971,24 @@ object StremioServer {
         if (isHomePage) {
             val cached = homePageCatalogCache[cacheKey]
             if (!cached.isNullOrEmpty()) {
+                // Live-only providers (live events, TV) change by the minute: serve the cached
+                // page at once but refresh it in the background once it is a couple of minutes
+                // old, instead of waiting for the 30-min refresh job.
+                val liveOnly = api.supportedTypes.all { it == "tv" }
+                val age = System.currentTimeMillis() - (homePageCachedAt[cacheKey] ?: 0L)
+                if (liveOnly && age > LIVE_HOME_TTL_MS && homePageRefreshing.add(cacheKey)) {
+                    streamSearchScope.launch {
+                        try {
+                            val fresh = fetchCatalogItemsDirect(type, id, null, 0, genre)
+                            if (fresh.isNotEmpty()) {
+                                homePageCatalogCache[cacheKey] = fresh
+                                homePageCachedAt[cacheKey] = System.currentTimeMillis()
+                            }
+                        } finally {
+                            homePageRefreshing.remove(cacheKey)
+                        }
+                    }
+                }
                 return cached
             }
         }
@@ -1974,6 +1996,7 @@ object StremioServer {
         val metas = fetchCatalogItemsDirect(type, id, search, skip, genre)
         if (isHomePage && metas.isNotEmpty()) {
             homePageCatalogCache[cacheKey] = metas
+            homePageCachedAt[cacheKey] = System.currentTimeMillis()
         }
         return metas
     }
