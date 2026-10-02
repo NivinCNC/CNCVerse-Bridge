@@ -2069,17 +2069,25 @@ object StremioServer {
 
     private suspend fun buildMeta(type: String, id: String, profileId: String? = null): StremioMeta? {
         val (pluginKey, dataUrl) = StremioIds.decode(id) ?: return null
-        val api = loadedApis.find { apiKey(it) == pluginKey }
-            ?: loadedApis.find { nameSlug(it.name) == pluginKey }
-            ?: loadedApis.find { it.internalName == pluginKey }
-            ?: return null
-        if (isPluginBlocked(api, profileId)) return null
-        return try {
-            api.load(dataUrl)?.toStremiMeta(nameSlug(api.name), type)?.also { rememberTitles(listOf(it)) }
-        } catch (e: Throwable) {
-            ServerState.warn("Meta error for ${api.name}: ${e.message}")
-            null
+        // Item ids carry the source's display-name slug, which several extensions can share
+        // (SKTech and LivXow both have "📺 SUN NXT"). Taking the first match could pick a
+        // copy that is disabled for this user → 404 and a detail page that never loads.
+        // Try every enabled match instead: exact keys first, then the name slug.
+        val candidates = (loadedApis.filter { apiKey(it) == pluginKey } +
+            loadedApis.filter { nameSlug(it.name) == pluginKey } +
+            loadedApis.filter { it.internalName == pluginKey })
+            .distinct()
+            .filter { !isPluginBlocked(it, profileId) }
+        for (api in candidates) {
+            val meta = try {
+                api.load(dataUrl)?.toStremiMeta(nameSlug(api.name), type)
+            } catch (e: Throwable) {
+                ServerState.warn("Meta error for ${api.name}: ${e.message}")
+                null
+            }
+            if (meta != null) return meta.also { rememberTitles(listOf(it)) }
         }
+        return null
     }
 
 

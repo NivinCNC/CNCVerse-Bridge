@@ -61,7 +61,7 @@ data class GeoProxySettings(
      */
     val ultrasurfProxy: String = System.getenv("CNC_ULTRASURF_PROXY")?.trim().orEmpty(),
     /** Host suffixes that always go through Ultrasurf (never public proxies, never skipped). */
-    val ultrasurfDomains: List<String> = listOf("workers.dev"),
+    val ultrasurfDomains: List<String> = listOf("workers.dev", "jio.com"),
 )
 
 val DEFAULT_DOMAIN_RULES: Map<String, String> = mapOf(

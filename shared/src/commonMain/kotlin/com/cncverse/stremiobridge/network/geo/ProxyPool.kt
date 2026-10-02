@@ -113,6 +113,8 @@ class PooledProxy(
 ) {
     @Volatile var latencyMs: Long = 0
     @Volatile var consecutiveFailures: Int = 0
+    /** Health checks (ipify through the proxy) failed in a row — only these can remove a public proxy. */
+    @Volatile var failedChecks: Int = 0
     val successes = AtomicInteger(0)
     val failures = AtomicInteger(0)
     /** Live channels currently leased to this proxy (see GeoRouter.StreamLease). */
@@ -177,6 +179,10 @@ object ProxyPool {
     private const val SOURCE_TTL_MS = 30 * 60_000L
     private const val DEMAND_TTL_MS = 6 * 60 * 60_000L
     private const val MAX_FAILURES = 2
+    /** A public proxy is removed only after this many failed health checks in a row (~1 min apart). */
+    private const val DEAD_CHECKS = 3
+    /** Marked-down proxies are re-checked this soon, so a hiccup costs a minute, not the proxy. */
+    private const val DOWN_RECHECK_MS = 60_000L
     /** Ultrasurf / private proxies carry hundreds of requests: a few failures in a row under load must not take them out. */
     private const val MAX_FAILURES_CUSTOM = 6
 
@@ -361,6 +367,7 @@ object ProxyPool {
     fun reportSuccess(p: PooledProxy, latencyMs: Long) {
         p.successes.incrementAndGet()
         p.consecutiveFailures = 0
+        p.failedChecks = 0
         p.lastOk = System.currentTimeMillis()
         p.latencyMs = if (p.latencyMs == 0L) latencyMs else (p.latencyMs * 7 + latencyMs) / 8
     }
@@ -368,8 +375,18 @@ object ProxyPool {
     fun reportFailure(p: PooledProxy, reason: String?) {
         p.failures.incrementAndGet()
         p.consecutiveFailures++
-        // Private proxies stay in the pool (marked down) and come back on the next good health check
-        if (p.consecutiveFailures >= MAX_FAILURES && !p.custom) evict(p, reason ?: "failures")
+        // Request failures only mark a proxy down: a site resetting one connection doesn't mean
+        // the proxy is dead. It stays in the pool and the health check decides (see healthCheck).
+        if (p.consecutiveFailures == failLimit(p)) {
+            ServerState.info("[GeoProxy] ${p.country}: ${p.endpoint.key} marked down (${reason ?: "failures"}) — re-checking")
+        }
+    }
+
+    private fun reportCheckFailed(p: PooledProxy) {
+        p.failures.incrementAndGet()
+        p.failedChecks++
+        p.consecutiveFailures = maxOf(p.consecutiveFailures + 1, failLimit(p))
+        if (!p.custom && p.failedChecks >= DEAD_CHECKS) evict(p, "dead: $DEAD_CHECKS health checks failed")
     }
 
     /** Called by the JVM ProxySelector when a connect through a pooled proxy fails. */
@@ -525,15 +542,17 @@ object ProxyPool {
             val slice = ProxySources.unclassifiedSpeedX(300)
             if (slice.isNotEmpty()) runCatching { IpClassifier.classify(slice, directClient, json) }
         }
-        pools.keys.filter { !demand.containsKey(it) }.forEach { c ->
-            pools.remove(c)?.forEach { dropClient(it.endpoint) }
-        }
-        for (country in demand.keys) {
+        // Proxies are kept until they die, even for countries nobody asked for lately or once
+        // they vanish from the public lists — only failed health checks remove them.
+        for (country in (pools.keys + demand.keys).toSet()) {
             val pool = pools[country].orEmpty()
-            // Down private/built-in tunnels are re-checked every 30 s so they come back fast
-            val due = pool.filter { now - it.lastChecked > (if (it.custom && it.consecutiveFailures >= failLimit(it)) 30_000L else HEALTH_INTERVAL_MS) }
+            // Down proxies are re-checked soon (custom tunnels every 30 s) so they come back fast
+            val due = pool.filter {
+                val down = it.consecutiveFailures >= failLimit(it)
+                now - it.lastChecked > when { down && it.custom -> 30_000L; down -> DOWN_RECHECK_MS; else -> HEALTH_INTERVAL_MS }
+            }
             if (due.isNotEmpty()) healthCheck(due)
-            if (healthy(country).size < targetFor(country)) {
+            if (demand.containsKey(country) && healthy(country).size < targetFor(country)) {
                 val last = lastRefill[country] ?: 0L
                 val backoff = if (healthy(country).size < MIN_HEALTHY) 2 * 60_000L else 10 * 60_000L
                 if (now - last > backoff) refill(country)
@@ -552,7 +571,7 @@ object ProxyPool {
                         p.exitIp = r.exitIp
                         reportSuccess(p, r.latencyMs)
                     } else {
-                        reportFailure(p, "health check failed")
+                        reportCheckFailed(p)
                     }
                 }
             }
