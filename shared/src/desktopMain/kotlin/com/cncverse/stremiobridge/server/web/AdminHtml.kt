@@ -2515,7 +2515,10 @@ function renderUnifiedSourceRow(p, installedList) {
   // its settings): each source has its own global switch, independent of the plugin switch.
   if (inst && inst.sources && inst.sources.length > 1) {
     var onCount = inst.sources.filter(function(s) { return s.enabled; }).length;
-    html += '<details style="margin-top:8px"><summary class="muted" style="cursor:pointer;font-size:11.5px">Sources: ' + onCount + ' of ' + inst.sources.length + ' on</summary>';
+    // Remember open lists: the tab re-renders every few seconds and would close it mid-edit
+    html += '<details data-src-plugin="' + esc(p.internalName) + '"' + (openSourceLists[p.internalName] ? ' open' : '') +
+      ' ontoggle="openSourceLists[this.getAttribute(\'data-src-plugin\')] = this.open" style="margin-top:8px">' +
+      '<summary class="muted" style="cursor:pointer;font-size:11.5px">Sources: ' + onCount + ' of ' + inst.sources.length + ' on</summary>';
     html += '<div style="display:flex;flex-direction:column;gap:4px;margin-top:6px;max-height:220px;overflow-y:auto">';
     inst.sources.forEach(function(s) {
       html += '<label style="display:flex;align-items:center;gap:6px;font-size:12px;cursor:pointer"><input type="checkbox" ' + (s.enabled ? 'checked ' : '') +
@@ -2688,6 +2691,8 @@ function installPlugin(id) {
       poll();
     }).catch(function(e) { toast("Install failed: " + e.message); });
 }
+
+var openSourceLists = {};  // plugin id -> Sources list expanded (kept across re-renders)
 
 function togglePlugin(id) {
   api("/plugins/toggle", {method:"POST", body: JSON.stringify({internalName: id})})
