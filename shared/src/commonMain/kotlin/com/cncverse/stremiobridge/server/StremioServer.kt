@@ -146,6 +146,7 @@ object StremioServer {
     private val homePageCachedAt = ConcurrentHashMap<String, Long>()
     private val homePageRefreshing: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private const val LIVE_HOME_TTL_MS = 2 * 60_000L
+    private const val LIVE_PLAYLIST_TTL_MS = 15 * 60_000L
 
     /**
      * Cached binary bytes for the official CNCVerse logo / favicon.
@@ -1976,7 +1977,12 @@ object StremioServer {
                 // old, instead of waiting for the 30-min refresh job.
                 val liveOnly = api.supportedTypes.all { it == "tv" }
                 val age = System.currentTimeMillis() - (homePageCachedAt[cacheKey] ?: 0L)
-                if (liveOnly && age > LIVE_HOME_TTL_MS && homePageRefreshing.add(cacheKey)) {
+                // Small pages are live events (change by the minute); big ones are channel
+                // playlists whose refresh re-parses thousands of lines — keep those at 15 min.
+                val ttl = if (cached.size <= 150) LIVE_HOME_TTL_MS else LIVE_PLAYLIST_TTL_MS
+                // One background refresh per provider at a time, whatever section was asked for
+                val refreshKey = api.internalName
+                if (liveOnly && age > ttl && homePageRefreshing.add(refreshKey)) {
                     streamSearchScope.launch {
                         try {
                             val fresh = fetchCatalogItemsDirect(type, id, null, 0, genre)
@@ -1985,7 +1991,7 @@ object StremioServer {
                                 homePageCachedAt[cacheKey] = System.currentTimeMillis()
                             }
                         } finally {
-                            homePageRefreshing.remove(cacheKey)
+                            homePageRefreshing.remove(refreshKey)
                         }
                     }
                 }
