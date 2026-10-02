@@ -284,6 +284,8 @@ object BridgeRuntime {
         appScope?.launch(Dispatchers.IO) {
             runCatching {
                 RepoManager.refreshAllRepos()
+                // Installed extensions whose file is gone (e.g. an interrupted update) are re-fetched
+                if (PluginInstaller.repairMissingFiles(cacheDir) > 0) forceReloadPlugins()
                 val toUpdate = RepoState.installedPlugins.value.filter {
                     RepoState.getInstallState(it.internalName) is PluginInstallState.UpdateAvailable
                 }
@@ -364,6 +366,7 @@ object BridgeRuntime {
                 runCatching {
                     ServerState.info("Periodic update check — refreshing repos…")
                     RepoManager.refreshAllRepos()
+                    if (PluginInstaller.repairMissingFiles(cacheDir) > 0) forceReloadPlugins()
                     val toUpdate = RepoState.installedPlugins.value.filter {
                         RepoState.getInstallState(it.internalName) is PluginInstallState.UpdateAvailable
                     }

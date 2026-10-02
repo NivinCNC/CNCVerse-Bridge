@@ -210,19 +210,23 @@ object PluginInstaller {
                     if (wasDisabled) " (was disabled)" else ""
             )
 
-            // 2. Explicitly remove the old .cs3 file so a stale/corrupt file can
-            //    never survive the update if the download subsequently fails.
-            val oldFile = File(inst.localPath)
-            if (oldFile.exists()) {
-                oldFile.delete()
-                ServerState.info("Deleted old '${inst.displayName}' file: ${oldFile.name}")
-            }
-            RepoState.markUninstalled(inst.internalName)
-
-            // 3. Download and install the new version.
+            // 2. Download + verify the new version first. The old file and record are
+            //    only replaced once the new file passed its hash check: right after a
+            //    release the repo index already lists the new hash while GitHub/jsDelivr
+            //    still serve the old file for a few minutes — deleting first made the
+            //    extension vanish instead of staying on its current version.
             val success = installPlugin(ap, cacheDir)
 
-            // 4. Restore the enabled/disabled state the plugin had before the update.
+            if (!success) {
+                // Keep running the installed version; retried on the next update check
+                RepoState.markInstalled(inst)
+                RepoState.setInstallState(inst.internalName, PluginInstallState.UpdateAvailable(ap.plugin.version))
+                saveInstalledPlugins(cacheDir)
+                ServerState.warn("Update of '${inst.displayName}' to v${ap.plugin.version} failed — keeping v${inst.version}")
+                return@forEach
+            }
+
+            // 3. Restore the enabled/disabled state the plugin had before the update.
             if (success) {
                 com.cncverse.stremiobridge.server.StremioServer.setPluginDisabled(
                     inst.internalName,
@@ -234,6 +238,29 @@ object PluginInstaller {
                 )
             }
         }
+    }
+
+    /**
+     * Self-heal: re-downloads installed plugins whose .cs3 file is missing on
+     * disk (a failed update, manual cleanup…). Returns how many were restored;
+     * the caller reloads once afterwards.
+     */
+    suspend fun repairMissingFiles(cacheDir: String): Int {
+        val available = RepoState.availablePlugins.value
+        val missing = RepoState.installedPlugins.value.filter { !File(it.localPath).exists() }
+        if (missing.isEmpty()) return 0
+        ServerState.warn("Re-downloading ${missing.size} installed extension(s) with a missing file: " +
+            missing.joinToString { it.displayName })
+        var restored = 0
+        for (inst in missing) {
+            val ap = available.find { it.plugin.internalName == inst.internalName && it.repoEntry.url == inst.repoUrl }
+                ?: available.find { it.plugin.internalName == inst.internalName }
+                ?: continue
+            if (installPlugin(ap, cacheDir)) restored++
+            else RepoState.markInstalled(inst) // keep the record; retried on the next check
+        }
+        saveInstalledPlugins(cacheDir)
+        return restored
     }
 
     /** Returns locally available .cs3 files for all installed plugins. */
