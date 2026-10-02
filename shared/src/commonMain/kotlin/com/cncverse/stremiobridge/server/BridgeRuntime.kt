@@ -101,6 +101,27 @@ object BridgeRuntime {
         val cs3Files = PluginInstaller.getInstalledFiles(cacheDir)
         GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
         StremioServer.initFastCatalogs()
+        registerGeoPlugins(installed)
+    }
+
+    /** Tells the geo proxy router each extension's names and languages (→ country). */
+    private fun registerGeoPlugins(installed: List<com.cncverse.stremiobridge.state.InstalledPlugin>) {
+        runCatching {
+            val byPlugin = StremioServer.loadedApis.groupBy { it.pluginInternalName }
+            val infos = installed.map { ip ->
+                val apis = byPlugin[ip.internalName].orEmpty()
+                com.cncverse.stremiobridge.network.geo.GeoRouter.PluginGeoInfo(
+                    internalName = ip.internalName,
+                    displayName = ip.displayName,
+                    names = listOf(ip.displayName, ip.internalName) + apis.map { it.name },
+                    sectionNames = apis.flatMap { it.staticSectionNames },
+                    languages = listOf(ip.language) + apis.map { it.pluginLanguage } + apis.map { it.apiLang },
+                )
+            }
+            com.cncverse.stremiobridge.network.geo.GeoRouter.registerPlugins(infos)
+            // Start the "installed since" clock used by auto-uninstall
+            installed.forEach { com.cncverse.stremiobridge.state.StreamTracker.ensureSeen(it.internalName, it.displayName) }
+        }.onFailure { ServerState.warn("Geo proxy registration failed: ${it.message}") }
     }
 
     /** Install a plugin and hot-reload it into the running server. */
@@ -111,6 +132,12 @@ object BridgeRuntime {
             forceReloadPlugins()
         }
         return success
+    }
+
+    /** Full plugin reload that waits for any install/uninstall in progress (nightly maintenance). */
+    suspend fun reloadAllPluginsSafely() = pluginMutationMutex.withLock {
+        ServerState.info("Reloading all plugins…")
+        forceReloadPlugins()
     }
 
     /** Uninstall a plugin and hot-reload. */
@@ -234,6 +261,9 @@ object BridgeRuntime {
      */
     suspend fun startBridge(preferredPort: Int = 8080) {
         ServerState.updateStatus(ServerStatus.Starting("Loading plugin registry…"))
+        com.cncverse.stremiobridge.network.geo.GeoRouter.init(cacheDir)
+        com.cncverse.stremiobridge.state.StreamTracker.init(cacheDir)
+        com.cncverse.stremiobridge.maintenance.Maintenance.init(cacheDir)
         RepoManager.loadSavedRepos()
         // Drop extensions whose repo was deleted + stray .cs3/.jar files left by older builds
         val pruned = withContext(Dispatchers.IO) {
@@ -319,6 +349,9 @@ object BridgeRuntime {
 
         // Start 30-min extension update checker
         startPeriodicUpdateCheck()
+
+        // Nightly 00:00 IST: reload plugins, refresh home pages, health sweep, auto-uninstall
+        appScope?.let { com.cncverse.stremiobridge.maintenance.Maintenance.start(it) }
     }
 
     /** Launches a background loop that refreshes repos and auto-updates plugins every 30 minutes. */

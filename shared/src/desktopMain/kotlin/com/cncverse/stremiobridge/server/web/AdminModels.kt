@@ -52,6 +52,10 @@ data class AdminInstalledPluginInfo(
     val hasSettings: Boolean = false,
     val updateAvailable: Boolean = false,
     val newVersion: Int? = null,
+    val health: String = "unknown",
+    val autoUninstall: Boolean = false,
+    val proxyCountry: String? = null,
+    val proxyMode: String = "auto",
 )
 
 @Serializable
@@ -226,3 +230,72 @@ data class AdminFormatterPreview(
     val samples: List<AdminFormatterSample> = emptyList(),
 )
 
+
+// ─── Nightly maintenance / health / auto-uninstall ───────────────────────────
+
+@Serializable
+data class AdminAutoUninstallEntry(
+    val internalName: String,
+    val displayName: String,
+    val optedInAt: Long,
+    val status: String,
+    val lastSuccessTime: Long = 0,
+    /** Days left before it would be removed (null = not dead, nothing scheduled). */
+    val dueInDays: Double? = null,
+)
+
+@Serializable
+data class AdminMaintenanceInfo(
+    val nextRunAt: Long,
+    val running: Boolean,
+    val step: String? = null,
+    val lastRun: com.cncverse.stremiobridge.maintenance.MaintenanceRun? = null,
+    val sweep: com.cncverse.stremiobridge.maintenance.SweepState,
+    val autoUninstallDays: Int,
+    val optedIn: List<AdminAutoUninstallEntry> = emptyList(),
+    val history: List<com.cncverse.stremiobridge.maintenance.AutoUninstallRecord> = emptyList(),
+)
+
+@Serializable
+data class AdminMaintenanceRunRequest(val reload: Boolean = true, val sweep: Boolean = true)
+
+@Serializable
+data class AdminSweepRequest(val onlyStale: Boolean = false, val internalName: String? = null)
+
+@Serializable
+data class AdminDaysRequest(val days: Int)
+
+@Serializable
+data class AdminAutoUninstallToggle(val internalName: String, val enabled: Boolean)
+
+// ─── Geo proxy ───────────────────────────────────────────────────────────────
+
+@Serializable
+data class AdminGeoCountry(
+    val country: String,
+    val healthy: Int,
+    val refilling: Boolean,
+    val lastRefill: Long? = null,
+    val proxies: List<com.cncverse.stremiobridge.network.geo.PooledProxySnapshot>,
+)
+
+@Serializable
+data class AdminGeoSession(val key: String, val primary: String?, val standby: String?)
+
+@Serializable
+data class AdminGeoInfo(
+    val settings: com.cncverse.stremiobridge.network.geo.GeoProxySettings,
+    val countries: List<AdminGeoCountry>,
+    val plugins: List<com.cncverse.stremiobridge.network.geo.PluginGeoStatus>,
+    val events: List<com.cncverse.stremiobridge.network.geo.GeoEvent>,
+    val sessions: List<AdminGeoSession>,
+)
+
+@Serializable
+data class AdminGeoOverrideRequest(val plugin: String, val mode: String = "auto", val country: String? = null)
+
+@Serializable
+data class AdminGeoCountryRequest(val country: String, val key: String? = null)
+
+@Serializable
+data class AdminGeoPluginRequest(val plugin: String)

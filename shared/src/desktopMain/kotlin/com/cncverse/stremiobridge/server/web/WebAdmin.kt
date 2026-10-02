@@ -548,29 +548,165 @@ object WebAdmin {
                     if (api == null) {
                         return@post call.respond(AdminActionResult(false, "Source '$targetId' not found in loaded extensions"))
                     }
-                    ServerState.info("🔍 Probing source [${api.name}] with query '$query'...")
-                    val streamCount = StremioServer.probeApi(api, query)
-                    val msg = if (streamCount > 0) "✅ [${api.name}] Probe successful: $streamCount stream(s) found"
-                              else "❌ [${api.name}] Probe returned 0 streams"
-                    call.respond(AdminActionResult(streamCount > 0, msg))
+                    ServerState.info("🔍 Probing source [${api.name}] (home page → links; direct, then via proxy)…")
+                    val status = com.cncverse.stremiobridge.maintenance.HealthProbe.probe(api)
+                    val stat = StreamTracker.statOf(api.internalName)
+                    val note = stat?.lastProbeNote?.let { " — $it" } ?: ""
+                    val msg = when (status) {
+                        com.cncverse.stremiobridge.state.HealthStatus.WORKING -> "✅ [${api.name}] working directly$note"
+                        com.cncverse.stremiobridge.state.HealthStatus.PROXY -> "🌐 [${api.name}] works only via ${stat?.lastProxyCountry} proxy$note"
+                        com.cncverse.stremiobridge.state.HealthStatus.DEAD -> "❌ [${api.name}] dead (no links direct or via proxy)$note"
+                        else -> "❔ [${api.name}] inconclusive$note"
+                    }
+                    call.respond(AdminActionResult(status == "working" || status == "proxy", msg))
                 } else {
-                    // A full benchmark probes every extension (minutes of work on a small VPS):
-                    // allow one at a time so repeated clicks / tabs can't stack sweeps.
-                    if (!benchmarkRunning.compareAndSet(false, true)) {
-                        return@post call.respond(AdminActionResult(false, "A benchmark is already running — wait for it to finish"))
+                    // Full sweep runs in the background (minutes on a small VPS); the UI polls /maintenance
+                    if (com.cncverse.stremiobridge.maintenance.HealthSweep.isRunning()) {
+                        return@post call.respond(AdminActionResult(false, "A health sweep is already running"))
                     }
-                    try {
-                        ServerState.info("🔍 Running stream probe benchmark across all active providers (query: '$query')...")
-                        val results = StremioServer.probeAllApis(query)
-                        val success = results.values.count { it > 0 }
-                        val total = results.size
-                        val msg = "Benchmark complete: $success/$total active source(s) resolved streamable links"
-                        ServerState.info("🏁 $msg")
-                        call.respond(AdminActionResult(true, msg))
-                    } finally {
-                        benchmarkRunning.set(false)
-                    }
+                    scope().launch { com.cncverse.stremiobridge.maintenance.HealthSweep.run("admin", onlyStale = false) }
+                    call.respond(AdminActionResult(true, "Health sweep started — probing every extension (direct, then via proxy)"))
                 }
+            }
+
+            // ── Nightly maintenance / auto-uninstall ─────────────────────────
+
+            get("/maintenance") {
+                if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
+                val m = com.cncverse.stremiobridge.maintenance.Maintenance
+                val installed = RepoState.installedPlugins.value.associateBy { it.internalName }
+                val now = System.currentTimeMillis()
+                val dayMs = 24.0 * 60 * 60_000
+                val opted = m.optedInAll().mapNotNull { (p, at) ->
+                    val ip = installed[p] ?: return@mapNotNull null
+                    val s = StreamTracker.statOf(p)
+                    val status = s?.status(now) ?: com.cncverse.stremiobridge.state.HealthStatus.UNKNOWN
+                    val due = if (status == com.cncverse.stremiobridge.state.HealthStatus.DEAD && s != null) {
+                        val since = maxOf(s.lastSuccessTime, s.firstSeen, at)
+                        (m.autoUninstallDays * dayMs - (now - since)) / dayMs
+                    } else null
+                    AdminAutoUninstallEntry(p, ip.displayName, at, status, s?.lastSuccessTime ?: 0, due)
+                }.sortedBy { it.displayName.lowercase() }
+                call.respond(
+                    AdminMaintenanceInfo(
+                        nextRunAt = m.nextRunAt(),
+                        running = m.isRunning() || com.cncverse.stremiobridge.maintenance.HealthSweep.isRunning(),
+                        step = m.currentStep ?: (if (com.cncverse.stremiobridge.maintenance.HealthSweep.isRunning()) "Health sweep" else null),
+                        lastRun = m.lastRun,
+                        sweep = com.cncverse.stremiobridge.maintenance.HealthSweep.state,
+                        autoUninstallDays = m.autoUninstallDays,
+                        optedIn = opted,
+                        history = m.history,
+                    )
+                )
+            }
+
+            post("/maintenance/run") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val req = runCatching { call.receive<AdminMaintenanceRunRequest>() }.getOrDefault(AdminMaintenanceRunRequest())
+                val m = com.cncverse.stremiobridge.maintenance.Maintenance
+                if (m.isRunning()) return@post call.respond(AdminActionResult(false, "Maintenance is already running"))
+                scope().launch { m.runNow("admin", reload = req.reload, sweep = req.sweep) }
+                call.respond(AdminActionResult(true, "Maintenance started"))
+            }
+
+            post("/maintenance/sweep") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val req = runCatching { call.receive<AdminSweepRequest>() }.getOrDefault(AdminSweepRequest())
+                if (com.cncverse.stremiobridge.maintenance.HealthSweep.isRunning()) {
+                    return@post call.respond(AdminActionResult(false, "A health sweep is already running"))
+                }
+                val only = req.internalName?.takeIf { it.isNotBlank() }?.let { setOf(it) }
+                scope().launch { com.cncverse.stremiobridge.maintenance.HealthSweep.run("admin", req.onlyStale, only) }
+                call.respond(AdminActionResult(true, "Health sweep started"))
+            }
+
+            post("/maintenance/auto-uninstall/days") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val req = runCatching { call.receive<AdminDaysRequest>() }.getOrNull()
+                    ?: return@post call.respond(AdminActionResult(false, "Invalid request"))
+                com.cncverse.stremiobridge.maintenance.Maintenance.setAutoUninstallDays(req.days)
+                call.respond(AdminActionResult(true, "Auto-uninstall after ${com.cncverse.stremiobridge.maintenance.Maintenance.autoUninstallDays} day(s) without links"))
+            }
+
+            post("/maintenance/auto-uninstall/toggle") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val req = runCatching { call.receive<AdminAutoUninstallToggle>() }.getOrNull()
+                    ?: return@post call.respond(AdminActionResult(false, "Invalid request"))
+                val plugin = RepoState.installedPlugins.value.find { it.internalName == req.internalName }
+                    ?: return@post call.respond(AdminActionResult(false, "Extension not installed"))
+                com.cncverse.stremiobridge.maintenance.Maintenance.setAutoUninstall(plugin.internalName, req.enabled)
+                call.respond(AdminActionResult(true,
+                    if (req.enabled) "Auto-uninstall on for ${plugin.displayName}" else "Auto-uninstall off for ${plugin.displayName}"))
+            }
+
+            // ── Geo proxy pool ───────────────────────────────────────────────
+
+            get("/geo") {
+                if (!call.checkAdminAuth()) return@get call.respondUnauthorized()
+                val geo = com.cncverse.stremiobridge.network.geo.GeoRouter
+                val pool = com.cncverse.stremiobridge.network.geo.ProxyPool
+                val snap = pool.snapshot()
+                call.respond(
+                    AdminGeoInfo(
+                        settings = geo.settings,
+                        countries = snap.map { (c, list) ->
+                            AdminGeoCountry(c, pool.healthy(c).size, pool.isRefilling(c), pool.lastRefillAt(c), list)
+                        }.sortedBy { it.country },
+                        plugins = geo.pluginStatuses(),
+                        events = geo.recentEvents().take(60),
+                        sessions = geo.activeSessions().map { (k, v) -> AdminGeoSession(k, v.first, v.second) },
+                    )
+                )
+            }
+
+            post("/geo/settings") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val s = runCatching { call.receive<com.cncverse.stremiobridge.network.geo.GeoProxySettings>() }.getOrNull()
+                    ?: return@post call.respond(AdminActionResult(false, "Invalid settings"))
+                com.cncverse.stremiobridge.network.geo.GeoRouter.updateSettings(s)
+                call.respond(AdminActionResult(true, "Proxy settings saved"))
+            }
+
+            post("/geo/override") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val r = runCatching { call.receive<AdminGeoOverrideRequest>() }.getOrNull()
+                    ?: return@post call.respond(AdminActionResult(false, "Invalid request"))
+                if (r.mode !in setOf("auto", "off", "always")) return@post call.respond(AdminActionResult(false, "Mode must be auto, off or always"))
+                val country = r.country?.trim()?.uppercase()?.takeIf { it.isNotEmpty() }
+                if (country != null && !Regex("^[A-Z]{2}$").matches(country)) {
+                    return@post call.respond(AdminActionResult(false, "Country must be a 2-letter code (e.g. IN)"))
+                }
+                com.cncverse.stremiobridge.network.geo.GeoRouter.setOverride(
+                    r.plugin, com.cncverse.stremiobridge.network.geo.PluginGeoOverride(r.mode, country),
+                )
+                call.respond(AdminActionResult(true, "Proxy route for ${r.plugin}: ${r.mode}" + (country?.let { " ($it)" } ?: "")))
+            }
+
+            post("/geo/clear") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val r = runCatching { call.receive<AdminGeoPluginRequest>() }.getOrNull()
+                    ?: return@post call.respond(AdminActionResult(false, "Invalid request"))
+                com.cncverse.stremiobridge.network.geo.GeoRouter.clearLearned(r.plugin)
+                call.respond(AdminActionResult(true, "Forgot learned proxy routes for ${r.plugin}"))
+            }
+
+            post("/geo/refill") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val r = runCatching { call.receive<AdminGeoCountryRequest>() }.getOrNull()
+                val c = r?.country?.trim()?.uppercase()
+                if (c == null || !Regex("^[A-Z]{2}$").matches(c)) return@post call.respond(AdminActionResult(false, "Country must be a 2-letter code"))
+                com.cncverse.stremiobridge.network.geo.ProxyPool.demand(c)
+                com.cncverse.stremiobridge.network.geo.ProxyPool.refillAsync(c)
+                call.respond(AdminActionResult(true, "Building $c proxy pool in the background"))
+            }
+
+            post("/geo/remove-proxy") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val r = runCatching { call.receive<AdminGeoCountryRequest>() }.getOrNull()
+                    ?: return@post call.respond(AdminActionResult(false, "Invalid request"))
+                val ok = com.cncverse.stremiobridge.network.geo.ProxyPool.removeProxy(r.country, r.key ?: "")
+                call.respond(AdminActionResult(ok, if (ok) "Proxy removed" else "Proxy not found"))
             }
 
 
@@ -790,6 +926,10 @@ object WebAdmin {
                 hasSettings = loaded?.hasSettings ?: false,
                 updateAvailable = installState is PluginInstallState.UpdateAvailable,
                 newVersion = (installState as? PluginInstallState.UpdateAvailable)?.newVersion,
+                health = StreamTracker.statusOf(inst.internalName),
+                autoUninstall = com.cncverse.stremiobridge.maintenance.Maintenance.optedIn(inst.internalName),
+                proxyCountry = com.cncverse.stremiobridge.network.geo.GeoRouter.countryFor(inst.internalName),
+                proxyMode = com.cncverse.stremiobridge.network.geo.GeoRouter.overrideMode(inst.internalName),
             )
         }
 

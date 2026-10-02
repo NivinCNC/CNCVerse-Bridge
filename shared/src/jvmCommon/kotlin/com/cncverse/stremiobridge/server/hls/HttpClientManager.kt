@@ -46,6 +46,71 @@ object HttpClientManager {
         .retryOnConnectionFailure(true)
         .build()
 
+    /** Pseudo-header (h_x_cnc_plugin) naming the plugin a relayed stream came from. */
+    const val PLUGIN_HEADER = "X-Cnc-Plugin"
+
+    private fun pluginOf(headers: Map<String, String>): String? =
+        headers.entries.firstOrNull { it.key.equals(PLUGIN_HEADER, ignoreCase = true) }?.value?.takeIf { it.isNotBlank() }
+
+    private val PROXY_RETRY_CODES = setOf(403, 407, 429, 451, 502, 503, 504)
+
+    /**
+     * Executes a relay request. Streams of plugins that are routed through a
+     * geo proxy use a sticky proxy with a hot standby (see
+     * [com.cncverse.stremiobridge.network.geo.GeoRouter.StickySession]): a
+     * failing proxy is swapped for the standby within the same request. If the
+     * direct fetch of a proxied plugin's CDN is refused, the CDN host is
+     * learned as blocked and retried through the pool.
+     */
+    private fun routed(request: Request, proxyUrl: String?, url: String?, plugin: String?): Response {
+        if (proxyUrl != null || plugin == null || url?.let { DomainProxyInterceptor.ULTRASURF_IN.proxyUrlFor(it) } != null) {
+            return createClient(proxyUrl, url).newCall(request).execute()
+        }
+        val host = request.url.host
+        val geo = com.cncverse.stremiobridge.network.geo.GeoRouter
+        geo.streamSession(plugin, host)?.let { session ->
+            viaSession(session, request)?.let { return it }
+            return baseClient.newCall(request).execute()
+        }
+        // Not routed yet: direct first; a refusal on a plugin that already needs a
+        // proxy elsewhere means its CDN is geo-blocked too.
+        val direct = try {
+            baseClient.newCall(request).execute()
+        } catch (e: java.io.IOException) {
+            val session = geo.learnStreamHostBlocked(plugin, host) ?: throw e
+            return viaSession(session, request) ?: throw e
+        }
+        if (direct.code != 403 && direct.code != 451) return direct
+        val session = geo.learnStreamHostBlocked(plugin, host) ?: return direct
+        val viaProxy = viaSession(session, request) ?: return direct
+        direct.close()
+        return viaProxy
+    }
+
+    private fun viaSession(
+        session: com.cncverse.stremiobridge.network.geo.GeoRouter.StickySession,
+        request: Request,
+    ): Response? {
+        repeat(3) {
+            val p = session.current() ?: return null
+            val started = System.currentTimeMillis()
+            try {
+                val resp = com.cncverse.stremiobridge.network.geo.ProxyPool
+                    .clientFor(p.endpoint, streaming = true).newCall(request).execute()
+                if (resp.code in PROXY_RETRY_CODES) {
+                    resp.close()
+                    session.failover(p, "HTTP ${resp.code}")
+                } else {
+                    com.cncverse.stremiobridge.network.geo.ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
+                    return resp
+                }
+            } catch (e: java.io.IOException) {
+                session.failover(p, e.javaClass.simpleName)
+            }
+        }
+        return null
+    }
+
     fun createClient(proxyUrl: String? = null, url: String? = null): OkHttpClient {
         val resolvedProxy = proxyUrl
             ?: url?.let { DomainProxyInterceptor.ULTRASURF_IN.proxyUrlFor(it) }
@@ -71,10 +136,9 @@ object HttpClientManager {
         headers: Map<String, String> = emptyMap(),
         proxyUrl: String? = null
     ): String {
-        val client = createClient(proxyUrl, url)
         val request = buildRequest(url, headers)
 
-        return client.newCall(request).execute().use { response ->
+        return routed(request, proxyUrl, url, pluginOf(headers)).use { response ->
             if (!response.isSuccessful) {
                 throw Exception("HTTP ${response.code}: ${response.message}")
             }
@@ -90,10 +154,9 @@ object HttpClientManager {
         headers: Map<String, String> = emptyMap(),
         proxyUrl: String? = null
     ): ByteArray {
-        val client = createClient(proxyUrl, url)
         val request = buildRequest(url, headers)
 
-        return client.newCall(request).execute().use { response ->
+        return routed(request, proxyUrl, url, pluginOf(headers)).use { response ->
             if (!response.isSuccessful) {
                 throw Exception("HTTP ${response.code}: ${response.message}")
             }
@@ -109,10 +172,9 @@ object HttpClientManager {
         headers: Map<String, String> = emptyMap(),
         proxyUrl: String? = null
     ): Response {
-        val client = createClient(proxyUrl, url)
         val request = buildRequest(url, headers)
 
-        val response = client.newCall(request).execute()
+        val response = routed(request, proxyUrl, url, pluginOf(headers))
         if (!response.isSuccessful) {
             response.close()
             throw Exception("HTTP ${response.code}: ${response.message}")
@@ -130,11 +192,10 @@ object HttpClientManager {
         contentType: String = "application/x-www-form-urlencoded",
         proxyUrl: String? = null
     ): String {
-        val client = createClient(proxyUrl, url)
         val requestBody = body.toRequestBody(contentType.toMediaType())
         val request = buildRequest(url, headers, requestBody)
 
-        return client.newCall(request).execute().use { response ->
+        return routed(request, proxyUrl, url, pluginOf(headers)).use { response ->
             if (!response.isSuccessful) {
                 throw Exception("HTTP ${response.code}: ${response.message}")
             }
@@ -150,10 +211,9 @@ object HttpClientManager {
         headers: Map<String, String> = emptyMap(),
         proxyUrl: String? = null
     ): Headers {
-        val client = createClient(proxyUrl, url)
         val request = buildRequest(url, headers, method = "HEAD")
 
-        return client.newCall(request).execute().use { response ->
+        return routed(request, proxyUrl, url, pluginOf(headers)).use { response ->
             response.headers
         }
     }
@@ -195,6 +255,8 @@ object HttpClientManager {
             if (key.equals("Accept-Encoding", ignoreCase = true)) {
                 return@forEach
             }
+            // Routing hint only — never sent upstream
+            if (key.equals(PLUGIN_HEADER, ignoreCase = true)) return@forEach
             requestBuilder.addHeader(key, value)
         }
 

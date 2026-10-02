@@ -1239,6 +1239,12 @@ object StremioServer {
                         put("iconUrl", kotlinx.serialization.json.JsonPrimitive(plugin?.iconUrl.orEmpty()))
                         put("description", kotlinx.serialization.json.JsonPrimitive(plugin?.description?.replace("\n", " ").orEmpty()))
                         put("types", kotlinx.serialization.json.JsonArray(types.map { kotlinx.serialization.json.JsonPrimitive(it) }))
+                        // working | proxy | dead | unknown — from real traffic + the nightly probe
+                        val stat = com.cncverse.stremiobridge.state.StreamTracker.statOf(api.internalName)
+                            ?: com.cncverse.stremiobridge.state.StreamTracker.statOf(api.pluginInternalName)
+                        put("health", kotlinx.serialization.json.JsonPrimitive(stat?.status() ?: com.cncverse.stremiobridge.state.HealthStatus.UNKNOWN))
+                        put("lastSuccess", kotlinx.serialization.json.JsonPrimitive(stat?.lastSuccessTime ?: 0L))
+                        put("lastChecked", kotlinx.serialization.json.JsonPrimitive(stat?.lastProbeTime ?: 0L))
                     })
                 }
                 }
@@ -5469,6 +5475,12 @@ interface MainApiWrapper {
     /** The bare plugin internalName used for repo/settings lookups (no API-name suffix). */
     val pluginInternalName: String get() = internalName
     val supportedTypes: List<String>
+    /** Home-page section names declared by the API (no network). */
+    val staticSectionNames: List<String> get() = emptyList()
+    /** MainAPI.lang as declared by the extension. */
+    val apiLang: String? get() = null
+    /** Language from the repo manifest. */
+    val pluginLanguage: String? get() = null
     suspend fun getMainPageSections(): List<String>
     fun clearCache() {}
 

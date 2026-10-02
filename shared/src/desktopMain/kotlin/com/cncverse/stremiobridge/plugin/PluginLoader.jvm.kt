@@ -138,7 +138,10 @@ actual class PluginLoader {
 
     /** Reconfigures the global NiceHttp `app` client used by plugins with AdaptiveHostDns + CloudflareKiller. */
     private fun configureAppClientNetwork() {
-        java.net.ProxySelector.setDefault(com.cncverse.stremiobridge.network.UltrasurfProxySelector)
+        java.net.ProxySelector.setDefault(
+            com.cncverse.stremiobridge.network.geo.GeoRouter.Selector(com.cncverse.stremiobridge.network.UltrasurfProxySelector)
+        )
+        com.cncverse.stremiobridge.network.geo.NetContext.stackResolver = { PluginCallContext.getCallingPluginName() }
         ServerState.info("Installed UltrasurfProxySelector as JVM default (covers all OkHttpClient instances)")
 
         val cfKiller = com.lagradost.cloudstream3.network.CloudflareKiller()
@@ -160,6 +163,7 @@ actual class PluginLoader {
             val newOk = existingOk.newBuilder()
                 .addInterceptor(cfKiller)
                 .addInterceptor(com.cncverse.stremiobridge.network.DomainProxyInterceptor.ULTRASURF_IN)
+                .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
                 .dns(AdaptiveHostDns)
                 .fastFallback(true)
                 .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
@@ -200,6 +204,7 @@ actual class PluginLoader {
                         val patched = existing.newBuilder()
                             .addInterceptor(cfKiller)
                             .addInterceptor(com.cncverse.stremiobridge.network.DomainProxyInterceptor.ULTRASURF_IN)
+                            .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
                             .dns(AdaptiveHostDns)
                             .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
                             .eventListenerFactory(LeakSafeEventListener.FACTORY)
@@ -246,6 +251,7 @@ actual class PluginLoader {
                     val patched = existing.newBuilder()
                         .addInterceptor(cfKiller)
                         .addInterceptor(com.cncverse.stremiobridge.network.DomainProxyInterceptor.ULTRASURF_IN)
+                        .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
                         .build()
                     okField.set(requests, patched)
                     ServerState.info("[CF] Patched CloudflareKiller + UltrasurfIN proxy into com.horis.cncverse.UtilsKt.app")
@@ -719,6 +725,7 @@ private class LeakSafeEventListener : EventListener() {
     }
 
     private fun closeIfLeaked(call: Call) {
+        com.cncverse.stremiobridge.network.geo.NetContext.forget(call)
         val ref = liveResponses.remove(call) ?: return
         val response = ref.get() ?: return
         try {
@@ -733,7 +740,12 @@ private class LeakSafeEventListener : EventListener() {
 
     companion object {
         /** Singleton factory — one listener instance per call (stateful, not shared). */
-        val FACTORY: Factory = Factory { LeakSafeEventListener() }
+        // create() runs on the thread that built the Call (the plugin coroutine), so it is
+        // where the call gets tagged with its plugin for geo proxy routing.
+        val FACTORY: Factory = Factory { call ->
+            com.cncverse.stremiobridge.network.geo.NetContext.attributeCall(call)
+            LeakSafeEventListener()
+        }
     }
 }
 
@@ -761,6 +773,14 @@ private class DirectMainApiWrapper(
     override val name: String get() = api.name
     override val internalName: String get() = plugin.internalName + "_" + StremioServer.publicNameSlug(api.name)
     override val pluginInternalName: String get() = plugin.internalName
+
+    /** Tags all network traffic of these calls with the plugin (geo proxy routing). */
+    private val netCtx = com.cncverse.stremiobridge.network.geo.NetContext.PluginNetElement(plugin.internalName)
+
+    override val staticSectionNames: List<String> get() = runCatching { api.mainPage.map { it.name } }.getOrDefault(emptyList())
+    override val apiLang: String? get() = runCatching { api.lang }.getOrNull()
+    override val pluginLanguage: String? get() = plugin.language
+
     override val supportedTypes: List<String> get() {
         val hasLive = api.supportedTypes.any { it.name.equals("Live", ignoreCase = true) }
         val isOnlyLive = api.supportedTypes.size == 1 && hasLive
@@ -798,7 +818,7 @@ private class DirectMainApiWrapper(
         return staticSections
     }
 
-    override suspend fun search(query: String): List<SearchResult> = withContext(Dispatchers.IO) {
+    override suspend fun search(query: String): List<SearchResult> = withContext(Dispatchers.IO + netCtx) {
         try {
             val rawResults: List<*>? = try {
                 api.search(query)
@@ -813,7 +833,7 @@ private class DirectMainApiWrapper(
         }
     }
 
-    override suspend fun getMainPage(page: Int, type: String, sectionName: String?): List<SearchResult> = withContext(Dispatchers.IO) {
+    override suspend fun getMainPage(page: Int, type: String, sectionName: String?): List<SearchResult> = withContext(Dispatchers.IO + netCtx) {
         try {
             val mainPageDataList = api.mainPage
             val allResults = mutableListOf<SearchResult>()
@@ -870,7 +890,7 @@ private class DirectMainApiWrapper(
         }
     }
 
-    override suspend fun load(url: String): MediaInfo? = withContext(Dispatchers.IO) {
+    override suspend fun load(url: String): MediaInfo? = withContext(Dispatchers.IO + netCtx) {
         try {
             val resp = api.load(url) ?: return@withContext null
             (resp as Any).reflectToMediaInfo(url)
@@ -880,7 +900,7 @@ private class DirectMainApiWrapper(
         }
     }
 
-    override suspend fun loadLinks(dataUrl: String): List<StremioStream> = withContext(Dispatchers.IO) {
+    override suspend fun loadLinks(dataUrl: String): List<StremioStream> = withContext(Dispatchers.IO + netCtx) {
         val streams = mutableListOf<StremioStream>()
         val subtitles = mutableListOf<StremioSubtitle>()
         ServerState.info("loadLinks called: plugin=${plugin.name} dataUrl=$dataUrl")
@@ -897,7 +917,7 @@ private class DirectMainApiWrapper(
                     }
                 }, { link: ExtractorLink ->
                     callbackCount++
-                    val newStreams = (link as Any).reflectToStreams(plugin.name, api)
+                    val newStreams = (link as Any).reflectToStreams(plugin.name, api, plugin.internalName)
                     newStreams.forEach { st ->
                         val u = st.url ?: st.hashCode().toString()
                         if (seenStreamUrls.add(u)) {
@@ -1068,7 +1088,7 @@ private fun Any.reflectToMediaInfo(originalUrl: String): MediaInfo? {
     }
 }
 
-private fun Any.reflectToStreams(pluginName: String, api: MainAPI? = null): List<StremioStream> {
+private fun Any.reflectToStreams(pluginName: String, api: MainAPI? = null, pluginInternalName: String? = null): List<StremioStream> {
     return try {
         val cls = this.javaClass
         val rawUrl = runCatching { cls.getMethod("getUrl").invoke(this) as? String }
@@ -1206,7 +1226,10 @@ private fun Any.reflectToStreams(pluginName: String, api: MainAPI? = null): List
                 "&h_${java.net.URLEncoder.encode(key, "UTF-8")}=${java.net.URLEncoder.encode(value, "UTF-8")}"
             }
             val clearKeyParam = if (!clearkeyHex.isNullOrBlank()) "&clearkey=$clearkeyHex" else ""
-            finalUrl = "$proxyBase/proxy/mpd/manifest.m3u8?d=$encodedMpdUrl$clearKeyParam$headerParams"
+            // Rides along with the h_ header params to every child playlist/segment so the
+            // relay can route this plugin's CDN through its geo proxy (stripped before sending)
+            val pluginParam = pluginInternalName?.let { "&h_x_cnc_plugin=" + java.net.URLEncoder.encode(it, "UTF-8") } ?: ""
+            finalUrl = "$proxyBase/proxy/mpd/manifest.m3u8?d=$encodedMpdUrl$clearKeyParam$headerParams$pluginParam"
             ServerState.info("Rewrote MPD to Proxy: $finalUrl")
         }
 
