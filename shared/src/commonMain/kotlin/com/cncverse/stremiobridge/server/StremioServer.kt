@@ -1447,7 +1447,7 @@ object StremioServer {
             val skip = request.queryParameters["skip"]?.toIntOrNull() ?: 0
 
             val metas = withContext(pluginDispatcher) { buildCatalog(type, id, search, skip, null, profileId) }
-            respond(StremioCatalogResponse(metas))
+            respondCatalogJson(metas, cacheable = search.isNullOrBlank())
         } else if (pathSegments.size == 3) {
             val id = pathSegments[1]
             val extraWithExt = pathSegments[2]
@@ -1464,10 +1464,38 @@ object StremioServer {
             val genre = parsedExtra["genre"]
 
             val metas = withContext(pluginDispatcher) { buildCatalog(type, id, search, skip, genre, profileId) }
-            respond(StremioCatalogResponse(metas))
+            respondCatalogJson(metas, cacheable = search.isNullOrBlank())
         } else {
             respond(HttpStatusCode.BadRequest)
         }
+    }
+
+    /**
+     * Big home-page catalogs (live TV playlists: thousands of channels) are served from
+     * homePageCatalogCache as the same list instance until refreshed, yet were re-encoded to
+     * JSON on every request — one of the larger CPU costs. Their bytes are kept with the exact
+     * list they came from (identity check), so a refreshed page is re-encoded once and a stale
+     * encoding can never be served.
+     */
+    private class EncodedCatalog(val metas: List<StremioMeta>, val bytes: ByteArray)
+    private val encodedCatalogs = ConcurrentHashMap<Int, EncodedCatalog>()
+    private const val ENCODE_CACHE_MIN_ITEMS = 200
+    private const val ENCODE_CACHE_MAX = 64
+
+    private suspend fun ApplicationCall.respondCatalogJson(metas: List<StremioMeta>, cacheable: Boolean) {
+        if (!cacheable || metas.size < ENCODE_CACHE_MIN_ITEMS) {
+            respond(StremioCatalogResponse(metas))
+            return
+        }
+        val key = System.identityHashCode(metas)
+        val bytes = encodedCatalogs[key]?.takeIf { it.metas === metas }?.bytes
+            ?: withContext(Dispatchers.Default) {
+                serverJson.encodeToString(StremioCatalogResponse.serializer(), StremioCatalogResponse(metas)).toByteArray()
+            }.also {
+                if (encodedCatalogs.size >= ENCODE_CACHE_MAX) encodedCatalogs.clear()
+                encodedCatalogs[key] = EncodedCatalog(metas, it)
+            }
+        respondBytes(bytes, io.ktor.http.ContentType.Application.Json)
     }
 
     private suspend fun ApplicationCall.respondMeta(profileId: String?) {
