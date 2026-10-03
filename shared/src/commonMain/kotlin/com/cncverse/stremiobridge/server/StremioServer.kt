@@ -1942,10 +1942,16 @@ object StremioServer {
     }
 
     private val TMDB_API_KEY = "1865f43a0549ca50d341dd9ab8b29f49"
+    // api.tmdb.org answers in ~0.4 s from the server; api.themoviedb.org (same API) gets its
+    // connections reset about half the time (hostname filtered on Indian networks). Both are
+    // asked at once and the first answer wins, so a hiccup on one costs nothing. A short
+    // per-host timeout was tried instead: under load the server itself was slower than that
+    // and every lookup failed.
     private val TMDB_HOSTS = listOf(
         "https://api.tmdb.org/3",
         "https://api.themoviedb.org/3"
     )
+    private const val TMDB_TIMEOUT_MS = 8_000L
 
     /** TMDB/IMDb id → (title, year). Bounded LRU: one entry per title ever requested would grow forever. */
     private val genericMediaCache: MutableMap<String, Pair<String, Int?>> = java.util.Collections.synchronizedMap(
@@ -1957,22 +1963,33 @@ object StremioServer {
     private suspend fun fetchTmdbJson(endpointPathAndQuery: String): JsonObject? {
         val cleanPath = endpointPathAndQuery.trimStart('/')
         val delimiter = if (cleanPath.contains("?")) "&" else "?"
-        for (host in TMDB_HOSTS) {
-            val url = "$host/$cleanPath${delimiter}api_key=$TMDB_API_KEY"
-            try {
-                ServerState.debug("Fetching TMDB: $url")
-                val responseText = withTimeoutOrNull(5_000) {
-                    httpClient.get(url).bodyAsText()
-                } ?: run {
-                    ServerState.warn("TMDB timeout on $host, trying fallback...")
-                    null
-                } ?: continue
-                return serverJson.parseToJsonElement(responseText).jsonObject
-            } catch (e: Throwable) {
-                ServerState.warn("TMDB error on $host: ${e.message?.take(80)}, trying fallback...")
+        val answers = kotlinx.coroutines.channels.Channel<JsonObject?>(TMDB_HOSTS.size)
+        return coroutineScope {
+            val tries = TMDB_HOSTS.map { host ->
+                launch {
+                    val url = "$host/$cleanPath${delimiter}api_key=$TMDB_API_KEY"
+                    ServerState.debug("Fetching TMDB: $url")
+                    val json = try {
+                        serverJson.parseToJsonElement(httpClient.get(url).bodyAsText()).jsonObject
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        ServerState.debug("TMDB error on $host: ${e.message?.take(80)}")
+                        null
+                    }
+                    answers.send(json)
+                }
             }
+            // First successful answer wins; a failed host just leaves it to the other one
+            val result = withTimeoutOrNull(TMDB_TIMEOUT_MS) {
+                var found: JsonObject? = null
+                repeat(TMDB_HOSTS.size) { if (found == null) found = answers.receive() }
+                found
+            }
+            tries.forEach { it.cancel() }
+            if (result == null) ServerState.warn("TMDB lookup failed on all hosts: $cleanPath")
+            result
         }
-        return null
     }
 
     private suspend fun resolveGenericMedia(type: String, tmdbId: String): Pair<String, Int?>? {
@@ -1987,7 +2004,7 @@ object StremioServer {
             try {
                 val cinemetaType = if (type == "series") "series" else "movie"
                 val cinemetaUrl = "https://v3-cinemeta.strem.io/meta/$cinemetaType/$tmdbId.json"
-                val responseText = withTimeoutOrNull(4_000) {
+                val responseText = withTimeoutOrNull(8_000) {
                     httpClient.get(cinemetaUrl).bodyAsText()
                 }
                 if (responseText != null) {
@@ -2343,7 +2360,14 @@ object StremioServer {
         val mediaType = if (type == "series") "tv" else "movie"
         val tmdbId = baseId
 
-        ServerState.info("Generic request: id=$id, type=$type, baseId=$baseId, tmdbId=$tmdbId")
+        // Stremio asks every add-on for streams, including other add-ons' items (xtream:…,
+        // nuvio_sport_…, mb:…): only IMDb (tt…) and TMDB ids can be looked up — anything else
+        // used to cost a Cinemeta + TMDB round trip that could never succeed.
+        if (!(baseId.matches(IMDB_ID) || (baseId.isNotEmpty() && baseId.all(Char::isDigit)))) {
+            return emptyList()
+        }
+
+        ServerState.debug("Generic request: id=$id, type=$type, baseId=$baseId, tmdbId=$tmdbId")
 
         // Key on the exact set of extensions this request may use, so profiles with
         // different opt-ins / disables and admin enable/disable changes never share results.
@@ -2442,6 +2466,7 @@ object StremioServer {
         .replace(MULTI_SPACE, " ")
         .trim()
 
+    private val IMDB_ID = Regex("tt[0-9]+")
     private val TITLE_PUNCT = Regex("[^\\p{L}\\p{N}]+")
     private val MULTI_SPACE = Regex("\\s+")
 

@@ -171,6 +171,7 @@ actual class PluginLoader {
                 .readTimeout(35, java.util.concurrent.TimeUnit.SECONDS)
                 .retryOnConnectionFailure(true)
                 .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
+                .addInterceptor(TMDB_HOST_REWRITE)
                 .dispatcher(PLUGIN_DISPATCHER)
                 .eventListenerFactory(LeakSafeEventListener.FACTORY)
                 .build()
@@ -208,6 +209,7 @@ actual class PluginLoader {
                             .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
                             .dns(AdaptiveHostDns)
                             .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
+                            .addInterceptor(TMDB_HOST_REWRITE)
                             .dispatcher(PLUGIN_DISPATCHER)
                             .eventListenerFactory(LeakSafeEventListener.FACTORY)
                             .build()
@@ -254,6 +256,7 @@ actual class PluginLoader {
                         .addInterceptor(cfKiller)
                         .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
                         // Tags each call with its plugin — without it geo routing sees no plugin
+                        .addInterceptor(TMDB_HOST_REWRITE)
                         .dispatcher(PLUGIN_DISPATCHER)
                         .eventListenerFactory(LeakSafeEventListener.FACTORY)
                         .build()
@@ -699,6 +702,34 @@ actual class PluginLoader {
 }
 
 /**
+ * api.themoviedb.org has its connections reset about half the time from the server (India:
+ * the hostname is filtered on many networks); api.tmdb.org is the same API and answers
+ * reliably. Plugins hard-code the former, so their requests are pointed at the latter.
+ */
+internal val TMDB_HOST_REWRITE = okhttp3.Interceptor { chain ->
+    val req = chain.request()
+    if (req.url.host.equals("api.themoviedb.org", ignoreCase = true)) {
+        chain.proceed(req.newBuilder().url(req.url.newBuilder().host("api.tmdb.org").build()).build())
+    } else {
+        chain.proceed(req)
+    }
+}
+
+/**
+ * One dispatcher for every plugin HTTP client. NiceHttp sends requests asynchronously, and
+ * the clients were derived (newBuilder) from one with OkHttp's default dispatcher: 64 requests
+ * in flight server-wide, 5 per host. With dozens of providers per stream request plus home
+ * pages and probes, calls queued for seconds before leaving — sites answering in 0.3 s took
+ * 6–13 s inside the bridge and providers hit their 38 s timeout. 512/32 went the other way:
+ * ~930 threads parsing at once pinned both vCPUs (0% idle, load ~30); 160 still did. The
+ * per-host cap of 5 was the real queue, so: 16 per host, 96 in total.
+ */
+internal val PLUGIN_DISPATCHER = okhttp3.Dispatcher().apply {
+    maxRequests = 96
+    maxRequestsPerHost = 16
+}
+
+/**
  * OkHttp EventListener that auto-closes any [Response] body left open when
  * a [Call] finishes (normally or with a failure). Plugins call NiceHttp inside
  * coroutine callbacks and sometimes exit before consuming/closing the body
@@ -710,18 +741,6 @@ actual class PluginLoader {
  * in [callEnd]/[callFailed] if OkHttp's internal isCanceled/consumed flag is
  * not already set.
  */
-/**
- * One dispatcher for every plugin HTTP client. NiceHttp sends requests asynchronously, and
- * the clients were derived (newBuilder) from one with OkHttp's default dispatcher: 64 requests
- * in flight server-wide, 5 per host. With dozens of providers per stream request plus home
- * pages and probes, calls queued for seconds before leaving — sites answering in 0.3 s took
- * 6–13 s inside the bridge and providers hit their 38 s timeout.
- */
-internal val PLUGIN_DISPATCHER = okhttp3.Dispatcher().apply {
-    maxRequests = 512
-    maxRequestsPerHost = 32
-}
-
 private class LeakSafeEventListener : EventListener() {
 
     // Map from Call to the latest Response received for that call.
