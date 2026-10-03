@@ -721,12 +721,14 @@ internal val TMDB_HOST_REWRITE = okhttp3.Interceptor { chain ->
  * in flight server-wide, 5 per host. With dozens of providers per stream request plus home
  * pages and probes, calls queued for seconds before leaving — sites answering in 0.3 s took
  * 6–13 s inside the bridge and providers hit their 38 s timeout. 512/32 went the other way:
- * ~930 threads parsing at once pinned both vCPUs (0% idle, load ~30); 160 still did. The
- * per-host cap of 5 was the real queue, so: 16 per host, 96 in total.
+ * ~930 threads parsing at once pinned both vCPUs (0% idle, load ~30). 96 total / 16 per host
+ * broke streams: a handful of dead hosts (DNS failures, connect timeouts) held all 96 slots for
+ * 20–35 s each and every other plugin request timed out. So a small per-host cap — one bad host
+ * can't take over — and a larger total for everything healthy.
  */
 internal val PLUGIN_DISPATCHER = okhttp3.Dispatcher().apply {
-    maxRequests = 96
-    maxRequestsPerHost = 16
+    maxRequests = 256
+    maxRequestsPerHost = 8
 }
 
 /**

@@ -2229,8 +2229,6 @@ object StremioServer {
      * gets a response well within its 60-second addon timeout.
      */
     private val STREAM_DEADLINE_MS = 45_000L
-    /** Answer with what is there after this long; slow providers keep filling the cache. */
-    private val STREAM_SOFT_DEADLINE_MS = 8_000L
     private val PROVIDER_TIMEOUT_MS = 38_000L
     private val streamSearchScope = CoroutineScope(pluginDispatcher + SupervisorJob())
 
@@ -2396,56 +2394,36 @@ object StremioServer {
                 }
                 ServerState.debug("Searching across ${activePlugins.size} plugin(s) (live-TV-only excluded)...")
 
-                // Every provider at once (HTTP is already bounded by the plugin dispatcher); they used
-                // to run 20 at a time, so a provider stuck for 38 s held a slot and pushed the rest back.
-                val started = System.currentTimeMillis()
+                val sem = Semaphore(20)
                 val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
-                val tookMs = ConcurrentHashMap<String, Long>()
                 val jobs = activePlugins.map { api ->
                     streamSearchScope.launch {
-                        val res = withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
-                            try {
-                                val streams = buildGenericStreamsForApi(api, type, id, title, year)
-                                accumulated.addAll(streams)
-                            } catch (e: kotlinx.coroutines.CancellationException) {
-                                throw e
-                            } catch (e: Throwable) {
-                                ServerState.warn("[${api.name}] Generic stream error: ${e.message}")
-                                StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, e.message ?: "Stream error")
+                        sem.withPermit {
+                            val res = withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
+                                try {
+                                    val streams = buildGenericStreamsForApi(api, type, id, title, year)
+                                    accumulated.addAll(streams)
+                                } catch (e: Throwable) {
+                                    ServerState.warn("[${api.name}] Generic stream error: ${e.message}")
+                                    StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, e.message ?: "Stream error")
+                                }
                             }
-                        }
-                        tookMs[api.name] = System.currentTimeMillis() - started
-                        if (res == null) {
-                            ServerState.debug("[STREAM_TIMEOUT] [${api.name}] Provider timed out after ${PROVIDER_TIMEOUT_MS}ms")
-                            StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Timed out after ${PROVIDER_TIMEOUT_MS}ms")
+                            if (res == null) {
+                                ServerState.debug("[STREAM_TIMEOUT] [${api.name}] Provider timed out after ${PROVIDER_TIMEOUT_MS}ms")
+                                StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Timed out after ${PROVIDER_TIMEOUT_MS}ms")
+                            }
                         }
                     }
                 }
 
-                // Answer once STREAM_SOFT_DEADLINE_MS has passed and there is something to show (or
-                // everything finished); with nothing yet, keep waiting up to STREAM_DEADLINE_MS.
-                // Slow providers are NOT cancelled: they finish in the background into the
-                // per-provider stream cache, so the next open of this title has them instantly.
-                withTimeoutOrNull(STREAM_DEADLINE_MS) {
-                    while (jobs.any { it.isActive }) {
-                        val elapsed = System.currentTimeMillis() - started
-                        if (elapsed >= STREAM_SOFT_DEADLINE_MS && accumulated.isNotEmpty()) break
-                        delay(200)
-                    }
-                }
+                withTimeoutOrNull(STREAM_DEADLINE_MS) { jobs.joinAll() }
                 val remaining = jobs.count { it.isActive }
-                val elapsed = System.currentTimeMillis() - started
-                val slowest = tookMs.entries.sortedByDescending { it.value }.take(3)
-                    .joinToString { "${it.key} ${it.value / 1000}s" }
-                val pending = activePlugins.filter { tookMs[it.name] == null }.take(4).joinToString { it.name }
-                ServerState.info(
-                    "[Streams] '$title': ${accumulated.size} streams in ${elapsed / 1000.0}s — " +
-                        "${activePlugins.size - remaining}/${activePlugins.size} providers done" +
-                        (if (remaining > 0) ", still running in background: $pending${if (remaining > 4) "…" else ""}" else "") +
-                        (if (slowest.isNotEmpty()) " | slowest done: $slowest" else "")
-                )
-                // Only a complete result is cached; an early answer is served once and the next
-                // request re-collects (fast: finished providers come from their own cache).
+                if (remaining > 0) {
+                    ServerState.warn("Deadline reached ($STREAM_DEADLINE_MS ms) — returning ${accumulated.size} stream(s), cancelling $remaining slow provider(s)")
+                    jobs.forEach { it.cancel() }
+                }
+                ServerState.info("Returning total ${accumulated.size} streams")
+                // Only a complete result is cached; a deadline-cut partial list is served once.
                 com.cncverse.stremiobridge.cache.StreamCacheManager.FetchResult(
                     sortStreamsByQuality(accumulated),
                     cacheable = remaining == 0,
