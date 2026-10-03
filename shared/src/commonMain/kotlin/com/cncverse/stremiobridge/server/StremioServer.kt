@@ -560,6 +560,75 @@ object StremioServer {
         }
     }
 
+    // ── Per-profile extension limit ───────────────────────────────────────────
+
+    /**
+     * A profile may have at most this many extensions switched on. Profiles that opted into
+     * every installed extension (~530) made each stream request search hundreds of providers,
+     * which is what kept the server's CPU pinned.
+     */
+    val MAX_PROFILE_EXTENSIONS = 50
+
+    /**
+     * One card per loaded source, exactly as the profile page lists them (/api/extensions):
+     * id = unambiguousSlug(api) ?: internalName; [globallyOn] = switched on for everyone.
+     * The limit counts these, so the page, the save check and the trim always agree.
+     */
+    private class ExtCard(val id: String, val globallyOn: Boolean, val statKey: String)
+
+    private fun extCards(): List<ExtCard> =
+        loadedApis.map { ExtCard(unambiguousSlug(it) ?: it.internalName, !isGloballyDisabled(it), it.internalName) }
+            .distinctBy { it.id }
+
+    /** Cards a profile with these choices has switched on (same rule as the page's isExtActive). */
+    private fun activeCards(disabled: Set<String>, overrides: Set<String>, cards: List<ExtCard>): List<ExtCard> =
+        cards.filter { if (it.globallyOn) it.id !in disabled else it.id in overrides }
+
+    fun enabledExtensionCount(profileId: String): Int {
+        val rec = profiles[profileId] ?: ProfileRecord()
+        return activeCards(rec.disabled, rec.enabledOverrides, extCards()).size
+    }
+
+    /** Would these choices go over the limit? */
+    fun exceedsExtensionLimit(disabled: Set<String>, overrides: Set<String>): Boolean =
+        activeCards(disabled, overrides, extCards()).size > MAX_PROFILE_EXTENSIONS
+
+    /** Would switching [internalName] on take this profile over the limit? */
+    fun wouldExceedOnEnable(profileId: String, internalName: String): Boolean {
+        val rec = profiles[profileId] ?: ProfileRecord()
+        val cards = extCards()
+        val active = activeCards(rec.disabled, rec.enabledOverrides, cards)
+        if (active.any { it.id == internalName }) return false // switching it off
+        return active.size >= MAX_PROFILE_EXTENSIONS
+    }
+
+    /**
+     * Trims every profile over [MAX_PROFILE_EXTENSIONS] to its best extensions — the ones
+     * that delivered the most streams — and switches the rest off. Returns profiles trimmed.
+     */
+    fun enforceProfileExtensionLimit(): Int {
+        val cards = extCards()
+        var trimmed = 0
+        for ((pid, rec) in profiles.toMap()) {
+            val active = activeCards(rec.disabled, rec.enabledOverrides, cards)
+            if (active.size <= MAX_PROFILE_EXTENSIONS) continue
+            val keep = active.sortedByDescending { com.cncverse.stremiobridge.state.StreamTracker.statOf(it.statKey)?.totalStreams ?: 0 }
+                .take(MAX_PROFILE_EXTENSIONS).map { it.id }.toSet()
+            val drop = active.filter { it.id !in keep }
+            val newOverrides = rec.enabledOverrides - drop.filter { !it.globallyOn }.map { it.id }.toSet()
+            val newDisabled = rec.disabled + drop.filter { it.globallyOn }.map { it.id }
+            profiles[pid] = rec.copy(disabled = newDisabled, enabledOverrides = newOverrides)
+            trimmed++
+        }
+        if (trimmed > 0) saveProfiles()
+        ServerState.info("[Profiles] extension limit $MAX_PROFILE_EXTENSIONS: trimmed $trimmed profile(s)")
+        return trimmed
+    }
+
+    private fun limitError(profileId: String): String =
+        "{\"error\":\"limit\",\"message\":\"A profile can have at most $MAX_PROFILE_EXTENSIONS extensions switched on. Switch one off first.\"," +
+            "\"max\":$MAX_PROFILE_EXTENSIONS,\"enabled\":${enabledExtensionCount(profileId)}}"
+
     /** Replaces the whole selection for a profile (bulk select / clear all). */
     fun setProfileSelections(
         profileId: String,
@@ -682,6 +751,7 @@ object StremioServer {
         val excludeCam = rec?.excludeCam ?: false
         val maxStreamsPerResolution = rec?.maxStreamsPerResolution ?: 0
         val extra = (if (nowEnabled != null) ",\"nowEnabled\":$nowEnabled" else "") +
+            ",\"maxExtensions\":$MAX_PROFILE_EXTENSIONS,\"enabledCount\":${enabledExtensionCount(profileId)}" +
             ",\"displayName\":" + serverJson.encodeToString(kotlinx.serialization.json.JsonPrimitive.serializer(), kotlinx.serialization.json.JsonPrimitive(rec?.displayName ?: "")) +
             ",\"formatter\":" + serverJson.encodeToString(
                 com.cncverse.stremiobridge.format.ProfileFormatter.serializer(),
@@ -1195,6 +1265,9 @@ object StremioServer {
                     Regex("\"internalName\"\\s*:\\s*\"([^\"]+)\"").find(rawText)?.groupValues?.get(1) ?: ""
                 }
                 if (internalName.isBlank()) return@post call.respond(HttpStatusCode.BadRequest)
+                if (wouldExceedOnEnable(profileId, internalName)) {
+                    return@post call.respondText(limitError(profileId), ContentType.Application.Json, HttpStatusCode.Conflict)
+                }
                 val nowEnabled = toggleProfilePlugin(profileId, internalName)
                 saveProfiles()
                 call.respondText(profileJson(profileId, nowEnabled), ContentType.Application.Json)
@@ -1212,6 +1285,9 @@ object StremioServer {
                         ContentType.Application.Json,
                         HttpStatusCode.BadRequest
                     )
+                }
+                if (exceedsExtensionLimit(body.disabledExtensions.toSet(), body.enabledExtensions.toSet())) {
+                    return@post call.respondText(limitError(profileId), ContentType.Application.Json, HttpStatusCode.Conflict)
                 }
                 setProfileSelections(
                     profileId,
@@ -4617,6 +4693,11 @@ function ensureProfileCustomized() {
   }
 }
 
+/* A profile can have at most MAX_EXT extensions switched on (the server enforces it too). */
+var MAX_EXT = 50;
+function activeExtCount() { return exts.filter(function(e){ return isExtActive(e); }).length; }
+function limitToast() { toast("A profile can have at most " + MAX_EXT + " extensions. Switch one off first."); }
+
 function isExtActive(e) {
   if (!isProfileCustomized()) {
     // Default Developer's Choice: all globally enabled extensions
@@ -4806,6 +4887,10 @@ function applyPreset(preset, btn) {
     }).map(function(e){ return e.internalName; });
     toast("Anime applied");
   }
+  if (targetInternals.length > MAX_EXT) {
+    targetInternals = targetInternals.slice(0, MAX_EXT);
+    toast("Limited to " + MAX_EXT + " extensions per profile");
+  }
 
   pData._d.clear();
   pData._e.clear();
@@ -4877,18 +4962,29 @@ function onLangFilterChange(val) {
 function setAll(enable) {
   ensureProfileCustomized();
   var matching = getFilteredExtensions();
+  var changed = 0, skipped = 0;
+  var free = MAX_EXT - activeExtCount();
   matching.forEach(function(e){
     if (enable) {
+      if (isExtActive(e)) return;
+      if (free <= 0) { skipped++; return; } // the per-profile limit
       pData._d.delete(e.internalName);
       if (!e.enabled) pData._e.add(e.internalName);
+      free--;
+      changed++;
     } else {
       pData._e.delete(e.internalName);
       if (e.enabled) pData._d.add(e.internalName);
+      changed++;
     }
   });
   var devBtn = document.querySelector('[data-preset="dev_choice"]');
   if (devBtn) devBtn.classList.remove("active");
-  toast(enable ? ("Enabled " + matching.length + " sources") : ("Cleared " + matching.length + " sources"));
+  if (enable && skipped > 0) {
+    toast("Enabled " + changed + " — limit of " + MAX_EXT + " extensions per profile reached");
+  } else {
+    toast(enable ? ("Enabled " + changed + " sources") : ("Cleared " + changed + " sources"));
+  }
   saveProfileState();
 }
 
@@ -4907,6 +5003,7 @@ function toggleCard(name) {
   ensureProfileCustomized();
 
   var willBeActive = !isExtActive(ext);
+  if (willBeActive && activeExtCount() >= MAX_EXT) { limitToast(); return; }
   if (ext.enabled) {
     if (willBeActive) pData._d.delete(name); else pData._d.add(name);
   } else {
@@ -4944,8 +5041,15 @@ function saveProfileState() {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
-  }).then(function(r){ return r.json(); })
+  }).then(function(r){
+      if (r.status === 409) {
+        // Over the per-profile limit: show why and go back to what is saved
+        return r.json().then(function(err){ toast(err.message || "Extension limit reached"); loadProfile(); return null; });
+      }
+      return r.json();
+    })
     .then(function(p){
+      if (!p) return;
       pData.disabledExtensions = p.disabledExtensions || [];
       pData.enabledExtensions = p.enabledExtensions || [];
       pData.disabledCatalogs = p.disabledCatalogs || [];
@@ -5179,7 +5283,7 @@ function updateMetrics() {
 
   // Selected Action Button
   var btnSelCount = document.getElementById("btn-selected-count");
-  if (btnSelCount) btnSelCount.textContent = activeCount;
+  if (btnSelCount) btnSelCount.textContent = activeCount + " / " + MAX_EXT;
 
   var btnSelectAll = document.getElementById("btn-select-all");
   if (btnSelectAll) {

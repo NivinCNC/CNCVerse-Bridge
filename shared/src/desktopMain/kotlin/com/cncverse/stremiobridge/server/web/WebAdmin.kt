@@ -648,6 +648,13 @@ object WebAdmin {
                     "Home-page audit started" + if (req.uninstall) " — extensions dead directly and via proxy will be uninstalled" else " (report only)"))
             }
 
+            // Trims every profile over the per-profile extension limit to its best extensions
+            post("/profiles/enforce-extension-limit") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val n = StremioServer.enforceProfileExtensionLimit()
+                call.respond(AdminActionResult(true, "Trimmed $n profile(s) to ${StremioServer.MAX_PROFILE_EXTENSIONS} extensions"))
+            }
+
             post("/maintenance/auto-uninstall/all") {
                 if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
                 val req = runCatching { call.receive<AdminAutoUninstallToggle>() }.getOrNull()
