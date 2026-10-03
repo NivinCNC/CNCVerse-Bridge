@@ -702,8 +702,9 @@ object WebAdmin {
                     ?: return@post call.respond(AdminActionResult(false, "Invalid request"))
                 if (r.mode !in setOf("auto", "off", "always")) return@post call.respond(AdminActionResult(false, "Mode must be auto, off or always"))
                 val country = r.country?.trim()?.uppercase()?.takeIf { it.isNotEmpty() }
-                if (country != null && !Regex("^[A-Z]{2}$").matches(country)) {
-                    return@post call.respond(AdminActionResult(false, "Country must be a 2-letter code (e.g. IN)"))
+                // One code, or several meaning "any of them" (TH,ID,VN)
+                if (country != null && !Regex("^[A-Z]{2}([\\s,;/]+[A-Z]{2})*$").matches(country)) {
+                    return@post call.respond(AdminActionResult(false, "Country must be a 2-letter code (e.g. IN) or a list (TH,ID,VN)"))
                 }
                 com.cncverse.stremiobridge.network.geo.GeoRouter.setOverride(
                     r.plugin, com.cncverse.stremiobridge.network.geo.PluginGeoOverride(r.mode, country),

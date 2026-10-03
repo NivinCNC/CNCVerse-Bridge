@@ -4596,7 +4596,7 @@ function renderGeoLive() {
     if (shared) {
       html += '<td colspan="2" class="muted">learned per host, for every extension</td>';
     } else {
-      html += '<td><input id="geo-cc-' + esc(p.plugin) + '" type="text" maxlength="2" value="' + esc(p.overrideCountry || "") + '" placeholder="' + esc(p.detectedCountry || "–") + '" style="width:46px" title="Detected: ' + esc((p.detectedCountry || "none") + " (" + p.countrySource + ")") + '"> <span class="muted" style="font-size:10px">' + esc(p.country || "none") + '</span></td>';
+      html += '<td><input id="geo-cc-' + esc(p.plugin) + '" type="text" maxlength="20" value="' + esc(p.overrideCountry || "") + '" placeholder="' + esc(p.detectedCountry || "–") + '" style="width:76px" title="Detected: ' + esc((p.detectedCountry || "none") + " (" + p.countrySource + ")") + '. Several codes (TH,ID,VN) = any of them: the one with the most working proxies is used."> <span class="muted" style="font-size:10px">' + esc(p.country || "none") + '</span></td>';
       html += '<td><select id="geo-mode-' + esc(p.plugin) + '" onchange="geoOverride(\'' + jsa(p.plugin) + '\')">' +
         ["auto", "always", "off"].map(function(m) { return '<option value="' + m + '"' + (p.mode === m ? ' selected' : '') + '>' + m + '</option>'; }).join("") + '</select> ' +
         '<a href="#" onclick="geoOverride(\'' + jsa(p.plugin) + '\');return false;" style="font-size:11px">save</a></td>';

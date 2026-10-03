@@ -258,8 +258,10 @@ object GeoRouter {
 
     fun setOverride(plugin: String, o: PluginGeoOverride?) {
         if (o == null || (o.mode == "auto" && o.country.isNullOrBlank())) overrides.remove(plugin)
-        else overrides[plugin] = o.copy(country = o.country?.trim()?.uppercase()?.takeIf { it.length == 2 })
+        else overrides[plugin] = o.copy(country = normalizeCountries(o.country))
         if (o?.mode == "off") clearLearned(plugin)
+        // Build every listed country's pool, so the choice between them has something to pick from
+        overrideCountries(plugin).forEach { ProxyPool.demand(it) }
         countryFor(plugin)?.let { if (o?.mode == "always") ProxyPool.demand(it) }
         save()
     }
@@ -306,8 +308,20 @@ object GeoRouter {
 
     fun overrideMode(plugin: String): String = overrides[plugin]?.mode ?: "auto"
 
+    /** "th, id vn" → "TH,ID,VN"; null when no valid 2-letter code is given. */
+    private fun normalizeCountries(raw: String?): String? =
+        raw?.split(',', ' ', ';', '/')?.map { it.trim().uppercase() }?.filter { it.length == 2 && it.all(Char::isLetter) }
+            ?.distinct()?.joinToString(",")?.takeIf { it.isNotEmpty() }
+
+    private fun overrideCountries(plugin: String): List<String> =
+        overrides[plugin]?.country?.split(',')?.filter { it.length == 2 }.orEmpty()
+
     fun countryFor(plugin: String): String? {
-        overrides[plugin]?.country?.let { return it }
+        // An admin list ("TH,ID,VN") means any of them: use the one with the most working
+        // proxies right now (the first listed on a tie, or while no pool is built yet)
+        val listed = overrideCountries(plugin)
+        if (listed.size == 1) return listed[0]
+        if (listed.size > 1) return listed.maxWith(compareBy<String> { ProxyPool.healthy(it).size }.thenBy { -listed.indexOf(it) })
         plugins[plugin]?.country?.let { return it }
         return settings.defaultCountry.takeIf { it.length == 2 }
     }
