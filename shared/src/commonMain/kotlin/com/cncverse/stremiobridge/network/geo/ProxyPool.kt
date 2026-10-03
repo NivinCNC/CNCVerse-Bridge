@@ -115,9 +115,6 @@ class PooledProxy(
     @Volatile var consecutiveFailures: Int = 0
     /** Health checks (ipify through the proxy) failed in a row — only these can remove a public proxy. */
     @Volatile var failedChecks: Int = 0
-    /** Measured download speed (KB/s, moving average of real segment downloads and speed tests); 0 = unknown. */
-    @Volatile var kbps: Double = 0.0
-    @Volatile var speedTestedAt: Long = 0
     val successes = AtomicInteger(0)
     val failures = AtomicInteger(0)
     /** Live channels currently leased to this proxy (see GeoRouter.StreamLease). */
@@ -149,14 +146,11 @@ data class PooledProxySnapshot(
     val capacity: Int = 1,
     /** Built-in local tunnel (Ultrasurf): tried before everything else for its country. */
     val builtin: Boolean = false,
-    /** Measured download speed, KB/s (0 = not measured yet). */
-    val kbps: Double = 0.0,
 )
 
 fun PooledProxy.snapshot() = PooledProxySnapshot(
     endpoint, country, residential, isp, exitIp, latencyMs, consecutiveFailures,
     successes.get(), failures.get(), lastOk, lastChecked, addedAt, activeStreams.get(), custom, capacity, builtin,
-    kotlin.math.round(kbps),
 )
 
 /**
@@ -304,59 +298,16 @@ object ProxyPool {
         if (host != null && GeoRouter.ultrasurfOnly(host)) return builtins().firstOrNull { it.endpoint.key !in exclude }
         demand(country)
         val banned = host?.let { bannedFor(it) }.orEmpty()
-        val candidates = healthy(country).filter { it.endpoint.key !in exclude && it.endpoint.key !in banned }
-        // Live video needs bandwidth: unknown proxies get a quick speed test for next time
-        candidates.filter { !it.builtin && it.kbps == 0.0 }.forEach { speedTestAsync(it) }
-        return candidates.minWithOrNull(
-            compareBy<PooledProxy> { cap != Int.MAX_VALUE && it.activeStreams.get() >= cap.toLong() * it.capacity }
-                // Ultrasurf is one shared, often slow tunnel — live channels use it only when nothing else works
-                .thenBy { it.builtin }
-                .thenBy { !it.custom }
-                // Fastest first, shared fairly: speed per channel it would be carrying
-                .thenByDescending { effectiveKbps(it) / (it.activeStreams.get() + 1.0) }
-                .thenBy { !it.residential }
-                .thenBy { it.score }
-        )
-    }
-
-    /** Unknown speed ranks as modest (below a measured good proxy, above a measured bad one). */
-    fun effectiveKbps(p: PooledProxy): Double = if (p.kbps > 0) p.kbps else UNKNOWN_KBPS
-
-    private const val UNKNOWN_KBPS = 400.0
-    private const val SPEED_TEST_INTERVAL_MS = 15 * 60_000L
-    private val speedTesting = ConcurrentHashMap.newKeySet<String>()
-
-    /** Real downloads through [key] (segments ≥ 100 KB) feed its speed. */
-    fun reportThroughput(key: String, bytes: Long, ms: Long) {
-        if (bytes < 100_000 || ms <= 0) return
-        val p = pools.values.asSequence().flatten().firstOrNull { it.endpoint.key == key } ?: return
-        addSpeedSample(p, bytes / 1024.0 / (ms / 1000.0))
-    }
-
-    private fun addSpeedSample(p: PooledProxy, kbps: Double) {
-        p.kbps = if (p.kbps == 0.0) kbps else p.kbps * 0.7 + kbps * 0.3
-    }
-
-    private fun speedTestAsync(p: PooledProxy) {
-        val now = System.currentTimeMillis()
-        if (now - p.speedTestedAt < SPEED_TEST_INTERVAL_MS || !speedTesting.add(p.endpoint.key)) return
-        p.speedTestedAt = now
-        scope.launch {
-            try {
-                val client = clientFor(p.endpoint, streaming = true)
-                val started = System.currentTimeMillis()
-                val n = runCatching {
-                    client.newCall(Request.Builder().url("https://speed.cloudflare.com/__down?bytes=400000").build()).execute().use { r ->
-                        if (r.isSuccessful) r.body?.bytes()?.size ?: 0 else 0
-                    }
-                }.getOrDefault(0)
-                val ms = System.currentTimeMillis() - started
-                // A failed test counts as very slow so it sinks in the ranking (health checks decide if it's dead)
-                addSpeedSample(p, if (n > 0) n / 1024.0 / (ms / 1000.0) else 20.0)
-            } finally {
-                speedTesting.remove(p.endpoint.key)
-            }
-        }
+        return healthy(country)
+            .filter { it.endpoint.key !in exclude && it.endpoint.key !in banned }
+            .minWithOrNull(
+                compareBy<PooledProxy> { cap != Int.MAX_VALUE && it.activeStreams.get() >= cap.toLong() * it.capacity }
+                    .thenBy { !it.builtin }
+                    .thenBy { !it.custom }
+                    .thenBy { !it.residential }
+                    .thenBy { it.activeStreams.get().toDouble() / it.capacity }
+                    .thenBy { it.score }
+            )
     }
 
     // ── Per-host bans: a proxy whose IP a given site refuses ─────────────────
@@ -387,7 +338,6 @@ object ProxyPool {
      */
     fun ensureCapacity(country: String, liveChannels: Int, perProxy: Int) {
         val per = perProxy.coerceAtLeast(1)
-        liveDemand[country] = LiveDemand(liveChannels, per, System.currentTimeMillis())
         // Private proxies take their share first (a rotating gateway may carry most of it)
         val privateSlots = healthy(country).filter { it.custom }.sumOf { it.capacity.toLong() * per }.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
         val publicChannels = (liveChannels - privateSlots).coerceAtLeast(0)
@@ -485,7 +435,6 @@ object ProxyPool {
                     pool += PooledProxy(s.endpoint, country, res, s.isp, s.exitIp).apply {
                         latencyMs = s.latencyMs
                         lastOk = s.lastOk
-                        kbps = s.kbps
                         lastChecked = 0 // force a re-check soon
                     }
                 }
@@ -608,38 +557,7 @@ object ProxyPool {
                 val backoff = if (healthy(country).size < MIN_HEALTHY) 2 * 60_000L else 10 * 60_000L
                 if (now - last > backoff) refill(country)
             }
-            huntFast(country, now)
         }
-    }
-
-    // ── Fast proxies for live video ──────────────────────────────────────────
-
-    private class LiveDemand(val channels: Int, val perProxy: Int, val at: Long)
-    private val liveDemand = ConcurrentHashMap<String, LiveDemand>()
-    private val lastHunt = ConcurrentHashMap<String, Long>()
-    /** ~5 Mbps: enough for a Jio HD channel (3.7 Mbps) with headroom. */
-    const val FAST_KBPS = 600.0
-    private const val HUNT_INTERVAL_MS = 3 * 60_000L
-
-    fun fastCount(country: String): Int = healthy(country).count { !it.builtin && it.kbps >= FAST_KBPS }
-
-    /**
-     * While live channels play in [country] and too few pool proxies are fast enough for
-     * video, keep validating more candidates (datacenter IPs too — in-country hosting
-     * networks are usually the fastest) and speed-test them; live leases pick the fastest.
-     */
-    private suspend fun huntFast(country: String, now: Long) {
-        val live = liveDemand[country]?.takeIf { now - it.at < 5 * 60_000L && it.channels > 0 } ?: return
-        val wantFast = maxOf(2, (live.channels + live.perProxy - 1) / live.perProxy)
-        val fast = fastCount(country)
-        // Speed-test anything still unmeasured first — it may already be fast
-        healthy(country).filter { !it.builtin && it.kbps == 0.0 }.forEach { speedTestAsync(it) }
-        if (fast >= wantFast) return
-        if (pools[country].orEmpty().size >= maxOf(maxSize, targetSize) * 2) return
-        if (now - (lastHunt[country] ?: 0L) < HUNT_INTERVAL_MS) return
-        lastHunt[country] = now
-        ServerState.info("[GeoProxy] $country: $fast fast proxies for ${live.channels} live channel(s), want $wantFast — hunting")
-        refill(country, extra = wantFast - fast + 2, includeDatacenter = true)
     }
 
     private suspend fun healthCheck(list: List<PooledProxy>) {
@@ -661,13 +579,13 @@ object ProxyPool {
     }
 
     /** Builds/tops up the pool for [country]. Serialized per country. */
-    suspend fun refill(country: String, extra: Int = 0, includeDatacenter: Boolean = false) {
+    suspend fun refill(country: String) {
         val lock = refillLocks.getOrPut(country) { Mutex() }
         if (lock.isLocked) return
         lock.withLock {
             lastRefill[country] = System.currentTimeMillis()
             val pool = pools.getOrPut(country) { CopyOnWriteArrayList() }
-            val need = maxOf(targetFor(country) - healthy(country).size, extra)
+            val need = targetFor(country) - healthy(country).size
             if (need <= 0) return
 
             val have = pool.map { it.endpoint.key }.toSet()
@@ -683,10 +601,8 @@ object ProxyPool {
             val inCountry = candidates.filter { info[it.host]?.countryCode == country }
             val residential = inCountry.filter { info[it.host]?.residential == true }
             // Residential first; datacenter IPs only when allowed outright or as a fallback while residential runs short
-            val dcAllowed = allowDatacenter || includeDatacenter || (datacenterFallback && residentialHealthy(country) < MIN_HEALTHY)
-            val datacenter = if (dcAllowed) inCountry.filter { info[it.host]?.residential != true } else emptyList()
-            // Hunting for speed: in-country hosting networks first (fast links), then residential
-            val ordered = if (includeDatacenter) datacenter + residential else residential + datacenter
+            val dcAllowed = allowDatacenter || (datacenterFallback && residentialHealthy(country) < MIN_HEALTHY)
+            val ordered = residential + (if (dcAllowed) inCountry.filter { info[it.host]?.residential != true } else emptyList())
             ServerState.info(
                 "[GeoProxy] $country: ${candidates.size} candidates, ${inCountry.size} in-country, " +
                     "${residential.size} residential — validating"
@@ -729,8 +645,6 @@ object ProxyPool {
                     lastChecked = lastOk
                     successes.incrementAndGet()
                 }
-                // Live channels rank proxies by speed — measure the new one right away
-                pool.lastOrNull()?.let { speedTestAsync(it) }
                 accepted++
             }
             ServerState.info("[GeoProxy] $country: +$accepted proxies (pool ${healthy(country).size}/${targetFor(country)})")

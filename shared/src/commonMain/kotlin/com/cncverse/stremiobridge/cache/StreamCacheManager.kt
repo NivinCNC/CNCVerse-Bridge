@@ -575,9 +575,9 @@ object StreamCacheManager {
         }
 
         // 3. Single-flight request coalescing. The shared job is time-limited on
-        //    its own (callers' timeouts only stop *their* wait) and is cancelled
-        //    when the last waiting request goes away, so abandoned scrapes never
-        //    keep running in the background.
+        //    its own (callers' timeouts only stop *their* wait) and finishes in the
+        //    background when every caller has given up, so its result is cached
+        //    for the next request.
         var isLeader = false
         val flight = inFlight.compute(key) { _, existing ->
             if (existing != null && existing.deferred.isActive) {
@@ -606,10 +606,11 @@ object StreamCacheManager {
         return try {
             flight.deferred.await()
         } finally {
-            if (flight.waiters.decrementAndGet() == 0 && flight.deferred.isActive) {
-                flight.deferred.cancel()
-                inFlight.remove(key, flight)
-            }
+            // When the last caller stops waiting (its provider budget ran out), the scrape keeps
+            // going — capped by MAX_FETCH_MS — and caches its result. Cancelling it meant slow
+            // providers (4K HDHUB series: search + load + many link hops) restarted from zero on
+            // every open and never answered.
+            flight.waiters.decrementAndGet()
         }
     }
 

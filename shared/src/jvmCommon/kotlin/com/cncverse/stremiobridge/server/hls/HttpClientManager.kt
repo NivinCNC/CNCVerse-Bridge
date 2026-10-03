@@ -145,8 +145,7 @@ object HttpClientManager {
                     com.cncverse.stremiobridge.network.geo.ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
                     // Another proxy got through, so the earlier 403s were about those IPs (e.g. Ultrasurf)
                     refused.forEach { com.cncverse.stremiobridge.network.geo.ProxyPool.banForHost(request.url.host, it) }
-                    // Tag which proxy carried it, so the body download can be credited to its speed
-                    return resp.newBuilder().header(VIA_PROXY_HEADER, p.endpoint.key).build()
+                    return resp
                 }
             } catch (e: java.io.IOException) {
                 lease.failover(p, e.javaClass.simpleName)
@@ -209,20 +208,8 @@ object HttpClientManager {
             if (!response.isSuccessful) {
                 throw httpError(response)
             }
-            readTimed(response)
+            response.body?.bytes() ?: throw Exception("Empty response body")
         }
-    }
-
-    private const val VIA_PROXY_HEADER = "X-Cnc-Via-Proxy"
-
-    /** Reads the body; when a pool proxy carried it, credits the transfer speed to that proxy. */
-    private fun readTimed(response: Response): ByteArray {
-        val started = System.currentTimeMillis()
-        val bytes = response.body?.bytes() ?: throw Exception("Empty response body")
-        response.header(VIA_PROXY_HEADER)?.let { key ->
-            com.cncverse.stremiobridge.network.geo.ProxyPool.reportThroughput(key, bytes.size.toLong(), System.currentTimeMillis() - started)
-        }
-        return bytes
     }
 
     /**
@@ -286,7 +273,7 @@ object HttpClientManager {
         val request = buildRequest(url, headers + ("Range" to "bytes=$start-$end"))
         return routed(request, proxyUrl, url, pluginOf(headers)).use { response ->
             if (!response.isSuccessful) throw httpError(response)
-            val body = readTimed(response)
+            val body = response.body?.bytes() ?: throw Exception("Empty response body")
             if (response.code != 206) return@use body to null
             val total = response.header("Content-Range")?.substringAfter('/')?.trim()?.toLongOrNull()
             body to total
