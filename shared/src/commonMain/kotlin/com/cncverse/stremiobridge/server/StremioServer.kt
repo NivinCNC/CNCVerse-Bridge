@@ -2151,6 +2151,20 @@ object StremioServer {
         val rec = profileId?.let { profiles[it] }
         if (rec != null && (rec.disableCatalogs || profileMatchIds(api).any { rec.disabledCatalogs.contains(it) })) return emptyList()
 
+        // Live-TV sources (SKTech, PlayZTV, PlayFy…) answer a search by downloading, decrypting and
+        // re-parsing every playlist — thousands of channels, per source, per search — and Stremio
+        // sends a search to every catalog. Their home pages are already parsed and cached, so a
+        // search is just a filter over those channels.
+        if (!search.isNullOrBlank() && api.supportedTypes.all { it == "tv" }) {
+            val pages = homePageCatalogCache.filterKeys { it.startsWith("$type:$id:") }.values
+            if (pages.isNotEmpty()) {
+                val words = normalizeTitle(search).split(' ').filter { it.isNotEmpty() }
+                return pages.asSequence().flatten().distinctBy { it.id }
+                    .filter { m -> val n = normalizeTitle(m.name); words.all { n.contains(it) } }
+                    .drop(skip).take(100).toList()
+            }
+        }
+
         val isHomePage = search.isNullOrBlank() && skip == 0
         val cacheKey = "$type:$id:$genre"
 
