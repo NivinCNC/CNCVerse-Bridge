@@ -425,6 +425,22 @@ object GeoRouter {
         markDirty()
     }
 
+    /** Direct connection failures per host (count, window start); see retryViaProxy. */
+    private val directStrikes = ConcurrentHashMap<String, Pair<Int, Long>>()
+    private const val STRIKES_TO_BLOCK = 3
+    private const val STRIKE_WINDOW_MS = 10 * 60_000L
+
+    /** Counts a direct connection failure for [host]; true once there have been enough recently. */
+    private fun directStrike(host: String): Boolean {
+        val now = System.currentTimeMillis()
+        val (n, _) = directStrikes.compute(host) { _, prev ->
+            if (prev == null || now - prev.second > STRIKE_WINDOW_MS) 1 to now else (prev.first + 1) to prev.second
+        }!!
+        if (n >= STRIKES_TO_BLOCK) { directStrikes.remove(host); return true }
+        if (directStrikes.size > 5_000) directStrikes.entries.removeIf { now - it.value.second > STRIKE_WINDOW_MS }
+        return false
+    }
+
     private fun markNoHelp(host: String) {
         noHelp[host] = System.currentTimeMillis() + NO_HELP_MS
     }
@@ -552,7 +568,7 @@ object GeoRouter {
                         chain.proceed(req)
                     } catch (e: IOException) {
                         if (!blockish(e)) throw e
-                        when (val r = retryViaProxy(plugin, c, host, req)) {
+                        when (val r = retryViaProxy(plugin, c, host, req, fromError = true)) {
                             null -> throw e
                             else -> return r
                         }
@@ -572,14 +588,17 @@ object GeoRouter {
          * verified: request one for [country] (built in the background) and
          * keep the direct result; later requests retry once it exists.
          */
-        private fun retryViaProxy(plugin: String?, country: String, host: String, req: Request): Response? {
+        private fun retryViaProxy(plugin: String?, country: String, host: String, req: Request, fromError: Boolean = false): Response? {
             if (ProxyPool.healthy(country).isEmpty()) {
                 ProxyPool.demand(country)
                 return null
             }
             val viaProxy = viaPool(plugin, country, req)
             if (viaProxy != null && viaProxy.code < 400 && viaProxy.header("cf-mitigated") == null) {
-                markBlocked(plugin, host, country)
+                // A refusal (403/45x) proves the block at once. A timeout or reset may just be a
+                // bad moment (server overloaded, WARP hiccup) — that once put MovieBox's API and
+                // Cinemeta behind proxies for 12 h — so it takes a few in a row to mark the host.
+                if (!fromError || directStrike(host)) markBlocked(plugin, host, country)
                 return viaProxy
             }
             viaProxy?.close()

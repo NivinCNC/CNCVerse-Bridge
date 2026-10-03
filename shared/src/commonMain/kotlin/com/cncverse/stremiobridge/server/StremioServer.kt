@@ -126,11 +126,17 @@ object StremioServer {
      * can be CPU-heavy (HTML parsing, extractor fuzzy matching); capping how
      * many run at once keeps the CPU from being oversubscribed so the HTTP
      * server, manifest/admin requests and the local proxies stay responsive
-     * even under load. Network waits suspend and do not hold a slot.
+     * even under load.
+     *
+     * Sized for blocking I/O, not CPU: plugins mostly make blocking OkHttp calls
+     * that hold their thread while waiting on the network. Sized by CPU count
+     * (2 vCPU → 8 threads) the whole server could only have 8 plugin requests on
+     * the wire, so stream searches (20 providers each), home pages and sweeps
+     * queued behind each other and most providers hit their 38 s timeout.
      */
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
     val pluginDispatcher: kotlinx.coroutines.CoroutineDispatcher =
-        Dispatchers.IO.limitedParallelism((Runtime.getRuntime().availableProcessors() * 4).coerceIn(8, 64))
+        Dispatchers.IO.limitedParallelism(64)
 
     /**
      * Shared provider catalog cache: provider internalName -> list of StremioCatalogDef.
