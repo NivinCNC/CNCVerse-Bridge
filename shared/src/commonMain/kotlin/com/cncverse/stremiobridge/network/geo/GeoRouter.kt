@@ -482,6 +482,15 @@ object GeoRouter {
     /** plugin → last time one of its requests was sent through a pool proxy. */
     private val lastProxiedAt = ConcurrentHashMap<String, Long>()
 
+    /**
+     * Hosts on a fixed domain rule (workers.dev → Ultrasurf, jio.com…) are proxied by choice,
+     * not because the plugin is blocked here — they don't make it a "works only via proxy" one.
+     */
+    private fun markProxied(plugin: String?, host: String) {
+        if (plugin == null || ruleCountry(host) != null || ultrasurfOnly(host)) return
+        lastProxiedAt[plugin] = System.currentTimeMillis()
+    }
+
     /** Requests of a forced-proxy health probe that no proxy could carry (per plugin). */
     private val probeMisses = ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
 
@@ -542,7 +551,7 @@ object GeoRouter {
                         lastBlocked?.close()
                         ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
                         counters.getOrPut(plugin ?: ANY) { Counters() }.ok.incrementAndGet()
-                        plugin?.let { lastProxiedAt[it] = System.currentTimeMillis() }
+                        markProxied(plugin, req.url.host)
                         // The site answers from here, so a 403 from the earlier proxy was about its IP
                         // (e.g. Ultrasurf on tv.imgcdn.kim) — skip it for this host for a while
                         refused.forEach { ProxyPool.banForHost(req.url.host, it) }
@@ -660,7 +669,7 @@ object GeoRouter {
                 if (mode == RouteMode.FORCE_PROXY && plugin != null) probeMisses.getOrPut(plugin) { java.util.concurrent.atomic.AtomicInteger() }.incrementAndGet()
                 return null
             }
-            plugin?.let { lastProxiedAt[it] = System.currentTimeMillis() }
+            markProxied(plugin, host)
             return picked + listOfNotNull(warp) + java.net.Proxy.NO_PROXY
         }
 
