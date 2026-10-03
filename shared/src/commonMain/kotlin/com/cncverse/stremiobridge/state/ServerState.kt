@@ -105,6 +105,15 @@ object ServerState {
         platformLog(level, message)
     }
 
+    /**
+     * Per-request trace (each provider's search/match/links steps, every relayed segment…):
+     * thousands of lines a minute that StreamTracker already summarises. Off unless the
+     * server runs with CNC_LOG_VERBOSE=1.
+     */
+    val verbose: Boolean = runCatching { System.getenv("CNC_LOG_VERBOSE") == "1" }.getOrDefault(false)
+
+    fun debug(msg: String) { if (verbose) log(LogLevel.INFO, msg) }
+
     fun info(msg: String) = log(LogLevel.INFO, msg)
     fun warn(msg: String) = log(LogLevel.WARN, msg)
     fun error(msg: String) = log(LogLevel.ERROR, msg)

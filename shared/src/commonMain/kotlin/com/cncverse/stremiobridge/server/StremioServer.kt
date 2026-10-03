@@ -1960,7 +1960,7 @@ object StremioServer {
         for (host in TMDB_HOSTS) {
             val url = "$host/$cleanPath${delimiter}api_key=$TMDB_API_KEY"
             try {
-                ServerState.info("Fetching TMDB: $url")
+                ServerState.debug("Fetching TMDB: $url")
                 val responseText = withTimeoutOrNull(5_000) {
                     httpClient.get(url).bodyAsText()
                 } ?: run {
@@ -2000,7 +2000,7 @@ object StremioServer {
                         val year = yearStr?.take(4)?.toIntOrNull()
                         val result = Pair(title, year)
                         genericMediaCache[cacheKey] = result
-                        ServerState.info("Cinemeta resolved $tmdbId -> '$title' ($year)")
+                        ServerState.debug("Cinemeta resolved $tmdbId -> '$title' ($year)")
                         return result
                     }
                 }
@@ -2035,7 +2035,7 @@ object StremioServer {
 
         val result = Pair(title, year)
         genericMediaCache[cacheKey] = result
-        ServerState.info("TMDB resolved $tmdbId -> '$title' ($year)")
+        ServerState.debug("TMDB resolved $tmdbId -> '$title' ($year)")
         return result
     }
     private suspend fun buildCatalog(
@@ -2291,7 +2291,7 @@ object StremioServer {
                     streamSearchScope.launch {
                         withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
                             try {
-                                ServerState.info("[${api.name}] Loading links for $dataUrl")
+                                ServerState.debug("[${api.name}] Loading links for $dataUrl")
                                 var links = api.loadLinks(dataUrl)
                                 // Catalog items opened straight from a row (defaultVideoId) carry the
                                 // item URL, not the load() data — e.g. Netflix mirrors need the title
@@ -2309,9 +2309,9 @@ object StremioServer {
                                 }
                                 StreamTracker.record(api.pluginInternalName, api.internalName, api.name, links.size, null)
                                 if (links.isNotEmpty()) {
-                                    ServerState.info("[STREAM_SUCCESS] [${api.name}] Resolved ${links.size} streamable link(s)")
+                                    ServerState.debug("[STREAM_SUCCESS] [${api.name}] Resolved ${links.size} streamable link(s)")
                                 } else {
-                                    ServerState.warn("[STREAM_EMPTY] [${api.name}] 0 streamable links returned")
+                                    ServerState.debug("[STREAM_EMPTY] [${api.name}] 0 streamable links returned")
                                 }
                                 accumulated.addAll(withMetadataTitle(links, titleForId(id)))
                             } catch (e: Throwable) {
@@ -2360,7 +2360,7 @@ object StremioServer {
                     return@getOrFetchResult com.cncverse.stremiobridge.cache.StreamCacheManager.FetchResult(emptyList())
                 }
                 val (title, year) = resolved
-                ServerState.info("Media resolve success: title='$title', year=$year")
+                ServerState.debug("Media resolve success: title='$title', year=$year")
 
                 // Exclude live-TV-only extensions from generic TMDB VOD searches —
                 // they don't carry on-demand movie/series content.
@@ -2368,7 +2368,7 @@ object StremioServer {
                     !isPluginBlocked(api, profileId) &&
                     api.supportedTypes.any { it != "tv" }
                 }
-                ServerState.info("Searching across ${activePlugins.size} plugin(s) (live-TV-only excluded)...")
+                ServerState.debug("Searching across ${activePlugins.size} plugin(s) (live-TV-only excluded)...")
 
                 val sem = Semaphore(20)
                 val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
@@ -2385,7 +2385,7 @@ object StremioServer {
                                 }
                             }
                             if (res == null) {
-                                ServerState.warn("[STREAM_TIMEOUT] [${api.name}] Provider timed out after ${PROVIDER_TIMEOUT_MS}ms")
+                                ServerState.debug("[STREAM_TIMEOUT] [${api.name}] Provider timed out after ${PROVIDER_TIMEOUT_MS}ms")
                                 StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Timed out after ${PROVIDER_TIMEOUT_MS}ms")
                             }
                         }
@@ -2482,7 +2482,7 @@ object StremioServer {
         title: String,
         year: Int?
     ): List<StremioStream> {
-        ServerState.info("[${api.name}] Searching for '$title'")
+        ServerState.debug("[${api.name}] Searching for '$title'")
         val cacheKey = api.internalName
         val searchResults = try {
             SearchLoadCache.getSearch(cacheKey, title)
@@ -2492,7 +2492,7 @@ object StremioServer {
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Search error: ${e.message}")
             return emptyList()
         }
-        ServerState.info("[${api.name}] Found ${searchResults.size} results")
+        ServerState.debug("[${api.name}] Found ${searchResults.size} results")
 
         val requestedSeason = if (type == "series" && id.contains(":")) {
             id.split(":").getOrNull(1)?.toIntOrNull()
@@ -2510,12 +2510,12 @@ object StremioServer {
         } else {
             pickBestMatch(searchResults, title, year)
         } ?: run {
-            ServerState.info("[${api.name}] No result matches '$title'" + (year?.let { " ($it)" } ?: ""))
+            ServerState.debug("[${api.name}] No result matches '$title'" + (year?.let { " ($it)" } ?: ""))
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "No result matches '$title'")
             return emptyList()
         }
 
-        ServerState.info("[${api.name}] Best match: '${bestMatch.name}' (url: ${bestMatch.url})")
+        ServerState.debug("[${api.name}] Best match: '${bestMatch.name}' (url: ${bestMatch.url})")
         val cachedLoad = SearchLoadCache.getLoad(cacheKey, bestMatch.url)
         val mediaInfo = try {
             if (cachedLoad != null) {
@@ -2530,7 +2530,7 @@ object StremioServer {
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Load error: ${e.message}")
             return emptyList()
         } ?: run {
-            ServerState.warn("[STREAM_EMPTY] [${api.name}] MediaInfo load returned null for ${bestMatch.url}")
+            ServerState.debug("[STREAM_EMPTY] [${api.name}] MediaInfo load returned null for ${bestMatch.url}")
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "MediaInfo null for match")
             return emptyList()
         }
@@ -2544,22 +2544,22 @@ object StremioServer {
                 val ep = mediaInfo.episodes?.find { it.season == season && it.episode == episode }
                 if (ep != null) {
                     dataUrlToLoad = ep.dataUrl
-                    ServerState.info("[${api.name}] Found episode S${season}E${episode}")
+                    ServerState.debug("[${api.name}] Found episode S${season}E${episode}")
                 } else {
-                    ServerState.warn("[STREAM_EMPTY] [${api.name}] Episode S${season}E${episode} not found")
+                    ServerState.debug("[STREAM_EMPTY] [${api.name}] Episode S${season}E${episode} not found")
                     StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Episode S${season}E${episode} not found")
                     return emptyList()
                 }
             }
         }
-        ServerState.info("[${api.name}] Loading links for $dataUrlToLoad")
+        ServerState.debug("[${api.name}] Loading links for $dataUrlToLoad")
         try {
             val links = api.loadLinks(dataUrlToLoad)
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, links.size, null)
             if (links.isNotEmpty()) {
-                ServerState.info("[STREAM_SUCCESS] [${api.name}] Resolved ${links.size} streamable link(s) for '$title'")
+                ServerState.debug("[STREAM_SUCCESS] [${api.name}] Resolved ${links.size} streamable link(s) for '$title'")
             } else {
-                ServerState.warn("[STREAM_EMPTY] [${api.name}] 0 streamable links returned for '$title'")
+                ServerState.debug("[STREAM_EMPTY] [${api.name}] 0 streamable links returned for '$title'")
             }
             return links.map { stream ->
                 val newName = bestMatch.name + (if (!stream.name.isNullOrBlank()) "\n${stream.name}" else "")

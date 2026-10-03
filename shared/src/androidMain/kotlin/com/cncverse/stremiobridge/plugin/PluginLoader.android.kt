@@ -388,7 +388,7 @@ private class ReflectionMainApiWrapper(
                     val subtitleCallback: (Any) -> Unit = { sub ->
                         val stremioSub = sub.reflectToSubtitle(plugin.name, api)
                         if (stremioSub != null && seenSubtitleUrls.add(stremioSub.url)) {
-                            ServerState.info("subtitle plugin=${plugin.name} lang=${stremioSub.lang} url=${stremioSub.url}")
+                            ServerState.debug("subtitle plugin=${plugin.name} lang=${stremioSub.lang} url=${stremioSub.url}")
                             subtitles.add(stremioSub)
                         }
                     }
@@ -397,7 +397,7 @@ private class ReflectionMainApiWrapper(
                         newStreams.forEach { st ->
                             val u = st.url ?: st.hashCode().toString()
                             if (seenStreamUrls.add(u)) {
-                                ServerState.info("stream plugin=${plugin.name} name=${st.name} url=${st.url}")
+                                ServerState.debug("stream plugin=${plugin.name} name=${st.name} url=${st.url}")
                                 streams.add(st)
                             }
                         }
@@ -410,7 +410,7 @@ private class ReflectionMainApiWrapper(
                         newStreams.forEach { st ->
                             val u = st.url ?: st.hashCode().toString()
                             if (seenStreamUrls.add(u)) {
-                                ServerState.info("stream plugin=${plugin.name} name=${st.name} url=${st.url}")
+                                ServerState.debug("stream plugin=${plugin.name} name=${st.name} url=${st.url}")
                                 streams.add(st)
                             }
                         }
@@ -751,7 +751,7 @@ private fun Any.reflectToStreams(pluginName: String, api: Any? = null): List<Str
             }
             val clearKeyParam = if (!clearkeyHex.isNullOrBlank()) "&clearkey=$clearkeyHex" else ""
             finalUrl = "$proxyBase/proxy/mpd/manifest.m3u8?d=$encodedMpdUrl$clearKeyParam$headerParams"
-            ServerState.info("Rewrote MPD to Proxy: $finalUrl")
+            ServerState.debug("Rewrote MPD to Proxy: $finalUrl")
         }
 
         // If we rewrote the URL (e.g. for MPD), our own proxy handles the headers, so don't ask Stremio to proxy it again.
@@ -1003,7 +1003,7 @@ private class DirectMainApiWrapper(
     override suspend fun loadLinks(dataUrl: String): List<StremioStream> = withContext(Dispatchers.IO) {
         val streams = mutableListOf<StremioStream>()
         val subtitles = mutableListOf<StremioSubtitle>()
-        ServerState.info("loadLinks called: plugin=${plugin.name} dataUrl=$dataUrl")
+        ServerState.debug("loadLinks called: plugin=${plugin.name} dataUrl=$dataUrl")
         var callbackCount = 0
         val seenSubtitleUrls = mutableSetOf<String>()
         val seenStreamUrls = mutableSetOf<String>()
@@ -1012,7 +1012,7 @@ private class DirectMainApiWrapper(
                 api.loadLinks(dataUrl, false, { sub ->
                     val stremioSub = (sub as Any).reflectToSubtitle(plugin.name, api)
                     if (stremioSub != null && seenSubtitleUrls.add(stremioSub.url)) {
-                        ServerState.info("subtitle plugin=${plugin.name} lang=${stremioSub.lang} url=${stremioSub.url}")
+                        ServerState.debug("subtitle plugin=${plugin.name} lang=${stremioSub.lang} url=${stremioSub.url}")
                         subtitles.add(stremioSub)
                     }
                 }, { link ->
@@ -1021,7 +1021,7 @@ private class DirectMainApiWrapper(
                     newStreams.forEach { st ->
                         val u = st.url ?: st.hashCode().toString()
                         if (seenStreamUrls.add(u)) {
-                            ServerState.info("stream plugin=${plugin.name} name=${st.name} url=${st.url}")
+                            ServerState.debug("stream plugin=${plugin.name} name=${st.name} url=${st.url}")
                             streams.add(st)
                         }
                     }

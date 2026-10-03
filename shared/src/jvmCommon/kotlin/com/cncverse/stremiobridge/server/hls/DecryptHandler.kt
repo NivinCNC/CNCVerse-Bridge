@@ -34,7 +34,7 @@ object DecryptHandler {
      */
     suspend fun handleDecryptSegment(call: ApplicationCall) {
         val reqPath = call.request.path()
-        ServerState.info("DECRYPT_REQ [$reqPath] starting...")
+        ServerState.debug("DECRYPT_REQ [$reqPath] starting...")
 
         SegmentCache.cleanup()
 
@@ -162,7 +162,7 @@ object DecryptHandler {
      */
     suspend fun handleInitDecrypt(call: ApplicationCall) {
         val reqPath = call.request.path()
-        ServerState.info("INIT_DECRYPT_REQ [$reqPath] starting...")
+        ServerState.debug("INIT_DECRYPT_REQ [$reqPath] starting...")
 
         SegmentCache.cleanup()
 

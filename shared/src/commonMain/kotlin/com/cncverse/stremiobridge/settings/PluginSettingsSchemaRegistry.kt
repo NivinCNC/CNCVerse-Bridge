@@ -49,7 +49,7 @@ object PluginSettingsSchemaRegistry {
                 storageKey ?: normalizedPref + key,
             )
             schemaUpdates.value++
-            com.cncverse.stremiobridge.state.ServerState.info(
+            com.cncverse.stremiobridge.state.ServerState.debug(
                 "Setting discovered: ${normalizedPref.removeSuffix("_")} → $key ($type${defaultValue?.let { " = $it" } ?: ""})"
             )
         } else if (existing.type != type && defaultValue != null &&

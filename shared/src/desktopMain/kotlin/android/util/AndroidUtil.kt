@@ -67,33 +67,50 @@ object Log {
     @JvmStatic fun d(tag: String?, msg: String?): Int = 0
     @JvmStatic fun d(tag: String?, msg: String?, tr: Throwable?): Int = 0
 
+    // Plugins log from loops (one line per channel, per retry…): the same tag+message is
+    // written at most once a minute. Info is per-request chatter — debug only.
+    private val lastLine = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    private fun once(line: String): Boolean {
+        val now = System.currentTimeMillis()
+        val prev = lastLine[line]
+        if (prev != null && now - prev < 60_000L) return false
+        lastLine[line] = now
+        if (lastLine.size > 5_000) lastLine.entries.removeIf { now - it.value > 60_000L }
+        return true
+    }
+
     @JvmStatic
     fun i(tag: String?, msg: String?): Int {
-        ServerState.info("[$tag] $msg")
+        ServerState.debug("[$tag] $msg")
         return 0
     }
 
     @JvmStatic
     fun w(tag: String?, msg: String?): Int {
-        ServerState.warn("[$tag] $msg")
+        val line = "[$tag] $msg"
+        if (once(line)) ServerState.warn(line)
         return 0
     }
 
     @JvmStatic
     fun w(tag: String?, msg: String?, tr: Throwable?): Int {
-        ServerState.warn("[$tag] $msg: ${tr?.message}")
+        val line = "[$tag] $msg: ${tr?.message}"
+        if (once(line)) ServerState.warn(line)
         return 0
     }
 
     @JvmStatic
     fun e(tag: String?, msg: String?): Int {
-        ServerState.error("[$tag] $msg")
+        val line = "[$tag] $msg"
+        if (once(line)) ServerState.error(line)
         return 0
     }
 
     @JvmStatic
     fun e(tag: String?, msg: String?, tr: Throwable?): Int {
-        ServerState.error("[$tag] $msg: ${tr?.message}")
+        val line = "[$tag] $msg: ${tr?.message}"
+        if (once(line)) ServerState.error(line)
         return 0
     }
 

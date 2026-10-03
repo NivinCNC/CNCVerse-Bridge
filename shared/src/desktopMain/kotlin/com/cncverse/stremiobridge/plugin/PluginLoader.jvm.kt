@@ -171,6 +171,7 @@ actual class PluginLoader {
                 .readTimeout(35, java.util.concurrent.TimeUnit.SECONDS)
                 .retryOnConnectionFailure(true)
                 .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
+                .dispatcher(PLUGIN_DISPATCHER)
                 .eventListenerFactory(LeakSafeEventListener.FACTORY)
                 .build()
             okClientField.set(currentNiceClient, newOk)
@@ -207,6 +208,7 @@ actual class PluginLoader {
                             .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
                             .dns(AdaptiveHostDns)
                             .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
+                            .dispatcher(PLUGIN_DISPATCHER)
                             .eventListenerFactory(LeakSafeEventListener.FACTORY)
                             .build()
                         runCatching { baseClientField.set(target, patched) }
@@ -252,6 +254,7 @@ actual class PluginLoader {
                         .addInterceptor(cfKiller)
                         .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
                         // Tags each call with its plugin — without it geo routing sees no plugin
+                        .dispatcher(PLUGIN_DISPATCHER)
                         .eventListenerFactory(LeakSafeEventListener.FACTORY)
                         .build()
                     okField.set(requests, patched)
@@ -707,22 +710,66 @@ actual class PluginLoader {
  * in [callEnd]/[callFailed] if OkHttp's internal isCanceled/consumed flag is
  * not already set.
  */
+/**
+ * One dispatcher for every plugin HTTP client. NiceHttp sends requests asynchronously, and
+ * the clients were derived (newBuilder) from one with OkHttp's default dispatcher: 64 requests
+ * in flight server-wide, 5 per host. With dozens of providers per stream request plus home
+ * pages and probes, calls queued for seconds before leaving — sites answering in 0.3 s took
+ * 6–13 s inside the bridge and providers hit their 38 s timeout.
+ */
+internal val PLUGIN_DISPATCHER = okhttp3.Dispatcher().apply {
+    maxRequests = 512
+    maxRequestsPerHost = 32
+}
+
 private class LeakSafeEventListener : EventListener() {
 
     // Map from Call to the latest Response received for that call.
     // ConcurrentHashMap + WeakReference so completed calls are GC-eligible.
     private val liveResponses = ConcurrentHashMap<Call, WeakReference<Response>>()
 
+    // One listener per call: when it started and the status it got, for the slow-call log
+    @Volatile private var startedAt = 0L
+    @Volatile private var status = 0
+
+    override fun callStart(call: Call) {
+        startedAt = System.nanoTime()
+    }
+
     override fun responseHeadersEnd(call: Call, response: Response) {
         liveResponses[call] = WeakReference(response)
+        status = response.code
     }
 
     override fun callEnd(call: Call) {
+        logIfSlow(call, null)
         closeIfLeaked(call)
     }
 
     override fun callFailed(call: Call, ioe: java.io.IOException) {
+        logIfSlow(call, ioe)
         closeIfLeaked(call)
+    }
+
+    /**
+     * Plugin requests slower than [SLOW_MS] — what makes a load page or link
+     * resolution slow — one line per host per minute: plugin, host/path, time,
+     * status or error.
+     */
+    private fun logIfSlow(call: Call, ioe: java.io.IOException?) {
+        if (startedAt == 0L) return
+        val ms = (System.nanoTime() - startedAt) / 1_000_000
+        if (ms < SLOW_MS) return
+        val url = call.request().url
+        val now = System.currentTimeMillis()
+        val prev = slowLogged.put(url.host, now)
+        if (prev != null && now - prev < 60_000L) { slowLogged[url.host] = prev; return }
+        if (slowLogged.size > 2_000) slowLogged.entries.removeIf { now - it.value > 60_000L }
+        val plugin = com.cncverse.stremiobridge.network.geo.NetContext.tagFor(call)?.plugin ?: "?"
+        val outcome = ioe?.let { "${it.javaClass.simpleName}: ${it.message?.take(60)}" } ?: "HTTP $status"
+        com.cncverse.stremiobridge.state.ServerState.warn(
+            "[SlowHTTP] $plugin ${url.host}${url.encodedPath.take(60)} ${ms / 1000.0}s ($outcome)"
+        )
     }
 
     private fun closeIfLeaked(call: Call) {
@@ -740,6 +787,9 @@ private class LeakSafeEventListener : EventListener() {
     }
 
     companion object {
+        private const val SLOW_MS = 5_000L
+        private val slowLogged = ConcurrentHashMap<String, Long>()
+
         /** Singleton factory — one listener instance per call (stateful, not shared). */
         // create() runs on the thread that built the Call (the plugin coroutine), so it is
         // where the call gets tagged with its plugin for geo proxy routing.
@@ -906,7 +956,7 @@ private class DirectMainApiWrapper(
     override suspend fun loadLinks(dataUrl: String): List<StremioStream> = withContext(Dispatchers.IO + netCtx) {
         val streams = mutableListOf<StremioStream>()
         val subtitles = mutableListOf<StremioSubtitle>()
-        ServerState.info("loadLinks called: plugin=${plugin.name} dataUrl=$dataUrl")
+        ServerState.debug("loadLinks called: plugin=${plugin.name} dataUrl=$dataUrl")
         var callbackCount = 0
         val seenSubtitleUrls = mutableSetOf<String>()
         val seenStreamUrls = mutableSetOf<String>()
@@ -915,7 +965,7 @@ private class DirectMainApiWrapper(
                 api.loadLinks(dataUrl, false, { sub: SubtitleFile ->
                     val stremioSub = (sub as Any).reflectToSubtitle(plugin.name)
                     if (stremioSub != null && seenSubtitleUrls.add(stremioSub.url)) {
-                        ServerState.info("subtitle plugin=${plugin.name} lang=${stremioSub.lang} url=${stremioSub.url}")
+                        ServerState.debug("subtitle plugin=${plugin.name} lang=${stremioSub.lang} url=${stremioSub.url}")
                         subtitles.add(stremioSub)
                     }
                 }, { link: ExtractorLink ->
@@ -924,7 +974,7 @@ private class DirectMainApiWrapper(
                     newStreams.forEach { st ->
                         val u = st.url ?: st.hashCode().toString()
                         if (seenStreamUrls.add(u)) {
-                            ServerState.info("stream plugin=${plugin.name} name=${st.name} url=${st.url}")
+                            ServerState.debug("stream plugin=${plugin.name} name=${st.name} url=${st.url}")
                             streams.add(st)
                         }
                     }
@@ -1233,7 +1283,7 @@ private fun Any.reflectToStreams(pluginName: String, api: MainAPI? = null, plugi
             // relay can route this plugin's CDN through its geo proxy (stripped before sending)
             val pluginParam = pluginInternalName?.let { "&h_x_cnc_plugin=" + java.net.URLEncoder.encode(it, "UTF-8") } ?: ""
             finalUrl = "$proxyBase/proxy/mpd/manifest.m3u8?d=$encodedMpdUrl$clearKeyParam$headerParams$pluginParam"
-            ServerState.info("Rewrote MPD to Proxy: $finalUrl")
+            ServerState.debug("Rewrote MPD to Proxy: $finalUrl")
         }
 
         // If we rewrote the URL (e.g. for MPD), our own proxy handles the headers,

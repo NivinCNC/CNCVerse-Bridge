@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicLong
 actual fun currentTimeMillis(): Long = System.currentTimeMillis()
 
 /**
- * Desktop log sink: mirrors every ServerState entry to stdout and into
+ * Desktop log sink: writes every ServerState entry (stdout only from a terminal) into
  * ~/.cncverse_bridge/app.log so issues are diagnosable when the packaged exe
  * runs without a console.
  *
@@ -27,8 +27,12 @@ private object AsyncLogSink {
     private val tsFormat = DateTimeFormatter.ofPattern("HH:mm:ss")
     private val logFile = File(System.getProperty("user.home"), ".cncverse_bridge/app.log")
 
-    // Captured once at startup so later System.setOut calls can't redirect us
-    private val stdout: PrintStream = System.out
+    // Captured once at startup so later System.setOut calls can't redirect us.
+    // Under systemd (no console) every line was stored three times — app.log, journald,
+    // rsyslog — so stdout is only mirrored from a terminal or with CNC_LOG_STDOUT=1.
+    private val stdout: PrintStream? = System.out.takeIf {
+        System.console() != null || System.getenv("CNC_LOG_STDOUT") == "1"
+    }
     private var fileOut: PrintStream? = null
 
     init {
@@ -60,10 +64,10 @@ private object AsyncLogSink {
                     fileOut = openFile()
                 }
                 for (line in batch) {
-                    stdout.println(line)
+                    stdout?.println(line)
                     fileOut?.println("$ts $line")
                 }
-                stdout.flush()
+                stdout?.flush()
                 fileOut?.flush()
             } catch (_: InterruptedException) {
                 return

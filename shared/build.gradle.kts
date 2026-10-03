@@ -53,16 +53,20 @@ kotlin {
 
                 // Cloudstream API interfaces to satisfy Dalvik ClassLoader
                 implementation(files("libs/cloudstream-api.jar"))
-                implementation("com.github.Blatzar:NiceHttp:0.4.16") {
-                    exclude(group = "org.jetbrains.kotlinx")
-                    exclude(group = "org.jetbrains.kotlin")
-                    exclude(group = "com.squareup.okhttp3")
-                }
+                // NiceHttp 0.4.16, vendored with its stack-trace prints routed to PluginErrorLog
+                // (libs/README.md). Its own dependencies besides okhttp/kotlin: org.json + jsoup.
+                implementation(files("libs/NiceHttp-0.4.16-patched.jar"))
+                implementation("org.json:json:20250517")
                 
                 // Plugin runtime dependencies
                 implementation(libs.okhttp)
                 implementation(libs.jsoup)
                 implementation(libs.jackson.module.kotlin)
+                // cloudstream-api.jar is built against kotlinx-datetime 0.7 (MainAPI.addDate uses the
+                // kotlin.time.Instant API). Without this, 0.6.0 came in transitively and every episode
+                // date threw NoSuchMethodError. The 0.6.x-compat build keeps the old Instant/Clock
+                // classes for plugins compiled against 0.6.
+                implementation("org.jetbrains.kotlinx:kotlinx-datetime:0.7.1-0.6.x-compat")
                 implementation("dev.whyoleg.cryptography:cryptography-core:0.6.0")
                 implementation("dev.whyoleg.cryptography:cryptography-provider-jdk:0.6.0")
                 implementation("com.uwetrottmann.tmdb2:tmdb-java:2.9.0")

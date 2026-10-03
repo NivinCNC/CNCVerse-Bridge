@@ -106,7 +106,7 @@ object AdaptiveHostDns : Dns {
         try {
             if (!hostCache.containsKey(hostname)) {
                 val addrs = resolveFresh(hostname)
-                ServerState.info("🔥 Pre-warmed DNS for $hostname (${addrs.size} IP(s) cached)")
+                ServerState.debug("🔥 Pre-warmed DNS for $hostname (${addrs.size} IP(s) cached)")
             }
         } catch (e: Exception) {
             ServerState.warn("Pre-warm failed for $hostname: ${e.message}")
