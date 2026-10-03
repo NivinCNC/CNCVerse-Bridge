@@ -2158,9 +2158,11 @@ object StremioServer {
         if (!search.isNullOrBlank() && api.supportedTypes.all { it == "tv" }) {
             val pages = homePageCatalogCache.filterKeys { it.startsWith("$type:$id:") }.values
             if (pages.isNotEmpty()) {
+                // Plain lower-case contains: normalizeTitle's regexes over ~15k channels per
+                // catalog per search showed up in the CPU profile
                 val words = normalizeTitle(search).split(' ').filter { it.isNotEmpty() }
                 return pages.asSequence().flatten().distinctBy { it.id }
-                    .filter { m -> val n = normalizeTitle(m.name); words.all { n.contains(it) } }
+                    .filter { m -> val n = m.name.lowercase(); words.all { n.contains(it) } }
                     .drop(skip).take(100).toList()
             }
         }
