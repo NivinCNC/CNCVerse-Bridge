@@ -2229,6 +2229,8 @@ object StremioServer {
      * gets a response well within its 60-second addon timeout.
      */
     private val STREAM_DEADLINE_MS = 45_000L
+    /** Answer with what has loaded after this long; the rest load into the cache until STREAM_DEADLINE_MS. */
+    private val STREAM_SOFT_DEADLINE_MS = 8_000L
     private val PROVIDER_TIMEOUT_MS = 38_000L
     private val streamSearchScope = CoroutineScope(pluginDispatcher + SupervisorJob())
 
@@ -2395,7 +2397,14 @@ object StremioServer {
                 ServerState.debug("Searching across ${activePlugins.size} plugin(s) (live-TV-only excluded)...")
 
                 val sem = Semaphore(20)
+                val started = System.currentTimeMillis()
                 val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
+                // Set once the request has been answered early: from then on every provider that
+                // finishes re-saves the cached list, so reloads see links arrive one by one.
+                val answered = java.util.concurrent.atomic.AtomicBoolean(false)
+                val publish = {
+                    com.cncverse.stremiobridge.cache.StreamCacheManager.put(aggCacheKey, sortStreamsByQuality(accumulated))
+                }
                 val jobs = activePlugins.map { api ->
                     streamSearchScope.launch {
                         sem.withPermit {
@@ -2413,20 +2422,43 @@ object StremioServer {
                                 StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Timed out after ${PROVIDER_TIMEOUT_MS}ms")
                             }
                         }
+                        if (answered.get() && accumulated.isNotEmpty()) publish()
                     }
                 }
 
-                withTimeoutOrNull(STREAM_DEADLINE_MS) { jobs.joinAll() }
+                // Answer when everything is done, or once STREAM_SOFT_DEADLINE_MS has passed and
+                // there is something to show; with nothing yet, wait up to STREAM_DEADLINE_MS.
+                withTimeoutOrNull(STREAM_DEADLINE_MS) {
+                    while (jobs.any { it.isActive }) {
+                        if (accumulated.isNotEmpty() && System.currentTimeMillis() - started >= STREAM_SOFT_DEADLINE_MS) break
+                        delay(200)
+                    }
+                }
+                val elapsed = System.currentTimeMillis() - started
                 val remaining = jobs.count { it.isActive }
-                if (remaining > 0) {
-                    ServerState.warn("Deadline reached ($STREAM_DEADLINE_MS ms) — returning ${accumulated.size} stream(s), cancelling $remaining slow provider(s)")
+                if (remaining > 0 && elapsed < STREAM_DEADLINE_MS) {
+                    // Early answer: the rest keep going until STREAM_DEADLINE_MS from the start —
+                    // each one that finishes adds its links to the cached list — then all are killed.
+                    answered.set(true)
+                    streamSearchScope.launch {
+                        withTimeoutOrNull(STREAM_DEADLINE_MS - elapsed) { jobs.joinAll() }
+                        val killed = jobs.count { it.isActive }
+                        jobs.forEach { it.cancel() }
+                        if (accumulated.isNotEmpty()) publish()
+                        ServerState.info("[Streams] '$title': ${accumulated.size} streams after ${(System.currentTimeMillis() - started) / 1000}s (background done, $killed slow provider(s) stopped)")
+                    }
+                } else if (remaining > 0) {
                     jobs.forEach { it.cancel() }
                 }
-                ServerState.info("Returning total ${accumulated.size} streams")
-                // Only a complete result is cached; a deadline-cut partial list is served once.
+                ServerState.info(
+                    "[Streams] '$title': answered with ${accumulated.size} streams in ${elapsed / 1000.0}s, " +
+                        "${activePlugins.size - remaining}/${activePlugins.size} providers done" +
+                        (if (remaining > 0 && elapsed < STREAM_DEADLINE_MS) ", $remaining still loading into cache" else "")
+                )
+                // Cached even when partial: reloads get it at once while the cache keeps filling
                 com.cncverse.stremiobridge.cache.StreamCacheManager.FetchResult(
                     sortStreamsByQuality(accumulated),
-                    cacheable = remaining == 0,
+                    cacheable = accumulated.isNotEmpty(),
                 )
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
