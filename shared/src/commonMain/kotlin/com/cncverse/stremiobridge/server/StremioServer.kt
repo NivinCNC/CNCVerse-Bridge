@@ -154,6 +154,8 @@ object StremioServer {
     private val homePageRefreshing: MutableSet<String> = ConcurrentHashMap.newKeySet()
     private const val LIVE_HOME_TTL_MS = 2 * 60_000L
     private const val LIVE_PLAYLIST_TTL_MS = 15 * 60_000L
+    /** Non-live home pages: refreshed on request once older than this. */
+    private const val HOME_PAGE_TTL_MS = 30 * 60_000L
 
     /**
      * Cached binary bytes for the official CNCVerse logo / favicon.
@@ -1764,19 +1766,14 @@ object StremioServer {
         providerCatalogCache.keys.retainAll(currentNames)
     }
 
+    /**
+     * No longer a timer: reloading every home page every 30 minutes (opened or not) was a big
+     * CPU spike for nothing. Pages load once at startup / after a plugin reload and are then
+     * refreshed only when requested (see buildCatalog). Kept so callers stay unchanged.
+     */
     fun startPeriodicRefreshJob() {
         periodicRefreshJob?.cancel()
-        periodicRefreshJob = manifestRefreshScope.launch {
-            while (isActive) {
-                delay(REFRESH_INTERVAL_MS)
-                try {
-                    ServerState.info("⏰ 30-minute interval reached — starting fresh home page and manifest refresh")
-                    refreshManifestAndHomepages()
-                } catch (e: Throwable) {
-                    ServerState.warn("Periodic refresh failed: ${e.message}")
-                }
-            }
-        }
+        periodicRefreshJob = null
     }
 
     fun stopPeriodicRefreshJob() {
@@ -2173,17 +2170,23 @@ object StremioServer {
         if (isHomePage) {
             val cached = homePageCatalogCache[cacheKey]
             if (!cached.isNullOrEmpty()) {
-                // Live-only providers (live events, TV) change by the minute: serve the cached
-                // page at once but refresh it in the background once it is a couple of minutes
-                // old, instead of waiting for the 30-min refresh job.
+                // Home pages are loaded once at startup (and after a plugin reload). After that a
+                // page is refreshed only when someone opens it and it is older than its TTL: the
+                // cached page is served at once and that one page reloads in the background.
+                // (A timer used to reload every home page every 30 min, opened or not.)
                 val liveOnly = api.supportedTypes.all { it == "tv" }
                 val age = System.currentTimeMillis() - (homePageCachedAt[cacheKey] ?: 0L)
-                // Small pages are live events (change by the minute); big ones are channel
-                // playlists whose refresh re-parses thousands of lines — keep those at 15 min.
-                val ttl = if (cached.size <= 150) LIVE_HOME_TTL_MS else LIVE_PLAYLIST_TTL_MS
-                // One background refresh per provider at a time, whatever section was asked for
-                val refreshKey = api.internalName
-                if (liveOnly && age > ttl && homePageRefreshing.add(refreshKey)) {
+                // Live events change by the minute; channel playlists re-parse thousands of
+                // lines, so 15 min; everything else 30 min.
+                val ttl = when {
+                    !liveOnly -> HOME_PAGE_TTL_MS
+                    cached.size <= 150 -> LIVE_HOME_TTL_MS
+                    else -> LIVE_PLAYLIST_TTL_MS
+                }
+                // Live: one refresh per provider at a time (its sections share one fetch);
+                // others: one per page
+                val refreshKey = if (liveOnly) api.internalName else cacheKey
+                if (age > ttl && homePageRefreshing.add(refreshKey)) {
                     streamSearchScope.launch {
                         try {
                             val fresh = fetchCatalogItemsDirect(type, id, null, 0, genre)

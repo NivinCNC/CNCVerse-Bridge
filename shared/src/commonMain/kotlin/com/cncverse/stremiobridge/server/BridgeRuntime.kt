@@ -375,8 +375,8 @@ object BridgeRuntime {
                         ServerState.info("Auto-updating ${toUpdate.size} plugin(s)…")
                         PluginInstaller.autoUpdateInstalled(cacheDir)
                         forceReloadPlugins()
-                        // Updated plugins need fresh home pages; otherwise StremioServer's
-                        // own 30-min refresh job covers it (no duplicate full pre-warm).
+                        // Updated plugins need fresh home pages; otherwise pages are only
+                        // refreshed when someone opens them (no timed full pre-warm).
                         runCatching { StremioServer.preWarmHomepages() }
                             .onFailure { e -> ServerState.warn("Periodic pre-warm error: ${e.message}") }
                     } else {
