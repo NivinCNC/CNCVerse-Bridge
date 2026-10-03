@@ -54,7 +54,9 @@ data class CachedStreamEntry(
     val cachedAt: Long,
     val expiresAt: Long,
     val providerKey: String? = null,
-    val hitCount: Long = 0L
+    val hitCount: Long = 0L,
+    /** Per stream (same order): when that link dies (signed URLs); empty = all live until [expiresAt]. */
+    val streamExpiresAt: List<Long> = emptyList(),
 )
 
 @Serializable
@@ -507,8 +509,16 @@ object StreamCacheManager {
             return null
         }
 
+        // Signed links carry their own expiry: drop only those that have died
+        val live = if (entry.streamExpiresAt.size != entry.streams.size) entry.streams
+        else entry.streams.filterIndexed { i, _ -> entry.streamExpiresAt[i] > now }
+        if (live.isEmpty()) {
+            memoryCache.remove(key)
+            totalEvicted.incrementAndGet()
+            return null
+        }
         hits.incrementAndGet()
-        return entry.streams
+        return live
     }
 
     /**
@@ -517,10 +527,10 @@ object StreamCacheManager {
     fun put(key: String, streams: List<StremioStream>, providerKey: String? = null) {
         if (!config.enabled || streams.isEmpty()) return
 
-        val (validStreams, computedTtlMs) = filterAndClassifyStreams(streams, providerKey)
+        val now = System.currentTimeMillis()
+        val (validStreams, computedTtlMs, linkExpiry) = classifyForCache(streams, providerKey, now)
         if (validStreams.isEmpty() || computedTtlMs <= 0L) return
 
-        val now = System.currentTimeMillis()
         val expiresAt = now + computedTtlMs
 
         // Evict if exceeding max RAM capacity
@@ -534,7 +544,8 @@ object StreamCacheManager {
             cachedAt = now,
             expiresAt = expiresAt,
             providerKey = providerKey,
-            hitCount = 0L
+            hitCount = 0L,
+            streamExpiresAt = linkExpiry,
         )
 
         memoryCache[key] = entry
@@ -617,6 +628,45 @@ object StreamCacheManager {
     /**
      * Inspects every stream, strips dead/expired URLs, and calculates safe TTL.
      */
+    /**
+     * What to store for a fresh stream list: the list lives for the configured TTL and each
+     * signed link keeps its own expiry (dropped on read once dead). A link already expired or
+     * about to is left out of the cached copy (it was still served to this request).
+     *
+     * It used to give the WHOLE list the shortest link's lifetime — and skip caching entirely
+     * when any one link was near expiry — so lists of 50–200 links from many providers (some
+     * always with short tokens) expired within minutes and the next open scraped again.
+     */
+    private fun classifyForCache(
+        streams: List<StremioStream>,
+        providerKey: String?,
+        now: Long,
+    ): Triple<List<StremioStream>, Long, List<Long>> {
+        val override = providerKey?.let { config.providerOverrides[it] }
+        if (override != null && !override.enabled) return Triple(emptyList(), 0L, emptyList())
+        val customTtl = override?.customTtlMinutes
+        val listTtlMs = (customTtl ?: config.defaultTtlMinutes) * 60_000L
+        val kept = ArrayList<StremioStream>(streams.size)
+        val expiry = ArrayList<Long>(streams.size)
+        for (stream in streams) {
+            val url = stream.url
+            if (url.isNullOrBlank()) { // infoHash / YouTube id: no link to expire
+                kept += stream; expiry += now + listTtlMs; continue
+            }
+            val c = StreamLinkClassifier.classify(
+                url = url,
+                customProviderTtlMinutes = customTtl,
+                defaultTtlMinutes = config.defaultTtlMinutes,
+                signedSafetyBufferSeconds = config.signedSafetyBufferSeconds,
+                minCacheableTtlMinutes = config.minCacheableTtlMinutes
+            )
+            if (!c.isCacheable || c.computedTtlMs <= 0L) continue
+            kept += stream
+            expiry += now + minOf(c.computedTtlMs, listTtlMs)
+        }
+        return Triple(kept, if (kept.isEmpty()) 0L else listTtlMs, expiry)
+    }
+
     fun filterAndClassifyStreams(
         streams: List<StremioStream>,
         providerKey: String? = null
