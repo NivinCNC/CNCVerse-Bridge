@@ -33,6 +33,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
@@ -2334,6 +2335,8 @@ object StremioServer {
                                 }
                                 accumulated.addAll(withMetadataTitle(links, titleForId(id)))
                             } catch (e: Throwable) {
+                                // Cancelled by the bridge (request gone / 45 s stop): not the provider's failure
+                                kotlinx.coroutines.currentCoroutineContext().ensureActive()
                                 StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, e.message)
                                 ServerState.error("[STREAM_ERROR] [${api.name}] Stream error: ${e.message}")
                             }
@@ -2413,6 +2416,8 @@ object StremioServer {
                                     val streams = buildGenericStreamsForApi(api, type, id, title, year)
                                     accumulated.addAll(streams)
                                 } catch (e: Throwable) {
+                                    // Cancelled by the bridge (request gone / 45 s stop): not the provider's failure
+                                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
                                     ServerState.warn("[${api.name}] Generic stream error: ${e.message}")
                                     StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, e.message ?: "Stream error")
                                 }
@@ -2545,6 +2550,8 @@ object StremioServer {
             SearchLoadCache.getSearch(cacheKey, title)
                 ?: api.search(title).also { SearchLoadCache.putSearch(cacheKey, title, it) }
         } catch (e: Throwable) {
+            // Cancelled by the bridge (request gone / 45 s stop): not the provider's failure
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
             ServerState.warn("[STREAM_ERROR] [${api.name}] Search failed: ${e.message}")
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Search error: ${e.message}")
             return emptyList()
@@ -2583,6 +2590,8 @@ object StremioServer {
                 fresh
             }
         } catch (e: Throwable) {
+            // Cancelled by the bridge (request gone / 45 s stop): not the provider's failure
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
             ServerState.warn("[STREAM_ERROR] [${api.name}] MediaInfo load failed: ${e.message}")
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Load error: ${e.message}")
             return emptyList()
@@ -2625,6 +2634,8 @@ object StremioServer {
                 stream.copy(name = newName, info = info)
             }
         } catch (e: Throwable) {
+            // Cancelled by the bridge (request gone / 45 s stop): not the provider's failure
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, e.message)
             ServerState.error("[STREAM_ERROR] [${api.name}] Stream error for '$title': ${e.message}")
             return emptyList()
@@ -2637,6 +2648,8 @@ object StremioServer {
             val streams = buildGenericStreamsForApi(api, "movie", "probe_test", query, null)
             streams.size
         } catch (e: Throwable) {
+            // Cancelled by the bridge (request gone / 45 s stop): not the provider's failure
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, e.message)
             0
         }

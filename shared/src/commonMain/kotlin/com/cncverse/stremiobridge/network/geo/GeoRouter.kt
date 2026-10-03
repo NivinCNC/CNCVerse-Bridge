@@ -471,7 +471,16 @@ object GeoRouter {
     }
 
     /** Health tracking asks whether a success came through a proxy. */
-    internal fun routesViaProxy(plugin: String): Boolean = usesProxy(plugin)
+    /**
+     * Did [plugin]'s last requests actually go through a proxy? Health uses it to tell
+     * "works only via proxy" from "works". It used to be "has any blocked host / proxy flag",
+     * so one blocked image host made every success of the plugin count as a proxy success.
+     */
+    internal fun routesViaProxy(plugin: String): Boolean =
+        (lastProxiedAt[plugin] ?: 0L) > System.currentTimeMillis() - 60_000L
+
+    /** plugin → last time one of its requests was sent through a pool proxy. */
+    private val lastProxiedAt = ConcurrentHashMap<String, Long>()
 
     /** Requests of a forced-proxy health probe that no proxy could carry (per plugin). */
     private val probeMisses = ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicInteger>()
@@ -533,6 +542,7 @@ object GeoRouter {
                         lastBlocked?.close()
                         ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
                         counters.getOrPut(plugin ?: ANY) { Counters() }.ok.incrementAndGet()
+                        plugin?.let { lastProxiedAt[it] = System.currentTimeMillis() }
                         // The site answers from here, so a 403 from the earlier proxy was about its IP
                         // (e.g. Ultrasurf on tv.imgcdn.kim) — skip it for this host for a while
                         refused.forEach { ProxyPool.banForHost(req.url.host, it) }
@@ -650,6 +660,7 @@ object GeoRouter {
                 if (mode == RouteMode.FORCE_PROXY && plugin != null) probeMisses.getOrPut(plugin) { java.util.concurrent.atomic.AtomicInteger() }.incrementAndGet()
                 return null
             }
+            plugin?.let { lastProxiedAt[it] = System.currentTimeMillis() }
             return picked + listOfNotNull(warp) + java.net.Proxy.NO_PROXY
         }
 
