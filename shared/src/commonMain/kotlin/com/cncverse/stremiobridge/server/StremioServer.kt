@@ -18,6 +18,7 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.encodeToStream
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
@@ -1569,7 +1570,8 @@ object StremioServer {
      * list they came from (identity check), so a refreshed page is re-encoded once and a stale
      * encoding can never be served.
      */
-    private class EncodedCatalog(val metas: List<StremioMeta>, val bytes: ByteArray, val gzipped: ByteArray)
+    /** Only the gzipped JSON is kept (~0.6 MB for a 15 MB catalog); the raw form is inflated on demand. */
+    private class EncodedCatalog(val metas: List<StremioMeta>, val gzipped: ByteArray)
     private val encodedCatalogs = ConcurrentHashMap<Int, EncodedCatalog>()
     private const val ENCODE_CACHE_MIN_ITEMS = 200
     private const val ENCODE_CACHE_MAX = 64
@@ -1584,15 +1586,18 @@ object StremioServer {
         val key = System.identityHashCode(metas)
         val encoded = encodedCatalogs[key]?.takeIf { it.metas === metas }
             ?: withContext(Dispatchers.Default) {
-                val raw = serverJson.encodeToString(StremioCatalogResponse.serializer(), StremioCatalogResponse(metas)).toByteArray()
-                // gzip once here instead of per request
-                val gz = java.io.ByteArrayOutputStream(raw.size / 8).also { out ->
-                    java.util.zip.GZIPOutputStream(out).use { it.write(raw) }
-                }.toByteArray()
-                EncodedCatalog(metas, raw, gz)
+                // Streamed straight into gzip: building the JSON as one String (~30 MB for the
+                // biggest playlists) plus a 15 MB byte copy, several at once, filled the heap with
+                // oversized (humongous) objects and crashed the server with OutOfMemoryError.
+                val out = java.io.ByteArrayOutputStream(256 * 1024)
+                @OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
+                java.util.zip.GZIPOutputStream(out, 64 * 1024).use { gz ->
+                    serverJson.encodeToStream(StremioCatalogResponse.serializer(), StremioCatalogResponse(metas), gz)
+                }
+                EncodedCatalog(metas, out.toByteArray())
             }.also {
                 if (encodedCatalogs.size >= ENCODE_CACHE_MAX ||
-                    encodedCatalogs.values.sumOf { e -> e.bytes.size.toLong() + e.gzipped.size } + it.bytes.size > ENCODE_CACHE_MAX_BYTES
+                    encodedCatalogs.values.sumOf { e -> e.gzipped.size.toLong() } + it.gzipped.size > ENCODE_CACHE_MAX_BYTES
                 ) encodedCatalogs.clear()
                 encodedCatalogs[key] = it
             }
@@ -1601,7 +1606,10 @@ object StremioServer {
             response.headers.append(io.ktor.http.HttpHeaders.Vary, io.ktor.http.HttpHeaders.AcceptEncoding)
             respondBytes(encoded.gzipped, io.ktor.http.ContentType.Application.Json)
         } else {
-            respondBytes(encoded.bytes, io.ktor.http.ContentType.Application.Json)
+            // Rare (clients without gzip): inflate on the fly
+            respondOutputStream(io.ktor.http.ContentType.Application.Json) {
+                java.util.zip.GZIPInputStream(java.io.ByteArrayInputStream(encoded.gzipped)).use { it.copyTo(this) }
+            }
         }
     }
 
