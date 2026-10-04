@@ -38,7 +38,7 @@ data class StreamCacheConfig(
     val defaultTtlMinutes: Long = 60L,            // 1 hour: many links carry undetectable short-lived tokens
     val signedSafetyBufferSeconds: Long = 60L,    // 60-second safety buffer for signed URLs
     val minCacheableTtlMinutes: Long = 5L,        // Below 5 min = ephemeral (bypass or short TTL)
-    val maxRamEntries: Int = 2_000,               // entries hold whole stream lists — keep RAM bounded
+    val maxRamEntries: Int = 3_000,               // entries hold whole stream lists (often 50–150 KB each) — keep RAM bounded
     val diskPersistenceEnabled: Boolean = true,   // keep cached links across restarts/deploys (expired links are dropped on load/read)
     val providerOverrides: Map<String, ProviderCacheOverride> = emptyMap()
 )
@@ -414,7 +414,9 @@ object StreamCacheManager {
         persistenceJob?.cancel()
         persistenceJob = maintenanceScope.launch {
             while (isActive) {
-                delay(2 * 60 * 1000L) // Debounced flush every 2 minutes (a shutdown save covers restarts)
+                // Every 30 min (a shutdown save covers restarts): each save re-encodes the whole cache,
+                // which at 2-min intervals with 25k entries (a 2.2 GB file) pinned the CPU and the heap
+                delay(30 * 60 * 1000L)
                 if (isDirty.getAndSet(false) && config.diskPersistenceEnabled) {
                     saveToDiskNow()
                 }
@@ -469,12 +471,12 @@ object StreamCacheManager {
             }
             val now = System.currentTimeMillis()
             var loaded = 0
-            list.forEach { entry ->
-                if (entry.expiresAt > now) {
+            list.asSequence().filter { it.expiresAt > now }
+                .sortedByDescending { it.cachedAt }.take(config.maxRamEntries)
+                .forEach { entry ->
                     memoryCache[entry.key] = entry
                     loaded++
                 }
-            }
             ServerState.info("StreamCacheManager: Restored $loaded valid stream entries from disk.")
         } catch (e: Throwable) {
             ServerState.warn("Failed to restore stream_cache.json: ${e.message}")
@@ -746,10 +748,11 @@ object StreamCacheManager {
             }
         }
 
-        // Pass 2: If still overflowing, evict oldest 20%
+        // Pass 2: if still at the limit, evict the oldest down to 80% of it (also shrinks an oversized
+        // cache restored from disk or left by a lowered limit, in one go)
         if (memoryCache.size >= config.maxRamEntries) {
             val sorted = memoryCache.entries.sortedBy { it.value.cachedAt }
-            val toRemove = (memoryCache.size * 0.2).toInt().coerceAtLeast(1)
+            val toRemove = (memoryCache.size - (config.maxRamEntries * 0.8).toInt()).coerceAtLeast(1)
             for (i in 0 until toRemove) {
                 if (i < sorted.size) {
                     memoryCache.remove(sorted[i].key)

@@ -1560,6 +1560,8 @@ object StremioServer {
     private val encodedCatalogs = ConcurrentHashMap<Int, EncodedCatalog>()
     private const val ENCODE_CACHE_MIN_ITEMS = 200
     private const val ENCODE_CACHE_MAX = 64
+    /** Encoded catalogs can be ~15 MB each (big playlists): cap the total, not just the count. */
+    private const val ENCODE_CACHE_MAX_BYTES = 300L * 1024 * 1024
 
     private suspend fun ApplicationCall.respondCatalogJson(metas: List<StremioMeta>, cacheable: Boolean) {
         if (!cacheable || metas.size < ENCODE_CACHE_MIN_ITEMS) {
@@ -1571,7 +1573,9 @@ object StremioServer {
             ?: withContext(Dispatchers.Default) {
                 serverJson.encodeToString(StremioCatalogResponse.serializer(), StremioCatalogResponse(metas)).toByteArray()
             }.also {
-                if (encodedCatalogs.size >= ENCODE_CACHE_MAX) encodedCatalogs.clear()
+                if (encodedCatalogs.size >= ENCODE_CACHE_MAX ||
+                    encodedCatalogs.values.sumOf { e -> e.bytes.size.toLong() } + it.size > ENCODE_CACHE_MAX_BYTES
+                ) encodedCatalogs.clear()
                 encodedCatalogs[key] = EncodedCatalog(metas, it)
             }
         respondBytes(bytes, io.ktor.http.ContentType.Application.Json)
