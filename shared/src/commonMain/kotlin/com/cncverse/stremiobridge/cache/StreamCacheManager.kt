@@ -39,7 +39,7 @@ data class StreamCacheConfig(
     val signedSafetyBufferSeconds: Long = 60L,    // 60-second safety buffer for signed URLs
     val minCacheableTtlMinutes: Long = 5L,        // Below 5 min = ephemeral (bypass or short TTL)
     val maxRamEntries: Int = 2_000,               // entries hold whole stream lists — keep RAM bounded
-    val diskPersistenceEnabled: Boolean = false,  // opt-in: stream links rarely outlive a restart anyway
+    val diskPersistenceEnabled: Boolean = true,   // keep cached links across restarts/deploys (expired links are dropped on load/read)
     val providerOverrides: Map<String, ProviderCacheOverride> = emptyMap()
 )
 
@@ -390,6 +390,8 @@ object StreamCacheManager {
     private var cleanupJob: Job? = null
     private var persistenceJob: Job? = null
 
+    @Volatile private var shutdownHookInstalled = false
+
     fun init(cacheDir: String) {
         val dir = File(cacheDir)
         if (!dir.exists()) dir.mkdirs()
@@ -412,11 +414,19 @@ object StreamCacheManager {
         persistenceJob?.cancel()
         persistenceJob = maintenanceScope.launch {
             while (isActive) {
-                delay(30 * 1000L) // Debounced flush every 30 seconds
+                delay(2 * 60 * 1000L) // Debounced flush every 2 minutes (a shutdown save covers restarts)
                 if (isDirty.getAndSet(false) && config.diskPersistenceEnabled) {
                     saveToDiskNow()
                 }
             }
+        }
+
+        // Restarts and deploys used to empty the cache: save it on the way down
+        if (!shutdownHookInstalled) {
+            shutdownHookInstalled = true
+            Runtime.getRuntime().addShutdownHook(Thread {
+                runCatching { if (config.diskPersistenceEnabled) saveToDiskNow() }
+            })
         }
 
         ServerState.info("StreamCacheManager initialized: ${memoryCache.size} active entries in RAM.")

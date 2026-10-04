@@ -108,8 +108,10 @@ class PooledProxy(
     val custom: Boolean = false,
     /** Live channels it may carry, as a multiple of maxStreamsPerProxy (rotating gateways: many). */
     val capacity: Int = 1,
-    /** Built-in local tunnel (Ultrasurf): tried before everything else for its country. */
+    /** Built-in local tunnel (Indian VPS tunnel, Ultrasurf): tried before everything else for its country. */
     val builtin: Boolean = false,
+    /** Order among built-ins: lower first (tunnel 0, Ultrasurf 1 — the fallback). */
+    val rank: Int = 0,
 ) {
     @Volatile var latencyMs: Long = 0
     @Volatile var consecutiveFailures: Int = 0
@@ -272,7 +274,7 @@ object ProxyPool {
      */
     /** Usable built-in tunnels (Ultrasurf), whatever country pool holds them. */
     private fun builtins(): List<PooledProxy> =
-        pools.values.flatten().filter { it.builtin && it.consecutiveFailures < failLimit(it) }
+        pools.values.flatten().filter { it.builtin && it.consecutiveFailures < failLimit(it) }.sortedBy { it.rank }
 
     fun pick(country: String, n: Int = 2, exclude: Set<String> = emptySet(), host: String? = null, residentialOnly: Boolean = false): List<PooledProxy> {
         // Hosts pinned to Ultrasurf (workers.dev…) never use anything else
@@ -286,7 +288,7 @@ object ProxyPool {
         // Built-in tunnels (Ultrasurf) always first; spread the rest over the best three
         val (builtin, rest) = ranked.partition { it.builtin }
         val head = rest.take(3).shuffled()
-        return (builtin + head + rest.drop(3)).take(n)
+        return (builtin.sortedBy { it.rank } + head + rest.drop(3)).take(n)
     }
 
     /**
@@ -303,6 +305,7 @@ object ProxyPool {
             .minWithOrNull(
                 compareBy<PooledProxy> { cap != Int.MAX_VALUE && it.activeStreams.get() >= cap.toLong() * it.capacity }
                     .thenBy { !it.builtin }
+                    .thenBy { it.rank }
                     .thenBy { !it.custom }
                     .thenBy { !it.residential }
                     .thenBy { it.activeStreams.get().toDouble() / it.capacity }
@@ -478,13 +481,15 @@ object ProxyPool {
      * Ultrasurf as the first proxy of [country]: preferred over everything,
      * never evicted, effectively unlimited live-channel capacity.
      */
-    fun setBuiltin(country: String, label: String, url: String) {
+    fun setBuiltin(country: String, label: String, url: String, rank: Int = 0) {
         val list = pools.getOrPut(country) { CopyOnWriteArrayList() }
         val parsed = parseCustom("$country $url")?.endpoint
-        list.filter { it.builtin && it.endpoint != parsed }.forEach { list.remove(it); dropClient(it.endpoint) }
-        if (parsed == null || list.any { it.builtin && it.endpoint == parsed }) return
+        // Several built-ins can coexist (tunnel + Ultrasurf); each label manages only its own entry
+        list.filter { it.builtin && it.isp == label && (it.endpoint != parsed || it.rank != rank) }
+            .forEach { list.remove(it); dropClient(it.endpoint) }
+        if (parsed == null || list.any { it.builtin && it.isp == label && it.endpoint == parsed }) return
         list.add(0, PooledProxy(parsed, country, residential = true, isp = label, exitIp = null,
-            custom = true, capacity = 1000, builtin = true).apply { lastChecked = 0 })
+            custom = true, capacity = 1000, builtin = true, rank = rank).apply { lastChecked = 0 })
         demand.putIfAbsent(country, System.currentTimeMillis())
     }
 

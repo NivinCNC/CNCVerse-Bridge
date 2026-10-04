@@ -60,6 +60,8 @@ data class GeoProxySettings(
      * any public IN proxy and never evicted. Blank = not used.
      */
     val ultrasurfProxy: String = System.getenv("CNC_ULTRASURF_PROXY")?.trim().orEmpty(),
+    /** Own Indian tunnel (socks on the Indian VPS, reverse-tunnelled to this host); tried before Ultrasurf. */
+    val tunnelProxy: String = System.getenv("CNC_TUNNEL_PROXY")?.trim().orEmpty(),
     /** Host suffixes that always go through Ultrasurf (never public proxies, never skipped). */
     val ultrasurfDomains: List<String> = listOf("workers.dev", "jio.com"),
 )
@@ -209,7 +211,9 @@ object GeoRouter {
         ProxyPool.allowDatacenter = settings.allowDatacenter
         ProxyPool.datacenterFallback = settings.datacenterFallback
         ProxyPool.setCustom(settings.customProxies)
-        ProxyPool.setBuiltin("IN", "ultrasurf", settings.ultrasurfProxy)
+        // Pinned hosts (jio.com, workers.dev…) use the own Indian tunnel first, Ultrasurf as fallback
+        ProxyPool.setBuiltin("IN", "tunnel", settings.tunnelProxy, rank = 0)
+        ProxyPool.setBuiltin("IN", "ultrasurf", settings.ultrasurfProxy, rank = 1)
         warp = parseLocalProxy(settings.warpProxy)
     }
 
@@ -329,7 +333,8 @@ object GeoRouter {
     /** Hosts pinned to Ultrasurf (settings.ultrasurfDomains, suffix match). */
     fun ultrasurfOnly(host: String): Boolean {
         val h = host.lowercase()
-        return settings.ultrasurfProxy.isNotBlank() && settings.ultrasurfDomains.any { d -> h == d || h.endsWith(".$d") }
+        return (settings.ultrasurfProxy.isNotBlank() || settings.tunnelProxy.isNotBlank()) &&
+            settings.ultrasurfDomains.any { d -> h == d || h.endsWith(".$d") }
     }
 
     /** Country of the domain rule matching [host] (suffix match), if any. */

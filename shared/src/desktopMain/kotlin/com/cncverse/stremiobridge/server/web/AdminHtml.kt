@@ -4453,6 +4453,7 @@ function saveGeoSettings() {
     blockTtlHours: parseInt(geoVal("geo-ttl"), 10) || 12,
     defaultCountry: geoVal("geo-default").trim().toUpperCase(),
     warpProxy: geoVal("geo-warp").trim(),
+    tunnelProxy: geoVal("geo-tunnel").trim(),
     ultrasurfProxy: geoVal("geo-ultra").trim(),
     ultrasurfDomains: geoVal("geo-ultra-domains").split(/[\s,]+/).map(function(s) { return s.trim(); }).filter(function(s) { return s; }),
     domainRules: rules,
@@ -4527,7 +4528,8 @@ function renderGeo() {
   });
   html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted">Default country<input id="geo-default" type="text" maxlength="2" placeholder="none" value="' + esc(s.defaultCountry || "") + '" style="width:90px" oninput="geoDirty=true"></label>';
   html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted" title="Default route for normal traffic (Cloudflare WARP local SOCKS). Blank = direct.">WARP (default route)<input id="geo-warp" type="text" placeholder="socks5://127.0.0.1:40000" value="' + esc(s.warpProxy || "") + '" style="width:210px" oninput="geoDirty=true"></label>';
-  html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted" title="Tried first for India (Jio etc.), before public IN proxies. Blank = off.">Ultrasurf (India first)<input id="geo-ultra" type="text" placeholder="socks5://127.0.0.1:9667" value="' + esc(s.ultrasurfProxy || "") + '" style="width:210px" oninput="geoDirty=true"></label>';
+  html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted" title="Own Indian VPS tunnel: tried first for India (Jio etc.); Ultrasurf is the fallback. Blank = off.">India tunnel (first)<input id="geo-tunnel" type="text" placeholder="socks5://127.0.0.1:9670" value="' + esc(s.tunnelProxy || "") + '" style="width:210px" oninput="geoDirty=true"></label>';
+  html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted" title="Fallback for India (Jio etc.) when the India tunnel is down, before public IN proxies. Blank = off.">Ultrasurf (India fallback)<input id="geo-ultra" type="text" placeholder="socks5://127.0.0.1:9667" value="' + esc(s.ultrasurfProxy || "") + '" style="width:210px" oninput="geoDirty=true"></label>';
   html += '<label style="display:flex;flex-direction:column;font-size:11px;gap:3px" class="muted" title="Hosts (and their subdomains) that always go through Ultrasurf — never public proxies.">Always via Ultrasurf<input id="geo-ultra-domains" type="text" placeholder="workers.dev" value="' + esc((s.ultrasurfDomains || []).join(", ")) + '" style="width:210px" oninput="geoDirty=true"></label>';
   html += '</div>';
   var rules = Object.keys(s.domainRules || {}).map(function(k) { return k + " " + s.domainRules[k]; }).join("\n");
