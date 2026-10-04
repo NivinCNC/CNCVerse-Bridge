@@ -595,6 +595,25 @@ object GeoRouter {
             }
             counters.getOrPut(plugin ?: ANY) { Counters() }.fail.incrementAndGet()
         }
+        // Nothing worked: the own Indian tunnel as a last resort (residential-only sites)
+        ProxyPool.lastResortTunnel(country, req.url.host)?.let { t ->
+            val started = System.currentTimeMillis()
+            try {
+                val sendReq = frontedForTunnel(req) ?: req
+                val client = if (sendReq !== req) ProxyPool.frontingClientFor(t.endpoint) else ProxyPool.clientFor(t.endpoint)
+                val resp = client.newCall(sendReq).execute()
+                if (resp.code != 407 && resp.code != 502 && resp.code != 504 && !geoBlocked(req.url.host, resp.code)) {
+                    lastBlocked?.close()
+                    ProxyPool.reportSuccess(t, System.currentTimeMillis() - started)
+                    counters.getOrPut(plugin ?: ANY) { Counters() }.ok.incrementAndGet()
+                    event(plugin, "${req.url.host}: no proxy got through — used the India tunnel (last resort)")
+                    return resp
+                }
+                resp.close()
+            } catch (e: IOException) {
+                ProxyPool.reportFailure(t, e.javaClass.simpleName)
+            }
+        }
         return lastBlocked
     }
 

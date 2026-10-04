@@ -156,6 +156,26 @@ object HttpClientManager {
                 lease.failover(p, e.javaClass.simpleName)
             }
         }
+        // Nothing worked: the own Indian tunnel as a last resort (residential-only stream hosts)
+        com.cncverse.stremiobridge.network.geo.ProxyPool.lastResortTunnel(lease.country, request.url.host)?.let { t ->
+            val started = System.currentTimeMillis()
+            try {
+                val fronted = com.cncverse.stremiobridge.network.geo.GeoRouter.frontedForTunnel(request)
+                val resp = if (fronted != null) {
+                    com.cncverse.stremiobridge.network.geo.ProxyPool.frontingClientFor(t.endpoint).newCall(fronted).execute()
+                } else {
+                    com.cncverse.stremiobridge.network.geo.ProxyPool.clientFor(t.endpoint, streaming = true).newCall(request).execute()
+                }
+                if (resp.code !in PROXY_RETRY_CODES) {
+                    lastBlocked?.close()
+                    com.cncverse.stremiobridge.network.geo.ProxyPool.reportSuccess(t, System.currentTimeMillis() - started)
+                    return resp
+                }
+                resp.close()
+            } catch (e: java.io.IOException) {
+                com.cncverse.stremiobridge.network.geo.ProxyPool.reportFailure(t, e.javaClass.simpleName)
+            }
+        }
         return lastBlocked
     }
 

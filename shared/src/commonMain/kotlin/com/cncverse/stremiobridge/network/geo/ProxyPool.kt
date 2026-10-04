@@ -301,6 +301,21 @@ object ProxyPool {
 
     private const val BUILTIN_RETRY_MS = 60_000L
 
+    /**
+     * The own Indian tunnel as a LAST resort for other hosts of its country (tv.imgcdn.kim…):
+     * callers use it only after every other proxy failed for the request — never as a default,
+     * to keep the VPS's bandwidth for Jio.
+     */
+    fun lastResortTunnel(country: String, host: String): PooledProxy? {
+        if (GeoRouter.tunnelHost(host)) return null // already its first choice
+        val now = System.currentTimeMillis()
+        val banned = bannedFor(host)
+        return pools[country].orEmpty().firstOrNull {
+            it.builtin && it.isp == "tunnel" && it.endpoint.key !in banned &&
+                (it.consecutiveFailures < failLimit(it) || now - it.lastFailAt > BUILTIN_RETRY_MS)
+        }
+    }
+
     /** The own Indian tunnel carries only its domains (Jio); other built-ins serve anything. */
     private fun servesHost(p: PooledProxy, host: String?): Boolean =
         p.isp != "tunnel" || (host != null && GeoRouter.tunnelHost(host))
