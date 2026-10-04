@@ -4883,6 +4883,18 @@ function updateCatalogStatusUI() {
 }
 
 /* Feature 4: Curated Presets */
+/* Live-only: every type it reports is Live. ("TvSeries" contains "tv" — a substring test pulled
+   ~250 movie/series extensions into the Live TV preset.) */
+function isLiveOnly(e) {
+  var ts = e.types || [];
+  if (!ts.length) return false;
+  for (var i = 0; i < ts.length; i++) {
+    var t = String(ts[i]).toLowerCase();
+    if (t !== "live" && t !== "livestream") return false;
+  }
+  return true;
+}
+
 function applyPreset(preset, btn) {
   if (preset === "dev_choice") {
     resetToDevChoice();
@@ -4898,16 +4910,13 @@ function applyPreset(preset, btn) {
     toast("All sources enabled");
   } else if (preset === "live_sports") {
     targetInternals = exts.filter(function(e) {
-      var types = (e.types || []).join(" ").toLowerCase();
+      if (!isLiveOnly(e)) return false;
       var n = (e.name + " " + e.internalName).toLowerCase();
-      return types.indexOf("live") >= 0 || n.indexOf("sport") >= 0 || n.indexOf("streamed") >= 0 || n.indexOf("daddy") >= 0;
+      return /sport|streamed|daddy|event|cric|match|football|fifa|ipl|f1|ufc|wwe/.test(n);
     }).map(function(e){ return e.internalName; });
     toast("Live Sports applied");
   } else if (preset === "live_tv") {
-    targetInternals = exts.filter(function(e) {
-      var types = (e.types || []).join(" ").toLowerCase();
-      return types.indexOf("tv") >= 0 || types.indexOf("live") >= 0;
-    }).map(function(e){ return e.internalName; });
+    targetInternals = exts.filter(function(e) { return isLiveOnly(e); }).map(function(e){ return e.internalName; });
     toast("Live TV applied");
   } else if (preset === "movies_tv") {
     targetInternals = exts.filter(function(e) {
