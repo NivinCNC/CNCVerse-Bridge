@@ -11,6 +11,7 @@ import io.ktor.server.application.*
 import io.ktor.server.cio.*
 import io.ktor.server.engine.*
 import io.ktor.server.plugins.contentnegotiation.*
+import io.ktor.server.plugins.compression.*
 import io.ktor.server.plugins.cors.routing.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
@@ -1098,6 +1099,18 @@ object StremioServer {
 
     private fun Application.setupPlugins() {
         install(ContentNegotiation) { json(serverJson) }
+        // JSON was sent uncompressed: the biggest catalog is 14.6 MB raw vs 0.6 MB gzipped, and copying
+        // that per viewer was a large share of the server's kernel time. Video segments and playlists
+        // aren't JSON and stay untouched; pre-compressed catalogs opt out (suppressCompression).
+        install(io.ktor.server.plugins.compression.Compression) {
+            gzip {
+                matchContentType(io.ktor.http.ContentType.Application.Json)
+                minimumSize(1024)
+                // Catalog routes gzip their own cached bytes once (respondCatalogJson); compressing
+                // here as well sent big catalogs gzipped twice
+                condition { !request.path().contains("/catalog/") }
+            }
+        }
         
         // Stremio Web (and sometimes Desktop) can be very strict or send 'Origin: null'. 
         // Manually appending these headers ensures maximum compatibility across all Stremio clients.
@@ -1556,7 +1569,7 @@ object StremioServer {
      * list they came from (identity check), so a refreshed page is re-encoded once and a stale
      * encoding can never be served.
      */
-    private class EncodedCatalog(val metas: List<StremioMeta>, val bytes: ByteArray)
+    private class EncodedCatalog(val metas: List<StremioMeta>, val bytes: ByteArray, val gzipped: ByteArray)
     private val encodedCatalogs = ConcurrentHashMap<Int, EncodedCatalog>()
     private const val ENCODE_CACHE_MIN_ITEMS = 200
     private const val ENCODE_CACHE_MAX = 64
@@ -1569,16 +1582,27 @@ object StremioServer {
             return
         }
         val key = System.identityHashCode(metas)
-        val bytes = encodedCatalogs[key]?.takeIf { it.metas === metas }?.bytes
+        val encoded = encodedCatalogs[key]?.takeIf { it.metas === metas }
             ?: withContext(Dispatchers.Default) {
-                serverJson.encodeToString(StremioCatalogResponse.serializer(), StremioCatalogResponse(metas)).toByteArray()
+                val raw = serverJson.encodeToString(StremioCatalogResponse.serializer(), StremioCatalogResponse(metas)).toByteArray()
+                // gzip once here instead of per request
+                val gz = java.io.ByteArrayOutputStream(raw.size / 8).also { out ->
+                    java.util.zip.GZIPOutputStream(out).use { it.write(raw) }
+                }.toByteArray()
+                EncodedCatalog(metas, raw, gz)
             }.also {
                 if (encodedCatalogs.size >= ENCODE_CACHE_MAX ||
-                    encodedCatalogs.values.sumOf { e -> e.bytes.size.toLong() } + it.size > ENCODE_CACHE_MAX_BYTES
+                    encodedCatalogs.values.sumOf { e -> e.bytes.size.toLong() + e.gzipped.size } + it.bytes.size > ENCODE_CACHE_MAX_BYTES
                 ) encodedCatalogs.clear()
-                encodedCatalogs[key] = EncodedCatalog(metas, it)
+                encodedCatalogs[key] = it
             }
-        respondBytes(bytes, io.ktor.http.ContentType.Application.Json)
+        if (request.headers[io.ktor.http.HttpHeaders.AcceptEncoding]?.contains("gzip", ignoreCase = true) == true) {
+            response.headers.append(io.ktor.http.HttpHeaders.ContentEncoding, "gzip")
+            response.headers.append(io.ktor.http.HttpHeaders.Vary, io.ktor.http.HttpHeaders.AcceptEncoding)
+            respondBytes(encoded.gzipped, io.ktor.http.ContentType.Application.Json)
+        } else {
+            respondBytes(encoded.bytes, io.ktor.http.ContentType.Application.Json)
+        }
     }
 
     private suspend fun ApplicationCall.respondMeta(profileId: String?) {

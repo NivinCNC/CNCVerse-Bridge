@@ -40,6 +40,8 @@ kotlin {
                 implementation(libs.ktor.server.cio)
                 implementation(libs.ktor.server.content.negotiation)
                 implementation(libs.ktor.server.cors)
+                // gzip for JSON responses (catalogs up to ~15 MB compress ~24x)
+                implementation(libs.ktor.server.compression)
 
                 // Ktor Client (for downloading CNC.json and plugins)
                 implementation(libs.ktor.client.core)
