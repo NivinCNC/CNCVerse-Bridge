@@ -1968,7 +1968,9 @@ object StremioServer {
 
         return try {
             if (!search.isNullOrBlank()) {
-                val results = api.search(search)
+                // Cached per extension + query (shared with the stream lookup's searches)
+                val results = SearchLoadCache.getSearch(api.internalName, search)
+                    ?: api.search(search).also { SearchLoadCache.putSearch(api.internalName, search, it) }
                 val filtered = if (api.supportedTypes.size > 1) {
                     results.filter { r -> cs3TvTypeToStremio(r.type) == type }
                         .ifEmpty { results }
@@ -2339,8 +2341,13 @@ object StremioServer {
      * "pluginInternalName::query" or "pluginInternalName::url").
      */
     private object SearchLoadCache {
-        private const val TTL_MS = 10 * 60 * 1_000L   // 10 minutes
+        private const val TTL_MS = 10 * 60 * 1_000L   // load() results: 10 minutes
         private const val MAX_ENTRIES = 500
+        // Search results (shared by Stremio's catalog search and the IMDb/TMDB stream lookup):
+        // hits 30 min, empty results 5 min so a site that hiccupped isn't "no results" for long
+        private const val SEARCH_TTL_MS = 30 * 60 * 1_000L
+        private const val EMPTY_SEARCH_TTL_MS = 5 * 60 * 1_000L
+        private const val MAX_SEARCH_ENTRIES = 5_000
 
         private data class Entry<T>(val value: T, val timestamp: Long = System.currentTimeMillis())
         /** Wraps a nullable MediaInfo so we can cache a 'null' result (load returned nothing). */
@@ -2349,17 +2356,27 @@ object StremioServer {
         private val searchCache = ConcurrentHashMap<String, Entry<List<SearchResult>>>()
         private val loadCache   = ConcurrentHashMap<String, Entry<CachedLoad>>()
 
-        private fun searchKey(apiKey: String, query: String) = "$apiKey::search::$query"
+        /** "Dune", " dune " and "DUNE" share an entry. */
+        private fun searchKey(apiKey: String, query: String) =
+            "$apiKey::search::" + query.trim().lowercase().replace(WHITESPACE, " ")
+        private val WHITESPACE = Regex("[ \t\r\n]+")
         private fun loadKey(apiKey: String, url: String)    = "$apiKey::load::$url"
 
         fun getSearch(apiKey: String, query: String): List<SearchResult>? {
-            val e = searchCache[searchKey(apiKey, query)] ?: return null
-            if (System.currentTimeMillis() - e.timestamp > TTL_MS) { searchCache.remove(searchKey(apiKey, query)); return null }
+            val k = searchKey(apiKey, query)
+            val e = searchCache[k] ?: return null
+            val ttl = if (e.value.isEmpty()) EMPTY_SEARCH_TTL_MS else SEARCH_TTL_MS
+            if (System.currentTimeMillis() - e.timestamp > ttl) { searchCache.remove(k); return null }
             return e.value
         }
 
+        /** Only call with the result of a search that completed (errors are never cached). */
         fun putSearch(apiKey: String, query: String, value: List<SearchResult>) {
-            if (searchCache.size >= MAX_ENTRIES) searchCache.keys.take(50).forEach { searchCache.remove(it) }
+            if (searchCache.size >= MAX_SEARCH_ENTRIES) {
+                // Drop the oldest tenth
+                searchCache.entries.sortedBy { it.value.timestamp }.take(MAX_SEARCH_ENTRIES / 10)
+                    .forEach { searchCache.remove(it.key) }
+            }
             searchCache[searchKey(apiKey, query)] = Entry(value)
         }
 
