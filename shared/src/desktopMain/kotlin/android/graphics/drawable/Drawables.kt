@@ -10,6 +10,9 @@ open class Drawable {
     val intrinsicHeight: Int get() = 0
 }
 
+/** Retain the Android drawable hierarchy for plugin settings discovery. */
+class StateListDrawable : Drawable()
+
 class ColorDrawable : Drawable {
     var color: Int = 0
         private set
