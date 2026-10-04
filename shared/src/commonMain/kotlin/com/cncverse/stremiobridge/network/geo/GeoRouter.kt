@@ -62,6 +62,14 @@ data class GeoProxySettings(
     val ultrasurfProxy: String = System.getenv("CNC_ULTRASURF_PROXY")?.trim().orEmpty(),
     /** Own Indian tunnel (socks on the Indian VPS, reverse-tunnelled to this host); tried before Ultrasurf. */
     val tunnelProxy: String = System.getenv("CNC_TUNNEL_PROXY")?.trim().orEmpty(),
+    /** Hosts (and subdomains) the own tunnel carries — only these, to keep the VPS's bandwidth for Jio. */
+    val tunnelDomains: List<String> = listOf("jio.com"),
+    /**
+     * Domain fronting through the tunnel: blocked host -> allowed host on the same CDN. The tunnel's
+     * network (Sophos) resets TLS by SNI for jiotvmblive.cdn.jio.com; connecting as jiotvpllive and
+     * naming the real host in the Host header gets the same content from Fastly.
+     */
+    val tunnelFronting: Map<String, String> = mapOf("jiotvmblive.cdn.jio.com" to "jiotvpllive.cdn.jio.com"),
     /** Host suffixes that always go through Ultrasurf (never public proxies, never skipped). */
     val ultrasurfDomains: List<String> = listOf("workers.dev", "jio.com"),
 )
@@ -328,6 +336,25 @@ object GeoRouter {
         if (listed.size > 1) return listed.maxWith(compareBy<String> { ProxyPool.healthy(it).size }.thenBy { -listed.indexOf(it) })
         plugins[plugin]?.country?.let { return it }
         return settings.defaultCountry.takeIf { it.length == 2 }
+    }
+
+    /**
+     * The request to send through the own tunnel for [request]: for a fronted host, the URL uses
+     * the allowed host (TLS SNI) and the Host header names the real one. Null = send as is.
+     */
+    fun frontedForTunnel(request: okhttp3.Request): okhttp3.Request? {
+        val real = request.url.host
+        val front = settings.tunnelFronting[real.lowercase()] ?: return null
+        return request.newBuilder()
+            .url(request.url.newBuilder().host(front).build())
+            .header("Host", real)
+            .build()
+    }
+
+    /** Hosts the own Indian tunnel may carry (settings.tunnelDomains, suffix match). */
+    fun tunnelHost(host: String): Boolean {
+        val h = host.lowercase()
+        return settings.tunnelProxy.isNotBlank() && settings.tunnelDomains.any { d -> h == d || h.endsWith(".$d") }
     }
 
     /** Hosts pinned to Ultrasurf (settings.ultrasurfDomains, suffix match). */
@@ -702,13 +729,29 @@ object GeoRouter {
             private set
         @Volatile var lastUsed = System.currentTimeMillis()
 
+        @Volatile private var lastRankCheck = 0L
+
         @Synchronized
         fun current(): PooledProxy? {
-            lastUsed = System.currentTimeMillis()
+            val now = System.currentTimeMillis()
+            lastUsed = now
             // Hot path (every segment of every viewer): keep a working pair without rescanning the pool
             val p = primary
             val s = standby
-            if (p != null && s != null && ProxyPool.isUsable(p) && ProxyPool.isUsable(s)) return p
+            if (p != null && s != null && ProxyPool.isUsable(p) && ProxyPool.isUsable(s)) {
+                // Pinned hosts: go back to a better-ranked built-in (the tunnel) once it works again
+                if (p.builtin && p.rank > 0 && now - lastRankCheck > 15_000L) {
+                    lastRankCheck = now
+                    val best = ProxyPool.leastLoaded(country, emptySet(), host)
+                    if (best != null && best.builtin && best.rank < p.rank) {
+                        ServerState.info("[GeoProxy] stream $key: back to ${best.endpoint.key} (preferred)")
+                        setPrimary(best)
+                        standby = p
+                        return best
+                    }
+                }
+                return p
+            }
             val healthy = ProxyPool.healthy(country).map { it.endpoint.key }.toSet()
             if (primary != null && primary!!.endpoint.key !in healthy) {
                 setPrimary(standby?.takeIf { it.endpoint.key in healthy })
@@ -731,10 +774,14 @@ object GeoRouter {
 
         @Synchronized
         fun failover(failed: PooledProxy, reason: String, penalize: Boolean = true, banForHost: Boolean = false) {
+            // A TLS handshake failing through a built-in tunnel is that network filtering this one
+            // hostname (BSNL blocks jiotvmblive.cdn.jio.com by SNI; jiotvpllive works on the same
+            // IPs): ban it for this host only and keep the tunnel healthy for every other host.
+            val hostFiltered = failed.builtin && reason == "SSLHandshakeException"
             // A site-level refusal (expired token, 403) is not the proxy's fault — switch without penalty
-            if (penalize) ProxyPool.reportFailure(failed, reason)
+            if (penalize && !hostFiltered) ProxyPool.reportFailure(failed, reason)
             // 450/451 = this site refuses that IP outright — don't hand it to this host again for a while
-            if (banForHost) ProxyPool.banForHost(host, failed)
+            if (banForHost || hostFiltered) ProxyPool.banForHost(host, failed)
             if (primary === failed) {
                 val next = standby?.takeIf { it !== failed }
                 standby = null

@@ -122,6 +122,8 @@ class PooledProxy(
     /** Live channels currently leased to this proxy (see GeoRouter.StreamLease). */
     val activeStreams = AtomicInteger(0)
     @Volatile var lastOk: Long = 0
+    /** Last request/health-check failure (built-ins are retried with real traffic 60 s after it). */
+    @Volatile var lastFailAt: Long = 0
     @Volatile var lastChecked: Long = 0
     val addedAt: Long = System.currentTimeMillis()
 
@@ -219,6 +221,15 @@ object ProxyPool {
     private val proxyClients = ConcurrentHashMap<String, OkHttpClient>()
 
     /** Client that sends everything through [ep]. Cached per endpoint. */
+    /**
+     * HTTP/1.1-only variant for domain-fronted requests: over HTTP/2 OkHttp sends the URL host as
+     * :authority and drops a custom Host header, so the fronting would silently not happen.
+     */
+    fun frontingClientFor(ep: ProxyEndpoint): OkHttpClient =
+        proxyClients.getOrPut(ep.key + "#front") {
+            clientFor(ep, streaming = true).newBuilder().protocols(listOf(okhttp3.Protocol.HTTP_1_1)).build()
+        }
+
     fun clientFor(ep: ProxyEndpoint, streaming: Boolean = false): OkHttpClient {
         val key = ep.key + (if (streaming) "#s" else "")
         return proxyClients.getOrPut(key) {
@@ -273,16 +284,34 @@ object ProxyPool {
      * top few. Empty when the pool is still being built.
      */
     /** Usable built-in tunnels (Ultrasurf), whatever country pool holds them. */
-    private fun builtins(): List<PooledProxy> =
-        pools.values.flatten().filter { it.builtin && it.consecutiveFailures < failLimit(it) }.sortedBy { it.rank }
+    private fun builtins(host: String? = null): List<PooledProxy> {
+        val now = System.currentTimeMillis()
+        val banned = host?.let { bannedFor(it) }.orEmpty()
+        val usable = pools.values.flatten().filter {
+            it.builtin && servesHost(it, host) &&
+                // A built-in marked down is tried again with real traffic after a minute — one
+                // burst of errors used to park the Indian tunnel for good and every Jio channel
+                // stayed on slow Ultrasurf.
+                (it.consecutiveFailures < failLimit(it) || now - it.lastFailAt > BUILTIN_RETRY_MS)
+        }.sortedBy { it.rank }
+        // Skip built-ins banned for this host (e.g. the tunnel's network filters jiotvmblive),
+        // unless that would leave nothing
+        return usable.filter { it.endpoint.key !in banned }.ifEmpty { usable }
+    }
+
+    private const val BUILTIN_RETRY_MS = 60_000L
+
+    /** The own Indian tunnel carries only its domains (Jio); other built-ins serve anything. */
+    private fun servesHost(p: PooledProxy, host: String?): Boolean =
+        p.isp != "tunnel" || (host != null && GeoRouter.tunnelHost(host))
 
     fun pick(country: String, n: Int = 2, exclude: Set<String> = emptySet(), host: String? = null, residentialOnly: Boolean = false): List<PooledProxy> {
         // Hosts pinned to Ultrasurf (workers.dev…) never use anything else
-        if (host != null && GeoRouter.ultrasurfOnly(host)) return builtins().filter { it.endpoint.key !in exclude }.take(n)
+        if (host != null && GeoRouter.ultrasurfOnly(host)) return builtins(host).filter { it.endpoint.key !in exclude }.take(n)
         demand(country)
         val banned = host?.let { bannedFor(it) }.orEmpty()
         val ranked = healthy(country)
-            .filter { it.endpoint.key !in exclude && it.endpoint.key !in banned && (!residentialOnly || it.residential || it.custom) }
+            .filter { it.endpoint.key !in exclude && it.endpoint.key !in banned && (!residentialOnly || it.residential || it.custom) && servesHost(it, host) }
             .sortedBy { it.score }
         if (ranked.isEmpty()) return emptyList()
         // Built-in tunnels (Ultrasurf) always first; spread the rest over the best three
@@ -297,11 +326,11 @@ object ProxyPool {
      * carrying the fewest channels, then latency.
      */
     fun leastLoaded(country: String, exclude: Set<String>, host: String? = null, cap: Int = Int.MAX_VALUE): PooledProxy? {
-        if (host != null && GeoRouter.ultrasurfOnly(host)) return builtins().firstOrNull { it.endpoint.key !in exclude }
+        if (host != null && GeoRouter.ultrasurfOnly(host)) return builtins(host).firstOrNull { it.endpoint.key !in exclude }
         demand(country)
         val banned = host?.let { bannedFor(it) }.orEmpty()
         return healthy(country)
-            .filter { it.endpoint.key !in exclude && it.endpoint.key !in banned }
+            .filter { it.endpoint.key !in exclude && it.endpoint.key !in banned && servesHost(it, host) }
             .minWithOrNull(
                 compareBy<PooledProxy> { cap != Int.MAX_VALUE && it.activeStreams.get() >= cap.toLong() * it.capacity }
                     .thenBy { !it.builtin }
@@ -320,7 +349,8 @@ object ProxyPool {
 
     /** [p] got a geo refusal from [host]; don't use it for that host for a while. */
     fun banForHost(host: String, p: PooledProxy) {
-        if (p.builtin && GeoRouter.ultrasurfOnly(host)) return // pinned: always Ultrasurf
+        // Pinned hosts may ban a built-in now that there are several (tunnel, Ultrasurf): builtins()
+        // ignores the bans again if every one of them is banned, so a pinned host never ends up with none
         hostBans["$host|${p.endpoint.key}"] = System.currentTimeMillis() + HOST_BAN_MS
         if (hostBans.size > 5_000) {
             val now = System.currentTimeMillis()
@@ -378,6 +408,7 @@ object ProxyPool {
     fun reportFailure(p: PooledProxy, reason: String?) {
         p.failures.incrementAndGet()
         p.consecutiveFailures++
+        p.lastFailAt = System.currentTimeMillis()
         // Request failures only mark a proxy down: a site resetting one connection doesn't mean
         // the proxy is dead. It stays in the pool and the health check decides (see healthCheck).
         if (p.consecutiveFailures == failLimit(p)) {

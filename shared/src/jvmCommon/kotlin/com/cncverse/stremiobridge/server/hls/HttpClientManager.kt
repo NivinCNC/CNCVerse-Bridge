@@ -129,8 +129,13 @@ object HttpClientManager {
             val p = lease.current() ?: return lastBlocked
             val started = System.currentTimeMillis()
             try {
-                val resp = com.cncverse.stremiobridge.network.geo.ProxyPool
-                    .clientFor(p.endpoint, streaming = true).newCall(request).execute()
+                // Through the own tunnel, hosts its network filters by SNI are domain-fronted
+                val fronted = if (p.isp == "tunnel") com.cncverse.stremiobridge.network.geo.GeoRouter.frontedForTunnel(request) else null
+                val resp = if (fronted != null) {
+                    com.cncverse.stremiobridge.network.geo.ProxyPool.frontingClientFor(p.endpoint).newCall(fronted).execute()
+                } else {
+                    com.cncverse.stremiobridge.network.geo.ProxyPool.clientFor(p.endpoint, streaming = true).newCall(request).execute()
+                }
                 if (resp.code in PROXY_RETRY_CODES && !(resp.code == 403 && com.cncverse.stremiobridge.network.geo.GeoRouter.isToken403Host(request.url.host))) {
                     lastBlocked?.close()
                     lastBlocked = resp
