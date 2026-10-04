@@ -62,8 +62,8 @@ data class GeoProxySettings(
     val ultrasurfProxy: String = System.getenv("CNC_ULTRASURF_PROXY")?.trim().orEmpty(),
     /** Own Indian tunnel (socks on the Indian VPS, reverse-tunnelled to this host); tried before Ultrasurf. */
     val tunnelProxy: String = System.getenv("CNC_TUNNEL_PROXY")?.trim().orEmpty(),
-    /** Hosts (and subdomains) the own tunnel carries — only these, to keep the VPS's bandwidth for Jio. */
-    val tunnelDomains: List<String> = listOf("jio.com"),
+    /** Hosts (and subdomains) the own tunnel carries first — others use it only as a last resort. */
+    val tunnelDomains: List<String> = listOf("jio.com", "workers.dev"),
     /**
      * Domain fronting through the tunnel: blocked host -> allowed host on the same CDN. The tunnel's
      * network (Sophos) resets TLS by SNI for jiotvmblive.cdn.jio.com; connecting as jiotvpllive and
