@@ -11,6 +11,7 @@ import com.cncverse.stremiobridge.network.AdaptiveHostDns
 import com.cncverse.stremiobridge.server.MainApiWrapper
 import com.cncverse.stremiobridge.server.MediaInfo
 import com.cncverse.stremiobridge.server.MediaInfoEpisode
+import com.cncverse.stremiobridge.server.withExtras
 import com.cncverse.stremiobridge.server.SearchResult
 import com.cncverse.stremiobridge.server.StremioServer
 import com.cncverse.stremiobridge.state.LoadedPluginInfo
@@ -1122,7 +1123,7 @@ private fun Any.reflectToMediaInfo(originalUrl: String): MediaInfo? {
                     .recoverCatching { epCls.getMethod("getDataUrl").invoke(ep) as? String }
                     .getOrNull() ?: return@mapNotNull null,
                 posterUrl = runCatching { epCls.getMethod("getPosterUrl").invoke(ep) as? String }.getOrNull()
-            )
+            ).withExtras(ep)
         }
 
         var finalDataUrl = fetchedDataUrl ?: originalUrl
@@ -1155,7 +1156,7 @@ private fun Any.reflectToMediaInfo(originalUrl: String): MediaInfo? {
             year = runCatching { cls.getMethod("getYear").invoke(this) as? Int }.getOrNull(),
             dataUrl = finalDataUrl,
             episodes = finalMappedEpisodes
-        )
+        ).withExtras(this)
     } catch (e: Exception) {
         ServerState.warn("reflectToMediaInfo error: ${e.message}")
         null

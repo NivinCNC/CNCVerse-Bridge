@@ -283,23 +283,57 @@ object ProxyPool {
      * Up to [n] proxies for [country], best first, spreading load across the
      * top few. Empty when the pool is still being built.
      */
-    /** Usable built-in tunnels (Ultrasurf), whatever country pool holds them. */
-    private fun builtins(host: String? = null): List<PooledProxy> {
+    /**
+     * Pool proxies of [country] that may be picked now: the healthy ones, plus built-ins (India
+     * tunnel, Ultrasurf) that were marked down more than a minute ago — they are tried again with
+     * real traffic, because one burst of errors used to park the tunnel for good and every Jio
+     * channel then stayed on slow Ultrasurf.
+     */
+    private fun selectable(country: String): List<PooledProxy> {
         val now = System.currentTimeMillis()
-        val banned = host?.let { bannedFor(it) }.orEmpty()
-        val usable = pools.values.flatten().filter {
-            it.builtin && servesHost(it, host) &&
-                // A built-in marked down is tried again with real traffic after a minute — one
-                // burst of errors used to park the Indian tunnel for good and every Jio channel
-                // stayed on slow Ultrasurf.
-                (it.consecutiveFailures < failLimit(it) || now - it.lastFailAt > BUILTIN_RETRY_MS)
-        }.sortedBy { it.rank }
-        // Skip built-ins banned for this host (e.g. the tunnel's network filters jiotvmblive),
-        // unless that would leave nothing
-        return usable.filter { it.endpoint.key !in banned }.ifEmpty { usable }
+        return pools[country].orEmpty().filter {
+            it.consecutiveFailures < failLimit(it) || (it.builtin && now - it.lastFailAt > BUILTIN_RETRY_MS)
+        }
     }
 
     private const val BUILTIN_RETRY_MS = 60_000L
+
+    /**
+     * Healthy residential (or private) pool proxies from every country except [exceptCountry],
+     * for hosts that block datacenter IPs instead of countries. Best first, with the top few
+     * shuffled to spread load. Built-ins (Ultrasurf/tunnel) are never included.
+     */
+    fun anyResidential(exceptCountry: String?, exclude: Set<String>, host: String): List<PooledProxy> {
+        val banned = bannedFor(host)
+        val ranked = pools.entries.asSequence()
+            .filter { it.key != exceptCountry }
+            .flatMap { it.value.asSequence() }
+            .filter {
+                !it.builtin && (it.residential || it.custom) && it.consecutiveFailures < failLimit(it) &&
+                    it.endpoint.key !in exclude && it.endpoint.key !in banned
+            }
+            .sortedBy { it.score }
+            .toList()
+        return ranked.take(4).shuffled() + ranked.drop(4)
+    }
+
+    /** host → (proxy key, until): the pool proxy that last got a request through, tried first next time. */
+    private val hostGood = ConcurrentHashMap<String, Pair<String, Long>>()
+    private const val HOST_GOOD_MS = 30 * 60_000L
+
+    fun rememberGood(host: String, p: PooledProxy) {
+        if (p.builtin) return
+        if (hostGood.size > 2_000) { val now = System.currentTimeMillis(); hostGood.entries.removeIf { it.value.second < now } }
+        hostGood[host] = p.endpoint.key to System.currentTimeMillis() + HOST_GOOD_MS
+    }
+
+    /** The remembered working proxy for [host], if it is still healthy and not banned for it. */
+    fun goodFor(host: String): PooledProxy? {
+        val (key, until) = hostGood[host] ?: return null
+        if (until < System.currentTimeMillis()) { hostGood.remove(host); return null }
+        if (key in bannedFor(host)) return null
+        return pools.values.asSequence().flatten().firstOrNull { it.endpoint.key == key && it.consecutiveFailures < failLimit(it) }
+    }
 
     /**
      * The own Indian tunnel as a LAST resort for other hosts of its country (tv.imgcdn.kim…):
@@ -321,15 +355,13 @@ object ProxyPool {
         p.isp != "tunnel" || (host != null && GeoRouter.tunnelHost(host))
 
     fun pick(country: String, n: Int = 2, exclude: Set<String> = emptySet(), host: String? = null, residentialOnly: Boolean = false): List<PooledProxy> {
-        // Hosts pinned to Ultrasurf (workers.dev…) never use anything else
-        if (host != null && GeoRouter.ultrasurfOnly(host)) return builtins(host).filter { it.endpoint.key !in exclude }.take(n)
         demand(country)
         val banned = host?.let { bannedFor(it) }.orEmpty()
-        val ranked = healthy(country)
+        val ranked = selectable(country)
             .filter { it.endpoint.key !in exclude && it.endpoint.key !in banned && (!residentialOnly || it.residential || it.custom) && servesHost(it, host) }
             .sortedBy { it.score }
         if (ranked.isEmpty()) return emptyList()
-        // Built-in tunnels (Ultrasurf) always first; spread the rest over the best three
+        // Built-ins first (India tunnel, then Ultrasurf); spread the rest over the best three
         val (builtin, rest) = ranked.partition { it.builtin }
         val head = rest.take(3).shuffled()
         return (builtin.sortedBy { it.rank } + head + rest.drop(3)).take(n)
@@ -341,10 +373,9 @@ object ProxyPool {
      * carrying the fewest channels, then latency.
      */
     fun leastLoaded(country: String, exclude: Set<String>, host: String? = null, cap: Int = Int.MAX_VALUE): PooledProxy? {
-        if (host != null && GeoRouter.ultrasurfOnly(host)) return builtins(host).firstOrNull { it.endpoint.key !in exclude }
         demand(country)
         val banned = host?.let { bannedFor(it) }.orEmpty()
-        return healthy(country)
+        return selectable(country)
             .filter { it.endpoint.key !in exclude && it.endpoint.key !in banned && servesHost(it, host) }
             .minWithOrNull(
                 compareBy<PooledProxy> { cap != Int.MAX_VALUE && it.activeStreams.get() >= cap.toLong() * it.capacity }
@@ -364,8 +395,8 @@ object ProxyPool {
 
     /** [p] got a geo refusal from [host]; don't use it for that host for a while. */
     fun banForHost(host: String, p: PooledProxy) {
-        // Pinned hosts may ban a built-in now that there are several (tunnel, Ultrasurf): builtins()
-        // ignores the bans again if every one of them is banned, so a pinned host never ends up with none
+        // A built-in (tunnel, Ultrasurf) can be banned for one host too — e.g. Ultrasurf refused by a
+        // site that blocks datacenter IPs — while staying in use for every other host
         hostBans["$host|${p.endpoint.key}"] = System.currentTimeMillis() + HOST_BAN_MS
         if (hostBans.size > 5_000) {
             val now = System.currentTimeMillis()

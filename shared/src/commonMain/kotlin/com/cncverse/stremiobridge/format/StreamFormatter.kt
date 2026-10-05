@@ -372,13 +372,18 @@ object StreamVariables {
         return (num * mult).toLong()
     }
 
+    /** "size next to <resolution>" expressions, compiled once per resolution (there are only a handful). */
+    private val RESOLUTION_SIZE_RX = java.util.concurrent.ConcurrentHashMap<String, Regex>()
+
     /** Size from the link's own name; for multi-quality release names, the size next to our resolution. */
     private fun sizeFrom(resolution: String?, linkText: String?, releaseText: String?): Long? {
         linkText?.let { t -> SIZE_RX.find(t)?.let { return parseSizeMatch(it) } }
         val t = releaseText ?: return null
         if (resolution != null) {
-            Regex(Regex.escape(resolution) + "\\s*[\\[(|:-]?\\s*" + SIZE_RX.pattern, RegexOption.IGNORE_CASE)
-                .find(t)?.let { m -> SIZE_RX.find(m.value)?.let { return parseSizeMatch(it) } }
+            // Compiling this per call was a cost of every stream on every response
+            RESOLUTION_SIZE_RX.getOrPut(resolution) {
+                Regex(Regex.escape(resolution) + "\\s*[\\[(|:-]?\\s*" + SIZE_RX.pattern, RegexOption.IGNORE_CASE)
+            }.find(t)?.let { m -> SIZE_RX.find(m.value)?.let { return parseSizeMatch(it) } }
         }
         val all = SIZE_RX.findAll(t).toList()
         return if (all.size == 1) parseSizeMatch(all[0]) else null // ambiguous pack listing → unknown
@@ -432,6 +437,20 @@ object StreamVariables {
      */
     fun resolutionOf(stream: StremioStream): String? =
         resolutionFrom(stream.info?.quality, stream.info?.linkName ?: stream.title)
+
+    /**
+     * File size in bytes when the link's own name says so, else null - never guessed from a
+     * multi-quality pack title. Same value the formatter shows as {stream.size}.
+     */
+    fun sizeBytesOf(stream: StremioStream): Long? {
+        val linkText = stream.info?.linkName ?: stream.title
+        val releaseText = stream.name?.substringBeforeLast('\n', "")?.takeIf { it.isNotBlank() }
+        return sizeFrom(resolutionOf(stream), linkText, releaseText)
+    }
+
+    /** The extension (addon) that produced [stream]. */
+    fun addonOf(stream: StremioStream): String? =
+        stream.info?.addonName ?: stream.name?.substringAfterLast('\n')?.substringBefore(" - ")?.takeIf { it.isNotBlank() }
 
     fun build(stream: StremioStream, ctx: StreamRequestContext): Map<String, Any?> {
         val info = stream.info
@@ -762,6 +781,10 @@ object StreamFormatter {
             })
         } catch (e: TemplateException) {
             FormatterPreviewResult(false, e.message)
+        } catch (e: Exception) {
+            // A bug or platform difference (e.g. regex on Android) must show up in the page, not as an empty 500
+            System.err.println("[Formatter] preview failed: " + e.stackTraceToString())
+            FormatterPreviewResult(false, "Preview failed: " + e.javaClass.simpleName + ": " + (e.message ?: ""))
         }
     }
 

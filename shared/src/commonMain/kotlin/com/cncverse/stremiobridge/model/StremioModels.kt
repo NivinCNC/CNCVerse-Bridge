@@ -65,6 +65,7 @@ data class StremioMeta(
     @SerialName("releaseInfo") val releaseInfo: String? = null,
     @SerialName("year")        val year: Int? = null,
     @SerialName("imdbRating")  val imdbRating: String? = null,
+    @SerialName("runtime")     val runtime: String? = null,
     @SerialName("genres")      val genres: List<String>? = null,
     @SerialName("cast")        val cast: List<String>? = null,
     @SerialName("links")       val links: List<MetaLink>? = null,

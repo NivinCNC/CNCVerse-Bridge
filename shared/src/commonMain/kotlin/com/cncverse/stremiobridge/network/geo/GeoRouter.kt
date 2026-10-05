@@ -70,8 +70,14 @@ data class GeoProxySettings(
      * naming the real host in the Host header gets the same content from Fastly.
      */
     val tunnelFronting: Map<String, String> = mapOf("jiotvmblive.cdn.jio.com" to "jiotvpllive.cdn.jio.com"),
-    /** Host suffixes that always go through Ultrasurf (never public proxies, never skipped). */
-    val ultrasurfDomains: List<String> = listOf("workers.dev", "jio.com"),
+    /** UNUSED — "built-in proxies only" was removed (hosts now fall back to public proxies after the built-ins). Kept so old saved settings still load. */
+    val ultrasurfDomains: List<String> = emptyList(),
+    /**
+     * Hosts that block datacenter IPs rather than countries (imgcdn.kim answers residential
+     * proxies from 12+ countries): after the host's own country (India) they may use residential
+     * proxies from ANY country before falling back to the own tunnel.
+     */
+    val anyCountryDomains: List<String> = listOf("imgcdn.kim"),
 )
 
 val DEFAULT_DOMAIN_RULES: Map<String, String> = mapOf(
@@ -261,7 +267,9 @@ object GeoRouter {
             blockTtlHours = s.blockTtlHours.coerceIn(1, 24 * 14),
             defaultCountry = s.defaultCountry.trim().uppercase().take(2),
             domainRules = rules,
-            ultrasurfDomains = s.ultrasurfDomains.map { it.trim().lowercase().removePrefix("*.").removePrefix(".") }
+            tunnelDomains = s.tunnelDomains.map { it.trim().lowercase().removePrefix("*.").removePrefix(".") }
+                .filter { it.isNotEmpty() && '.' in it }.distinct(),
+            anyCountryDomains = s.anyCountryDomains.map { it.trim().lowercase().removePrefix("*.").removePrefix(".") }
                 .filter { it.isNotEmpty() && '.' in it }.distinct(),
         )
         applySettings()
@@ -351,23 +359,22 @@ object GeoRouter {
             .build()
     }
 
+    /** Hosts allowed residential proxies from any country (settings.anyCountryDomains, suffix match). */
+    fun anyCountryHost(host: String): Boolean {
+        val h = host.lowercase()
+        return settings.anyCountryDomains.any { d -> h == d || h.endsWith(".$d") }
+    }
+
     /** Hosts the own Indian tunnel may carry (settings.tunnelDomains, suffix match). */
     fun tunnelHost(host: String): Boolean {
         val h = host.lowercase()
         return settings.tunnelProxy.isNotBlank() && settings.tunnelDomains.any { d -> h == d || h.endsWith(".$d") }
     }
 
-    /** Hosts pinned to Ultrasurf (settings.ultrasurfDomains, suffix match). */
-    fun ultrasurfOnly(host: String): Boolean {
-        val h = host.lowercase()
-        return (settings.ultrasurfProxy.isNotBlank() || settings.tunnelProxy.isNotBlank()) &&
-            settings.ultrasurfDomains.any { d -> h == d || h.endsWith(".$d") }
-    }
-
     /** Country of the domain rule matching [host] (suffix match), if any. */
     fun ruleCountry(host: String): String? {
         val h = host.lowercase()
-        if (ultrasurfOnly(h)) return "IN"
+        if (tunnelHost(h)) return "IN"
         return settings.domainRules.entries.firstOrNull { (d, _) -> h == d || h.endsWith(".$d") }?.value
     }
 
@@ -519,7 +526,7 @@ object GeoRouter {
      * not because the plugin is blocked here — they don't make it a "works only via proxy" one.
      */
     private fun markProxied(plugin: String?, host: String) {
-        if (plugin == null || ruleCountry(host) != null || ultrasurfOnly(host)) return
+        if (plugin == null || ruleCountry(host) != null) return
         lastProxiedAt[plugin] = System.currentTimeMillis()
     }
 
@@ -554,13 +561,20 @@ object GeoRouter {
      * whose answer is itself a geo block (or a proxy-level error) is skipped
      * for the next one. Returns the first usable response, the last blocked
      * one when nothing better came back, or null when no proxy answered.
+     *
+     * Hosts in settings.anyCountryDomains (imgcdn.kim: blocks datacenter IPs, not countries) get
+     * two extra steps: the proxy that last worked for the host goes first, and after [country]'s
+     * proxies fail, up to three residential proxies from any other country are tried.
      */
     fun viaPool(plugin: String?, country: String, req: Request, residentialOnly: Boolean = false): Response? {
+        val host = req.url.host
+        val anyCountry = anyCountryHost(host)
         val tried = HashSet<String>()
         var lastBlocked: Response? = null
         val refused = ArrayList<PooledProxy>(2)
-        repeat(3) {
-            val p = ProxyPool.pick(country, 1, tried, req.url.host, residentialOnly).firstOrNull() ?: return lastBlocked
+
+        /** One attempt through [p]: the response when it got through, else null. */
+        fun attempt(p: PooledProxy): Response? {
             tried += p.endpoint.key
             val started = System.currentTimeMillis()
             try {
@@ -572,10 +586,10 @@ object GeoRouter {
                         ProxyPool.reportFailure(p, "HTTP ${resp.code}")
                     }
                     // This proxy's IP is refused by this site (e.g. datacenter range) — ban it for this host, try another
-                    geoBlocked(req.url.host, resp.code) -> {
+                    geoBlocked(host, resp.code) -> {
                         lastBlocked?.close()
                         lastBlocked = resp
-                        if (resp.code in HARD_BLOCK_CODES || resp.header("cf-mitigated") != null) ProxyPool.banForHost(req.url.host, p)
+                        if (resp.code in HARD_BLOCK_CODES || resp.header("cf-mitigated") != null) ProxyPool.banForHost(host, p)
                         else refused += p
                         ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
                     }
@@ -583,10 +597,11 @@ object GeoRouter {
                         lastBlocked?.close()
                         ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
                         counters.getOrPut(plugin ?: ANY) { Counters() }.ok.incrementAndGet()
-                        markProxied(plugin, req.url.host)
+                        markProxied(plugin, host)
+                        if (anyCountry) ProxyPool.rememberGood(host, p)
                         // The site answers from here, so a 403 from the earlier proxy was about its IP
                         // (e.g. Ultrasurf on tv.imgcdn.kim) — skip it for this host for a while
-                        refused.forEach { ProxyPool.banForHost(req.url.host, it) }
+                        refused.forEach { ProxyPool.banForHost(host, it) }
                         return resp
                     }
                 }
@@ -594,19 +609,40 @@ object GeoRouter {
                 ProxyPool.reportFailure(p, e.javaClass.simpleName)
             }
             counters.getOrPut(plugin ?: ANY) { Counters() }.fail.incrementAndGet()
+            return null
         }
+
+        // The proxy that last got through for this host (any country): no need to rediscover it
+        if (anyCountry) ProxyPool.goodFor(host)?.let { g -> attempt(g)?.let { return it } }
+
+        repeat(3) {
+            val p = ProxyPool.pick(country, 1, tried, host, residentialOnly).firstOrNull() ?: return@repeat
+            attempt(p)?.let { return it }
+        }
+
+        // Residential proxies from any other country (the host blocks datacenter IPs, not countries)
+        if (anyCountry) {
+            repeat(3) {
+                val p = ProxyPool.anyResidential(country, tried, host).firstOrNull() ?: return@repeat
+                attempt(p)?.let {
+                    event(plugin, "$host: no $country proxy got through — used a ${p.country} residential proxy")
+                    return it
+                }
+            }
+        }
+
         // Nothing worked: the own Indian tunnel as a last resort (residential-only sites)
-        ProxyPool.lastResortTunnel(country, req.url.host)?.let { t ->
+        ProxyPool.lastResortTunnel(country, host)?.let { t ->
             val started = System.currentTimeMillis()
             try {
                 val sendReq = frontedForTunnel(req) ?: req
                 val client = if (sendReq !== req) ProxyPool.frontingClientFor(t.endpoint) else ProxyPool.clientFor(t.endpoint)
                 val resp = client.newCall(sendReq).execute()
-                if (resp.code != 407 && resp.code != 502 && resp.code != 504 && !geoBlocked(req.url.host, resp.code)) {
+                if (resp.code != 407 && resp.code != 502 && resp.code != 504 && !geoBlocked(host, resp.code)) {
                     lastBlocked?.close()
                     ProxyPool.reportSuccess(t, System.currentTimeMillis() - started)
                     counters.getOrPut(plugin ?: ANY) { Counters() }.ok.incrementAndGet()
-                    event(plugin, "${req.url.host}: no proxy got through — used the India tunnel (last resort)")
+                    event(plugin, "$host: no proxy got through — used the India tunnel (last resort)")
                     return resp
                 }
                 resp.close()
@@ -715,7 +751,13 @@ object GeoRouter {
             if (plugin == null && ruleCountry(host) == null) return null
             val (decision, country) = decide(plugin, mode, host)
             if (decision != Decision.PROXY_FIRST || country == null) return null
-            val picked = ProxyPool.pick(country, 2, host = host, residentialOnly = mode == RouteMode.FORCE_PROXY).map { it.endpoint.toJavaProxy() }
+            val inCountry = ProxyPool.pick(country, 2, host = host, residentialOnly = mode == RouteMode.FORCE_PROXY)
+            // imgcdn-style hosts: the proxy that last worked first, the country's own next, then
+            // residential ones from any other country
+            val anyCountry = anyCountryHost(host)
+            val good = if (anyCountry) ProxyPool.goodFor(host) else null
+            val others = if (anyCountry) ProxyPool.anyResidential(country, inCountry.map { it.endpoint.key }.toSet(), host).take(2) else emptyList()
+            val picked = (listOfNotNull(good) + inCountry + others).distinctBy { it.endpoint.key }.map { it.endpoint.toJavaProxy() }
             if (picked.isEmpty()) {
                 if (mode == RouteMode.FORCE_PROXY && plugin != null) probeMisses.getOrPut(plugin) { java.util.concurrent.atomic.AtomicInteger() }.incrementAndGet()
                 return null

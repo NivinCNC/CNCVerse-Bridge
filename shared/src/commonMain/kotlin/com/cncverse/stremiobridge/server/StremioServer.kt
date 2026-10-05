@@ -211,6 +211,17 @@ object StremioServer {
         val excludeCam: Boolean = false,
         /** Maximum streams to return per quality tier (0 = unlimited). */
         val maxStreamsPerResolution: Int = 0,
+        /** Hide subtitles: streams go out without subtitle tracks and /subtitles answers empty. */
+        val hideSubtitles: Boolean = false,
+        /** How streams are grouped: default | provider | quality. */
+        val groupBy: String = "default",
+        /** Order inside a group: default | size (largest first, unknown size last). */
+        val sortBy: String = "default",
+        /** Streams with a KNOWN file size outside [minSizeGb, maxSizeGb] are dropped; 0 = no bound. */
+        val minSizeGb: Double = 0.0,
+        val maxSizeGb: Double = 0.0,
+        /** Extension names in priority order: earlier ones come first inside each group. */
+        val providerOrder: List<String> = emptyList(),
         /** The profile's own stream formatter choice (null = follow the server's formatter). */
         val formatter: com.cncverse.stremiobridge.format.ProfileFormatter? = null,
         /** User-chosen profile name, shown in the Stremio addon title ("CNCVerse Bridge · Kids"). */
@@ -232,6 +243,17 @@ object StremioServer {
         val allowedResolutions: List<String>? = null,
         val excludeCam: Boolean? = null,
         val maxStreamsPerResolution: Int? = null,
+    )
+
+    /** Request body for POST /api/profile/{id}/playback. */
+    @Serializable
+    data class ProfilePlaybackRequest(
+        val hideSubtitles: Boolean = false,
+        val groupBy: String = "default",
+        val sortBy: String = "default",
+        val minSizeGb: Double = 0.0,
+        val maxSizeGb: Double = 0.0,
+        val providerOrder: List<String> = emptyList(),
     )
 
     @Serializable
@@ -646,7 +668,8 @@ object StremioServer {
     ) {
         val now = currentTimeMillis()
         val existing = profiles[profileId]
-        profiles[profileId] = ProfileRecord(
+        // copy(): every other field (formatter, name, playback settings...) carries over untouched
+        profiles[profileId] = (existing ?: ProfileRecord(createdAt = now)).copy(
             disabled = disabled,
             enabledOverrides = enabledOverrides,
             disableCatalogs = disableCatalogs ?: existing?.disableCatalogs ?: false,
@@ -654,9 +677,25 @@ object StremioServer {
             allowedResolutions = allowedResolutions ?: existing?.allowedResolutions ?: emptySet(),
             excludeCam = excludeCam ?: existing?.excludeCam ?: false,
             maxStreamsPerResolution = maxStreamsPerResolution ?: existing?.maxStreamsPerResolution ?: 0,
-            formatter = existing?.formatter,
-            displayName = existing?.displayName ?: "",
-            createdAt = existing?.createdAt ?: now,
+            lastSeen = now,
+        )
+        saveProfiles()
+    }
+
+    /** Updates a profile's filtering & playback settings (file size, subtitles, grouping, sorting, provider order). */
+    fun updateProfilePlayback(profileId: String, r: ProfilePlaybackRequest) {
+        val now = currentTimeMillis()
+        val existing = profiles.getOrPut(profileId) { ProfileRecord(createdAt = now, lastSeen = now) }
+        val max = r.maxSizeGb.coerceIn(0.0, 1000.0)
+        val min = r.minSizeGb.coerceIn(0.0, 1000.0).let { if (max > 0 && it > max) max else it }
+        profiles[profileId] = existing.copy(
+            hideSubtitles = r.hideSubtitles,
+            groupBy = r.groupBy.takeIf { it in setOf("default", "provider", "quality") } ?: "default",
+            sortBy = r.sortBy.takeIf { it in setOf("default", "size") } ?: "default",
+            minSizeGb = min,
+            maxSizeGb = max,
+            providerOrder = r.providerOrder.map { it.trim() }.filter { it.isNotEmpty() && it.length <= 80 }
+                .distinct().take(MAX_PROFILE_EXTENSIONS + 10),
             lastSeen = now,
         )
         saveProfiles()
@@ -768,6 +807,13 @@ object StremioServer {
             ",\"allowedResolutions\":[" + allowedResolutionsJson + "]" +
             ",\"excludeCam\":" + excludeCam +
             ",\"maxStreamsPerResolution\":" + maxStreamsPerResolution +
+            ",\"hideSubtitles\":" + (rec?.hideSubtitles ?: false) +
+            ",\"groupBy\":\"" + (rec?.groupBy ?: "default") + "\",\"sortBy\":\"" + (rec?.sortBy ?: "default") + "\"" +
+            ",\"minSizeGb\":" + (rec?.minSizeGb ?: 0.0) + ",\"maxSizeGb\":" + (rec?.maxSizeGb ?: 0.0) +
+            ",\"providerOrder\":" + serverJson.encodeToString(
+                kotlinx.serialization.serializer<List<String>>(),
+                rec?.providerOrder ?: emptyList(),
+            ) +
             ",\"createdAt\":" + (rec?.createdAt ?: 0) + ",\"lastSeen\":" + (rec?.lastSeen ?: 0) + extra + "}"
     }
 
@@ -1342,6 +1388,23 @@ object StremioServer {
                 call.respondText(profileJson(profileId), ContentType.Application.Json)
             }
 
+            // Filtering & playback: file size, subtitles, grouping, sorting, provider order
+            post("/api/profile/{profileId}/playback") {
+                val profileId = call.parameters["profileId"] ?: return@post call.respond(HttpStatusCode.BadRequest)
+                val rawText = try { call.receiveText() } catch (_: Throwable) { "" }
+                val body = try {
+                    serverJson.decodeFromString<ProfilePlaybackRequest>(rawText)
+                } catch (e: Exception) {
+                    return@post call.respondText(
+                        "{\"error\":\"invalid playback settings body\"}",
+                        ContentType.Application.Json,
+                        HttpStatusCode.BadRequest
+                    )
+                }
+                updateProfilePlayback(profileId, body)
+                call.respondText(profileJson(profileId), ContentType.Application.Json)
+            }
+
             // Toggle per-plugin catalog on/off for this profile
             post("/api/profile/{profileId}/toggle-catalog") {
                 val profileId = call.parameters["profileId"] ?: return@post call.respond(HttpStatusCode.BadRequest)
@@ -1634,7 +1697,7 @@ object StremioServer {
 
         // Filter streams according to user profile quality preferences (if requested with a profile)
         val filtered = if (profileId != null) {
-            profiles[profileId]?.let { filterStreamsByProfile(sorted, it) } ?: sorted
+            profiles[profileId]?.let { arrangeStreams(filterStreamsByProfile(sorted, it), it) } ?: sorted
         } else {
             sorted
         }
@@ -1645,13 +1708,19 @@ object StremioServer {
             com.cncverse.stremiobridge.format.StreamFormatter.contextFromId(type, id),
             profileId?.let { profiles[it]?.formatter },
         )
-        respond(StremioStreamResponse(formatted))
+        // "Hide subtitles": no subtitle tracks go out (after formatting, so the description stays truthful)
+        val out = if (profileId != null && profiles[profileId]?.hideSubtitles == true) formatted.map { it.copy(subtitles = null) } else formatted
+        respond(StremioStreamResponse(out))
     }
 
     private suspend fun ApplicationCall.respondSubtitles(profileId: String?) {
         val type = parameters["type"] ?: return respond(HttpStatusCode.BadRequest)
         val id   = parameters["id"]   ?: return respond(HttpStatusCode.BadRequest)
 
+        if (profileId != null && profiles[profileId]?.hideSubtitles == true) {
+            respond(StremioSubtitleResponse(emptyList()))
+            return
+        }
         val streams = withContext(pluginDispatcher) { buildStreams(type, id, profileId) }
         val subtitles = streams.flatMap { it.subtitles ?: emptyList() }.distinctBy { it.id }
 
@@ -2252,6 +2321,9 @@ object StremioServer {
 
     // ── Meta builder ──────────────────────────────────────────────────────────
 
+    /** A source that has not answered its detail page by now is skipped (Stremio gives up long before). */
+    private const val META_LOAD_TIMEOUT_MS = 25_000L
+
     private suspend fun buildMeta(type: String, id: String, profileId: String? = null): StremioMeta? {
         val (pluginKey, dataUrl) = StremioIds.decode(id) ?: return null
         // Item ids carry the source's display-name slug, which several extensions can share
@@ -2265,7 +2337,14 @@ object StremioServer {
             .filter { !isPluginBlocked(it, profileId) }
         for (api in candidates) {
             val meta = try {
-                api.load(dataUrl)?.toStremiMeta(nameSlug(api.name), type)
+                // Opening the same detail page again used to re-scrape the site every time
+                val key = apiKey(api)
+                val info = SearchLoadCache.getLoad(key, dataUrl)?.info
+                    ?: kotlinx.coroutines.withTimeoutOrNull(META_LOAD_TIMEOUT_MS) { api.load(dataUrl) }
+                        ?.also { SearchLoadCache.putLoad(key, dataUrl, it) }
+                info?.toStremiMeta(nameSlug(api.name), type)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
             } catch (e: Throwable) {
                 ServerState.warn("Meta error for ${api.name}: ${e.message}")
                 null
@@ -2317,6 +2396,33 @@ object StremioServer {
     /** Resolution tiers the configure page lets users pick; anything else is never filtered out. */
     private val SELECTABLE_RESOLUTIONS = setOf("2160p", "1080p", "720p", "480p", "360p")
 
+    /**
+     * Orders already-filtered streams by the profile's grouping, sorting and provider order.
+     * Default/quality: best resolution first, inside a resolution the provider order (or, with
+     * "sort by size", the biggest file first, unknown last). Provider grouping: all of one
+     * provider together, providers in the chosen order, best resolution first inside each.
+     */
+    fun arrangeStreams(streams: List<StremioStream>, profile: ProfileRecord): List<StremioStream> {
+        val bySize = profile.sortBy == "size"
+        val byProvider = profile.groupBy == "provider"
+        if (profile.providerOrder.isEmpty() && !bySize && !byProvider) return streams
+        val rank = profile.providerOrder.withIndex().associate { (i, n) -> n.lowercase() to i }
+        // Sort keys are computed ONCE per stream: the size lookup is a text search and a sort
+        // compares each stream about log2(n) times (6 ms -> well under 1 ms for 250 streams)
+        class Keyed(val stream: StremioStream, val providerRank: Int, val provider: String, val quality: Int, val sizeKey: Long)
+        val keyed = streams.map { st ->
+            val provider = com.cncverse.stremiobridge.format.StreamVariables.addonOf(st)?.lowercase().orEmpty()
+            // Largest first via a negated key; unknown size gets +1 so it sorts after every known one
+            val sizeKey = if (!bySize) 0L else -(com.cncverse.stremiobridge.format.StreamVariables.sizeBytesOf(st) ?: -1L)
+            Keyed(st, rank[provider] ?: Int.MAX_VALUE, provider, streamQualityRank(st), sizeKey)
+        }
+        val order = if (byProvider)
+            compareBy<Keyed>({ it.providerRank }, { it.provider }, { -it.quality }, { it.sizeKey })
+        else
+            compareBy<Keyed>({ -it.quality }, { it.sizeKey }, { it.providerRank })
+        return keyed.sortedWith(order).map { it.stream } // stable: ties keep their arrival order
+    }
+
     /** Filters a list of streams against a user's profile quality preferences. */
     fun filterStreamsByProfile(streams: List<StremioStream>, profile: ProfileRecord): List<StremioStream> {
         var result = streams
@@ -2334,6 +2440,17 @@ object StremioServer {
             result = result.filter { stream ->
                 val res = detectStreamResolution(stream).lowercase()
                 res !in SELECTABLE_RESOLUTIONS || res in allowed
+            }
+        }
+
+        // 2b. File size window: only streams whose size is KNOWN can be outside it (unknown always pass)
+        if (profile.minSizeGb > 0 || profile.maxSizeGb > 0) {
+            val gb = 1024.0 * 1024 * 1024
+            val lo = (profile.minSizeGb * gb).toLong()
+            val hi = if (profile.maxSizeGb > 0) (profile.maxSizeGb * gb).toLong() else Long.MAX_VALUE
+            result = result.filter { st ->
+                val size = com.cncverse.stremiobridge.format.StreamVariables.sizeBytesOf(st) ?: return@filter true
+                size in lo..hi
             }
         }
 
@@ -4343,6 +4460,67 @@ input:checked + .slider:before {
     </div>
   </div>
 
+  <!-- FILTERING & PLAYBACK (per profile) -->
+  <div class="u-card" id="playback-card" data-view="quality">
+    <div>
+      <div class="catalog-title" style="font-size:14px;"><span>Filtering &amp; Playback</span></div>
+      <div class="catalog-desc">File size limits, subtitles, grouping, sorting and provider order for this profile. Streams whose size is not known are never hidden by the size limits.</div>
+    </div>
+    <div style="display:flex;flex-wrap:wrap;gap:14px;align-items:flex-end;">
+      <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;color:var(--text-sub);">Min size (GB)
+        <input id="pb-min-gb" type="number" min="0" step="0.1" placeholder="Any" onchange="onPlaybackChange()" style="background:var(--surface);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-size:12.5px;font-weight:600;padding:6px 9px;outline:none;width:110px;">
+      </label>
+      <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;color:var(--text-sub);">Max size (GB)
+        <input id="pb-max-gb" type="number" min="0" step="0.1" placeholder="Any" onchange="onPlaybackChange()" style="background:var(--surface);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-size:12.5px;font-weight:600;padding:6px 9px;outline:none;width:110px;">
+      </label>
+      <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;color:var(--text-sub);">Group streams by
+        <select id="pb-group" onchange="onPlaybackChange()" style="background:var(--surface);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-size:12.5px;font-weight:600;padding:6px 9px;outline:none;">
+          <option value="default">Default</option>
+          <option value="provider">Provider</option>
+          <option value="quality">Quality</option>
+        </select>
+      </label>
+      <label style="display:flex;flex-direction:column;gap:4px;font-size:11px;font-weight:700;color:var(--text-sub);">Sort streams
+        <select id="pb-sort" onchange="onPlaybackChange()" style="background:var(--surface);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-size:12.5px;font-weight:600;padding:6px 9px;outline:none;">
+          <option value="default">Default</option>
+          <option value="size">Size (largest first)</option>
+        </select>
+      </label>
+      <label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;background:var(--surface);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-size:12.5px;font-weight:600;padding:6px 9px;outline:none;">
+        <input type="checkbox" id="pb-hide-subs" onchange="onPlaybackChange()" style="accent-color:var(--accent);cursor:pointer;">
+        <span>Hide subtitles</span>
+      </label>
+    </div>
+    <div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
+        <div class="catalog-title" style="font-size:13px;"><span>Provider order</span></div>
+        <button onclick="resetProviderOrder()" style="background:var(--surface);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-size:12px;font-weight:700;padding:5px 11px;cursor:pointer;">Reset</button>
+      </div>
+      <div class="catalog-desc">Inside each quality group, providers appear in this order. Only your switched-on movie &amp; series sources are listed.</div>
+      <div id="provider-order" style="display:flex;flex-direction:column;gap:6px;margin-top:8px;max-height:340px;overflow:auto;"></div>
+    </div>
+  </div>
+
+  <!-- SOURCE STATUS (live health of the sources) -->
+  <div class="u-card" id="status-card" data-view="status">
+    <div class="u-row" style="justify-content:space-between;gap:8px;">
+      <div>
+        <div class="catalog-title" style="font-size:14px;"><span>Source status</span></div>
+        <div class="catalog-desc">Live health of your sources, from the server's own checks.</div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
+        <label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;font-size:12px;font-weight:700;color:var(--text-sub);">
+          <input type="checkbox" id="status-all" onchange="renderStatusView()" style="accent-color:var(--accent);cursor:pointer;">
+          <span>All installed sources</span>
+        </label>
+        <button onclick="loadStatusView()" style="background:var(--surface);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-size:12px;font-weight:700;padding:5px 11px;cursor:pointer;">Refresh</button>
+      </div>
+    </div>
+    <div id="status-summary" style="display:flex;gap:10px;flex-wrap:wrap;"></div>
+    <div id="status-filters" style="display:flex;gap:6px;flex-wrap:wrap;"></div>
+    <div id="status-list" style="display:flex;flex-direction:column;gap:6px;"></div>
+  </div>
+
   <!-- USER STREAM FORMATTER (per profile) -->
   <div class="u-card" id="formatter-card" data-view="formatter">
     <div class="u-row" style="justify-content:space-between;">
@@ -4529,13 +4707,20 @@ input:checked + .slider:before {
     <button class="drawer-btn" data-page="quality" onclick="showView('quality'); toggleDrawer(false);">
       <div style="display:flex;align-items:center;gap:10px;">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="7" width="20" height="15" rx="2"/><polyline points="17 2 12 7 7 2"/></svg>
-        <span>Stream quality</span>
+        <span>Stream filters</span>
       </div>
     </button>
     <button class="drawer-btn" data-page="formatter" onclick="showView('formatter'); toggleDrawer(false);">
       <div style="display:flex;align-items:center;gap:10px;">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 7 4 4 20 4 20 7"/><line x1="9" y1="20" x2="15" y2="20"/><line x1="12" y1="4" x2="12" y2="20"/></svg>
         <span>Stream formatter</span>
+      </div>
+    </button>
+
+    <button class="drawer-btn" data-page="status" onclick="showView('status'); toggleDrawer(false);">
+      <div style="display:flex;align-items:center;gap:10px;">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        <span>Source status</span>
       </div>
     </button>
 
@@ -4620,7 +4805,7 @@ function toggleTheme() {
 applyTheme(localStorage.getItem("cnc_theme") || "dark");
 
 /* Page views: Home / Profiles / Quality / Formatter (hash-routed, back button works) */
-var VIEWS = ["home", "profiles", "quality", "formatter"];
+var VIEWS = ["home", "profiles", "quality", "formatter", "status"];
 var currentView = "home";
 function showView(name, fromHash) {
   if (VIEWS.indexOf(name) < 0) name = "home";
@@ -4639,6 +4824,8 @@ function showView(name, fromHash) {
       try { history.pushState(null, "", window.location.pathname + window.location.search + h); } catch (e) { window.location.hash = h; }
     }
   }
+  if (name === "status") loadStatusView();
+  if (name === "quality") { try { renderProviderOrder(); } catch (e) {} }
   window.scrollTo(0, 0);
 }
 function viewFromHash() { return (window.location.hash || "").replace("#", "") || "home"; }
@@ -5342,6 +5529,7 @@ function scrollToSources() {
 }
 
 function updateMetrics() {
+  if (currentView === "quality") { try { renderProviderOrder(); } catch (e) {} }
   var activeCount = exts.filter(function(e){ return isExtActive(e); }).length;
   var totalSources = exts.length;
 
@@ -5693,6 +5881,7 @@ function loadProfile() {
       pData.maxStreamsPerResolution = p.maxStreamsPerResolution || 0;
 
       applyQualityPreferences(p);
+      applyPlaybackPreferences(p);
       applyUserFormatterFromProfile(p);
       applyServerProfileName(p);
 
@@ -5777,6 +5966,212 @@ function onQualityChange() {
       pData.maxStreamsPerResolution = p.maxStreamsPerResolution || 0;
       updateUrls();
     }).catch(function(e){ console.error("Quality save error", e); });
+}
+
+/* ---- Filtering & playback (per profile) ---- */
+function applyPlaybackPreferences(p) {
+  pData.hideSubtitles = !!p.hideSubtitles;
+  pData.groupBy = p.groupBy || "default";
+  pData.sortBy = p.sortBy || "default";
+  pData.minSizeGb = p.minSizeGb || 0;
+  pData.maxSizeGb = p.maxSizeGb || 0;
+  pData.providerOrder = p.providerOrder || [];
+  var el = document.getElementById("pb-hide-subs"); if (el) el.checked = pData.hideSubtitles;
+  el = document.getElementById("pb-group"); if (el) el.value = pData.groupBy;
+  el = document.getElementById("pb-sort"); if (el) el.value = pData.sortBy;
+  el = document.getElementById("pb-min-gb"); if (el) el.value = pData.minSizeGb > 0 ? pData.minSizeGb : "";
+  el = document.getElementById("pb-max-gb"); if (el) el.value = pData.maxSizeGb > 0 ? pData.maxSizeGb : "";
+  renderProviderOrder();
+}
+
+function onPlaybackChange() {
+  function num(id) {
+    var el = document.getElementById(id);
+    var v = el ? parseFloat(el.value) : 0;
+    return (isFinite(v) && v > 0) ? v : 0;
+  }
+  var hs = document.getElementById("pb-hide-subs");
+  var g = document.getElementById("pb-group");
+  var so = document.getElementById("pb-sort");
+  pData.hideSubtitles = hs ? hs.checked : false;
+  pData.groupBy = g ? g.value : "default";
+  pData.sortBy = so ? so.value : "default";
+  pData.minSizeGb = num("pb-min-gb");
+  pData.maxSizeGb = num("pb-max-gb");
+  savePlayback();
+}
+
+var playbackTimer = null;
+function savePlayback() {
+  if (playbackTimer) clearTimeout(playbackTimer);
+  playbackTimer = setTimeout(function() {
+    fetch("/api/profile/" + encodeURIComponent(pid) + "/playback", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        hideSubtitles: !!pData.hideSubtitles,
+        groupBy: pData.groupBy || "default",
+        sortBy: pData.sortBy || "default",
+        minSizeGb: pData.minSizeGb || 0,
+        maxSizeGb: pData.maxSizeGb || 0,
+        providerOrder: pData.providerOrder || []
+      })
+    }).then(function(r){ return r.json(); })
+      .then(function(p){
+        // The server tidies the values (min cannot exceed max…): show what is saved
+        var el = document.getElementById("pb-min-gb"); if (el) el.value = p.minSizeGb > 0 ? p.minSizeGb : "";
+        el = document.getElementById("pb-max-gb"); if (el) el.value = p.maxSizeGb > 0 ? p.maxSizeGb : "";
+        pData.minSizeGb = p.minSizeGb || 0;
+        pData.maxSizeGb = p.maxSizeGb || 0;
+      }).catch(function(e){ console.error("Playback save error", e); });
+  }, 300);
+}
+
+function activeProviderNames() {
+  var names = [];
+  exts.forEach(function(e) {
+    if (isExtActive(e) && !isLiveOnly(e) && names.indexOf(e.name) < 0) names.push(e.name);
+  });
+  return names;
+}
+
+function orderedProviders() {
+  var active = activeProviderNames();
+  var out = [];
+  (pData.providerOrder || []).forEach(function(n) { if (active.indexOf(n) >= 0 && out.indexOf(n) < 0) out.push(n); });
+  active.forEach(function(n) { if (out.indexOf(n) < 0) out.push(n); });
+  return out;
+}
+
+function renderProviderOrder() {
+  var box = document.getElementById("provider-order");
+  if (!box) return;
+  var list = orderedProviders();
+  box.innerHTML = "";
+  if (!list.length) { box.textContent = "Switch on some movie / series sources to order them."; return; }
+  list.forEach(function(name, i) {
+    var row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;gap:8px;padding:5px 8px;border:1px solid var(--border);border-radius:8px;background:var(--surface);font-size:12.5px;font-weight:600;";
+    var label = document.createElement("span");
+    label.style.flex = "1";
+    label.textContent = (i + 1) + ". " + name;
+    function mk(txt, delta) {
+      var b = document.createElement("button");
+      b.textContent = txt;
+      b.style.cssText = "background:var(--surface);border:1px solid var(--border);border-radius:6px;color:var(--text);cursor:pointer;padding:2px 9px;font-size:13px;font-weight:700;";
+      b.onclick = function() { moveProvider(i, delta); };
+      return b;
+    }
+    row.appendChild(label);
+    row.appendChild(mk("\u2191", -1));
+    row.appendChild(mk("\u2193", 1));
+    box.appendChild(row);
+  });
+}
+
+function moveProvider(i, delta) {
+  var list = orderedProviders();
+  var j = i + delta;
+  if (j < 0 || j >= list.length) return;
+  var t = list[i]; list[i] = list[j]; list[j] = t;
+  pData.providerOrder = list;
+  renderProviderOrder();
+  savePlayback();
+}
+
+function resetProviderOrder() {
+  pData.providerOrder = [];
+  renderProviderOrder();
+  savePlayback();
+}
+
+/* ---- Source status ---- */
+var statusData = [];
+var statusFilter = "all";
+function agoText(ms) {
+  if (!ms) return "never";
+  var sec = Math.max(0, Math.round((Date.now() - ms) / 1000));
+  if (sec < 60) return sec + "s ago";
+  if (sec < 3600) return Math.round(sec / 60) + "m ago";
+  if (sec < 86400) return Math.round(sec / 3600) + "h ago";
+  return Math.round(sec / 86400) + "d ago";
+}
+function statusKind(e) {
+  var h = e.health || "unknown";
+  if (h === "working" || h === "proxy") return "up";
+  if (h === "dead") return "down";
+  return "unchecked";
+}
+function loadStatusView() {
+  fetch("/api/extensions").then(function(r){ return r.json(); }).then(function(list) {
+    statusData = list || [];
+    renderStatusView();
+  }).catch(function() {
+    var el = document.getElementById("status-list");
+    if (el) el.textContent = "Could not load the source status.";
+  });
+}
+function setStatusFilter(f) { statusFilter = f; renderStatusView(); }
+function renderStatusView() {
+  var sum = document.getElementById("status-summary");
+  var fil = document.getElementById("status-filters");
+  var list = document.getElementById("status-list");
+  if (!sum || !fil || !list) return;
+  var allBox = document.getElementById("status-all");
+  var showAll = allBox ? allBox.checked : false;
+  var rows = statusData.filter(function(e) { return showAll || isExtActive(e); });
+  var counts = { up: 0, down: 0, unchecked: 0 };
+  rows.forEach(function(e) { counts[statusKind(e)]++; });
+
+  sum.innerHTML = "";
+  [["Sources", rows.length, "var(--text)"], ["Up", counts.up, "var(--green)"], ["Down", counts.down, "var(--red)"], ["Unchecked", counts.unchecked, "var(--text-sub)"]].forEach(function(c) {
+    var box = document.createElement("div");
+    box.style.cssText = "min-width:90px;padding:8px 12px;border:1px solid var(--border);border-radius:9px;background:var(--surface);";
+    var n = document.createElement("div");
+    n.style.cssText = "font-size:20px;font-weight:800;color:" + c[2] + ";";
+    n.textContent = c[1];
+    var l = document.createElement("div");
+    l.style.cssText = "font-size:11px;font-weight:700;color:var(--text-sub);";
+    l.textContent = c[0];
+    box.appendChild(n); box.appendChild(l);
+    sum.appendChild(box);
+  });
+
+  fil.innerHTML = "";
+  [["all", "All"], ["up", "Up"], ["down", "Down"], ["unchecked", "Unchecked"]].forEach(function(f) {
+    var b = document.createElement("button");
+    b.textContent = f[1];
+    var on = statusFilter === f[0];
+    b.style.cssText = "border-radius:7px;font-size:12px;font-weight:700;padding:4px 12px;cursor:pointer;border:1.5px solid " + (on ? "var(--accent)" : "var(--border)") + ";background:" + (on ? "var(--accent)" : "var(--surface)") + ";color:" + (on ? "#fff" : "var(--text)") + ";";
+    b.onclick = function() { setStatusFilter(f[0]); };
+    fil.appendChild(b);
+  });
+
+  var order = { down: 0, unchecked: 1, up: 2 };
+  rows = rows.filter(function(e) { return statusFilter === "all" || statusKind(e) === statusFilter; });
+  rows.sort(function(a, b) {
+    var d = order[statusKind(a)] - order[statusKind(b)];
+    return d !== 0 ? d : String(a.name).toLowerCase().localeCompare(String(b.name).toLowerCase());
+  });
+  list.innerHTML = "";
+  if (!rows.length) { list.textContent = "Nothing to show."; return; }
+  rows.forEach(function(e) {
+    var kind = statusKind(e);
+    var row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;gap:10px;padding:7px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface);font-size:12.5px;";
+    var name = document.createElement("span");
+    name.style.cssText = "flex:1;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;";
+    name.textContent = e.name;
+    var pill = document.createElement("span");
+    var color = kind === "up" ? "var(--green)" : (kind === "down" ? "var(--red)" : "var(--text-sub)");
+    pill.style.cssText = "font-size:10.5px;font-weight:800;padding:2px 8px;border-radius:5px;border:1px solid " + color + ";color:" + color + ";";
+    pill.textContent = kind === "up" ? (e.health === "proxy" ? "UP · PROXY" : "UP") : (kind === "down" ? "DOWN" : "UNCHECKED");
+    var when = document.createElement("span");
+    when.style.cssText = "font-size:11px;color:var(--text-sub);min-width:150px;text-align:right;";
+    when.textContent = "worked " + agoText(e.lastSuccess) + " · checked " + agoText(e.lastChecked);
+    row.appendChild(name); row.appendChild(pill); row.appendChild(when);
+    list.appendChild(row);
+  });
 }
 
 function loadStats() {
@@ -6092,7 +6487,10 @@ data class MediaInfoEpisode(
     val season: Int?,
     val episode: Int?,
     val dataUrl: String,
-    val posterUrl: String?
+    val posterUrl: String?,
+    val description: String? = null,
+    /** Air date, epoch milliseconds. */
+    val releasedMs: Long? = null,
 )
 
 data class MediaInfo(
@@ -6103,7 +6501,16 @@ data class MediaInfo(
     val description: String?,
     val year: Int?,
     val dataUrl: String,
-    val episodes: List<MediaInfoEpisode>? = null
+    val episodes: List<MediaInfoEpisode>? = null,
+    val backgroundUrl: String? = null,
+    val logoUrl: String? = null,
+    /** CloudStream "tags": genres, or labels like "Live" / "Rank: 5" for live sources. */
+    val genres: List<String>? = null,
+    /** 0..10 */
+    val rating: Double? = null,
+    val cast: List<String>? = null,
+    val runtimeMinutes: Int? = null,
+    val contentRating: String? = null,
 )
 
 fun SearchResult.toStremiMeta(pluginInternalName: String, stremioType: String): StremioMeta {
@@ -6130,15 +6537,24 @@ fun MediaInfo.toStremiMeta(pluginInternalName: String, stremioType: String) = St
     type        = cs3TvTypeToStremio(type),
     name        = name,
     poster      = PublicUrls.safeForBrowser(posterUrl),
+    background  = PublicUrls.safeForBrowser(backgroundUrl),
+    logo        = PublicUrls.safeForBrowser(logoUrl),
     description = description,
     year        = year,
+    releaseInfo = year?.toString(),
+    genres      = genres,
+    cast        = cast,
+    imdbRating  = rating?.let { String.format(java.util.Locale.ROOT, "%.1f", it) },
+    runtime     = runtimeMinutes?.let { "$it min" },
     videos      = episodes?.mapIndexed { index, ep ->
         StremioVideo(
             id       = StremioIds.encode(pluginInternalName, ep.dataUrl),
             title    = ep.name ?: "Episode ${ep.episode ?: (index + 1)}",
+            released = ep.releasedMs?.let { java.time.Instant.ofEpochMilli(it).toString() },
             season   = ep.season ?: 1,
             episode  = ep.episode ?: (index + 1),
-            thumbnail= PublicUrls.safeForBrowser(ep.posterUrl ?: posterUrl)
+            thumbnail= PublicUrls.safeForBrowser(ep.posterUrl ?: posterUrl),
+            overview = ep.description,
         )
     }
 )
