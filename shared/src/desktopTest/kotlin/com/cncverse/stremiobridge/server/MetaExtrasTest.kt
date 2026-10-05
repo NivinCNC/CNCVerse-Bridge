@@ -6,8 +6,8 @@ import kotlin.test.assertNull
 
 class MetaExtrasTest {
     class Score(private val v: Double) { fun toDouble(max: Int) = v * max / 10.0 }
-    class Actor(val name: String, val image: String? = null)
-    class ActorData(private val a: Actor) { fun getActor() = a }
+    class Actor(private val n: String, private val img: String? = null) { fun getName() = n; fun getImage() = img }
+    class ActorData(private val a: Actor, private val role: String? = null) { fun getActor() = a; fun getRoleString() = role }
 
     /** Shaped like the Twitch extension's response: a plot, poster, background and tags. */
     class FakeLoad {
@@ -15,7 +15,7 @@ class MetaExtrasTest {
         fun getLogoUrl(): String? = null
         fun getTags() = listOf("Live", "en", "Rank: 3", "Live")
         fun getScore() = Score(7.456)
-        fun getActors() = listOf(ActorData(Actor("Ada")), ActorData(Actor("Bob")))
+        fun getActors() = listOf(ActorData(Actor("Ada", "https://img.example/ada.jpg"), "Lead"), ActorData(Actor("Bob")))
         fun getDuration() = 45
         fun getContentRating() = "TV-14"
     }
@@ -32,6 +32,8 @@ class MetaExtrasTest {
         assertEquals("https://img.example/bg.jpg", m.backgroundUrl)
         assertEquals(listOf("Live", "en", "Rank: 3"), m.genres)
         assertEquals(listOf("Ada", "Bob"), m.cast)
+        assertEquals(CastPerson("Ada", "Lead", "https://img.example/ada.jpg"), m.castPeople!![0])
+        assertNull(m.castPeople!![1].photo)
         assertEquals(45, m.runtimeMinutes)
         assertEquals("TV-14", m.contentRating)
         assertEquals(7.456, m.rating!!, 1e-9)
@@ -61,5 +63,8 @@ class MetaExtrasTest {
         assertEquals("45 min", meta.runtime)
         assertEquals("2024", meta.releaseInfo)
         assertEquals(listOf("Ada"), meta.cast)
+        val withPhoto = base.copy(castPeople = listOf(CastPerson("Ada", "Lead", "https://img.example/ada.jpg"))).toStremiMeta("plug", "movie")
+        assertEquals("https://img.example/ada.jpg", withPhoto.appExtras!!.cast!![0].photo)
+        assertEquals("Lead", withPhoto.appExtras!!.cast!![0].character)
     }
 }

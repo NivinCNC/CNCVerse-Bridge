@@ -6493,6 +6493,8 @@ data class MediaInfoEpisode(
     val releasedMs: Long? = null,
 )
 
+data class CastPerson(val name: String, val character: String? = null, val photo: String? = null)
+
 data class MediaInfo(
     val name: String,
     val url: String,
@@ -6509,6 +6511,8 @@ data class MediaInfo(
     /** 0..10 */
     val rating: Double? = null,
     val cast: List<String>? = null,
+    /** Same people as [cast], with photo and role where the extension gives them. */
+    val castPeople: List<CastPerson>? = null,
     val runtimeMinutes: Int? = null,
     val contentRating: String? = null,
 )
@@ -6544,6 +6548,9 @@ fun MediaInfo.toStremiMeta(pluginInternalName: String, stremioType: String) = St
     releaseInfo = year?.toString(),
     genres      = genres,
     cast        = cast,
+    appExtras   = castPeople?.takeIf { it.isNotEmpty() }?.let { people ->
+        AppExtras(cast = people.map { AppCast(it.name, it.character, PublicUrls.safeForBrowser(it.photo)) })
+    },
     imdbRating  = rating?.let { String.format(java.util.Locale.ROOT, "%.1f", it) },
     runtime     = runtimeMinutes?.let { "$it min" },
     videos      = episodes?.mapIndexed { index, ep ->

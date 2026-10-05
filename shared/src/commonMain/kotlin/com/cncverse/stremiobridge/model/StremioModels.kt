@@ -66,11 +66,23 @@ data class StremioMeta(
     @SerialName("year")        val year: Int? = null,
     @SerialName("imdbRating")  val imdbRating: String? = null,
     @SerialName("runtime")     val runtime: String? = null,
+    /** Stremio apps read cast photos from here (Cinemeta does the same); plain `cast` is names only. */
+    @SerialName("app_extras")  val appExtras: AppExtras? = null,
     @SerialName("genres")      val genres: List<String>? = null,
     @SerialName("cast")        val cast: List<String>? = null,
     @SerialName("links")       val links: List<MetaLink>? = null,
     @SerialName("videos")      val videos: List<StremioVideo>? = null,
     @SerialName("behaviorHints") val behaviorHints: MetaBehaviorHints? = null,
+)
+
+@Serializable
+data class AppExtras(@SerialName("cast") val cast: List<AppCast>? = null)
+
+@Serializable
+data class AppCast(
+    @SerialName("name")      val name: String,
+    @SerialName("character") val character: String? = null,
+    @SerialName("photo")     val photo: String? = null,
 )
 
 @Serializable

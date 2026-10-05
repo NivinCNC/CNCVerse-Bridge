@@ -27,10 +27,14 @@ private fun Any.rating10(): Double? {
 fun MediaInfo.withExtras(resp: Any): MediaInfo {
     val genres = (resp.get("getTags") as? List<*>)?.mapNotNull { (it as? String)?.trim()?.takeIf { s -> s.isNotEmpty() } }
         ?.distinct()?.take(30)?.takeIf { it.isNotEmpty() }
-    val cast = (resp.get("getActors") as? List<*>)?.mapNotNull { a ->
-        a?.get("getActor")?.str("getName")
-    }?.distinct()?.take(40)?.takeIf { it.isNotEmpty() }
+    val people = (resp.get("getActors") as? List<*>)?.mapNotNull { a ->
+        val actor = a?.get("getActor") ?: return@mapNotNull null
+        val name = actor.str("getName") ?: return@mapNotNull null
+        CastPerson(name, character = a.str("getRoleString"), photo = actor.str("getImage"))
+    }?.distinctBy { it.name }?.take(40)?.takeIf { it.isNotEmpty() }
+    val cast = people?.map { it.name }
     return copy(
+        castPeople = people,
         backgroundUrl = resp.str("getBackgroundPosterUrl"),
         logoUrl = resp.str("getLogoUrl"),
         genres = genres,
