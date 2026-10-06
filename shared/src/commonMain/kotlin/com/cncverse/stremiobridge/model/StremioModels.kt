@@ -21,6 +21,8 @@ data class StremioManifest(
     @SerialName("resources")   val resources: List<String>,
     @SerialName("catalogs")    val catalogs: List<StremioCatalogDef>,
     @SerialName("behaviorHints") val behaviorHints: BehaviorHints = BehaviorHints(),
+    /** Ids Stremio sends for meta/stream/subtitles: the bridge's own "cnc:" items plus other catalogs' ids. */
+    @SerialName("idPrefixes")  val idPrefixes: List<String> = com.cncverse.stremiobridge.server.ExternalIds.MANIFEST_PREFIXES,
 )
 
 @Serializable
@@ -155,6 +157,8 @@ data class StreamInfo(
     /** Title/year the stream was resolved for (TMDB for generic requests). */
     val metadataTitle: String? = null,
     val metadataYear: Int? = null,
+    /** Display name of the extension (MainAPI.name, e.g. "4K HDHUB") - what the configure page lists. */
+    val providerName: String? = null,
 )
 
 @Serializable

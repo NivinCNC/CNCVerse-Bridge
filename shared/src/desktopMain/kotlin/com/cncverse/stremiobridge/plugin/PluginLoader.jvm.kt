@@ -12,6 +12,7 @@ import com.cncverse.stremiobridge.server.MainApiWrapper
 import com.cncverse.stremiobridge.server.MediaInfo
 import com.cncverse.stremiobridge.server.MediaInfoEpisode
 import com.cncverse.stremiobridge.server.withExtras
+import com.cncverse.stremiobridge.server.mergeDubVariants
 import com.cncverse.stremiobridge.server.SearchResult
 import com.cncverse.stremiobridge.server.StremioServer
 import com.cncverse.stremiobridge.state.LoadedPluginInfo
@@ -1122,7 +1123,8 @@ private fun Any.reflectToMediaInfo(originalUrl: String): MediaInfo? {
                 dataUrl = runCatching { epCls.getMethod("getData").invoke(ep) as? String }
                     .recoverCatching { epCls.getMethod("getDataUrl").invoke(ep) as? String }
                     .getOrNull() ?: return@mapNotNull null,
-                posterUrl = runCatching { epCls.getMethod("getPosterUrl").invoke(ep) as? String }.getOrNull()
+                posterUrl = runCatching { epCls.getMethod("getPosterUrl").invoke(ep) as? String }.getOrNull(),
+                variant = dubName,
             ).withExtras(ep)
         }
 
@@ -1130,7 +1132,7 @@ private fun Any.reflectToMediaInfo(originalUrl: String): MediaInfo? {
         val classType = inferTypeFromClass(cls)
         val reflectedType = this.reflectStremioType()
 
-        var finalMappedEpisodes = mappedEpisodes
+        var finalMappedEpisodes = mappedEpisodes?.let { mergeDubVariants(it) }
         val type = if (finalMappedEpisodes?.size == 1) {
             // Single-episode responses collapse to direct-play, even if the plugin
             // wrapped it in a TvSeriesLoadResponse.

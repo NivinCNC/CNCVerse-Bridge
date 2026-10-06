@@ -49,3 +49,43 @@ fun MediaInfoEpisode.withExtras(ep: Any): MediaInfoEpisode = copy(
     description = ep.str("getDescription"),
     releasedMs = (ep.get("getDate") as? Number)?.toLong()?.takeIf { it > 0 },
 )
+
+/**
+ * Anime extensions list every episode once per dub status ("Subbed", "Dubbed"), which showed
+ * as duplicate episodes. Episodes with the same season/episode number become one episode whose
+ * data carries all variants (VariantData); its streams come back labelled [Sub] / [Dub].
+ * Lists with a single variant, and episodes without a number, are left as they were.
+ */
+fun mergeDubVariants(episodes: List<MediaInfoEpisode>): List<MediaInfoEpisode> {
+    val variants = episodes.mapNotNull { VariantData.label(it.variant) }.distinct()
+    if (variants.size < 2) return episodes
+    fun plainName(e: MediaInfoEpisode): String? {
+        val v = e.variant ?: return e.name
+        val n = e.name ?: return null
+        if (n == v) return null
+        return n.removeSuffix(" ($v)").takeIf { it.isNotBlank() }
+    }
+    val out = ArrayList<MediaInfoEpisode>()
+    val groups = LinkedHashMap<Pair<Int, Int>, MutableList<MediaInfoEpisode>>()
+    for (e in episodes) {
+        val num = e.episode
+        if (num == null) { out += e; continue }
+        groups.getOrPut((e.season ?: 1) to num) { ArrayList() } += e
+    }
+    // Sub before Dub, then anything else
+    fun rank(e: MediaInfoEpisode) = when (VariantData.label(e.variant)) { "Sub" -> 0; "Dub" -> 1; else -> 2 }
+    val merged = groups.values.map { group ->
+        val sorted = group.sortedBy { rank(it) }
+        val first = sorted.first()
+        val parts = sorted.distinctBy { it.dataUrl }.map { (it.variant ?: "None") to it.dataUrl }
+        first.copy(
+            name = sorted.firstNotNullOfOrNull { plainName(it) },
+            dataUrl = if (parts.size > 1) VariantData.encode(parts) else first.dataUrl,
+            posterUrl = sorted.firstNotNullOfOrNull { it.posterUrl },
+            description = sorted.firstNotNullOfOrNull { it.description },
+            releasedMs = sorted.firstNotNullOfOrNull { it.releasedMs },
+            variant = null,
+        )
+    }
+    return (merged + out).sortedWith(compareBy({ it.season ?: 1 }, { it.episode ?: Int.MAX_VALUE }))
+}

@@ -29,6 +29,9 @@ import kotlinx.serialization.json.jsonPrimitive
 import java.io.File
 import io.ktor.client.HttpClient
 import io.ktor.client.request.get
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import io.ktor.client.request.header
 import io.ktor.client.statement.bodyAsText
 import kotlinx.coroutines.async
@@ -1712,6 +1715,7 @@ object StremioServer {
         // "Hide subtitles": no subtitle tracks go out (after formatting, so the description stays truthful)
         val out = (if (profileId != null && profiles[profileId]?.hideSubtitles == true) formatted.map { it.copy(subtitles = null) } else formatted)
             .map { withStreamBase(it) }
+            .map { s -> s.subtitles?.let { subs -> s.copy(subtitles = subs.map { it.copy(lang = com.cncverse.stremiobridge.format.SubtitleLangs.normalize(it.lang)) }) } ?: s }
         respond(StremioStreamResponse(out))
     }
 
@@ -1744,6 +1748,7 @@ object StremioServer {
         }
         val streams = withContext(pluginDispatcher) { buildStreams(type, id, profileId) }
         val subtitles = streams.flatMap { it.subtitles ?: emptyList() }.distinctBy { it.id }
+            .map { it.copy(lang = com.cncverse.stremiobridge.format.SubtitleLangs.normalize(it.lang)) }
 
         respond(StremioSubtitleResponse(subtitles))
     }
@@ -2194,6 +2199,88 @@ object StremioServer {
         }
     }
 
+    /** Title + year for any supported id; null when the source has no such item. */
+    private suspend fun resolveExternal(type: String, ext: ExternalId): Pair<String, Int?>? {
+        if (ext.scheme == "imdb" || ext.scheme == "tmdb") return resolveGenericMedia(type, ext.key)
+        val cacheKey = "$type:${ext.scheme}:${ext.key}"
+        genericMediaCache[cacheKey]?.let { return it }
+        val result = try {
+            when (ext.scheme) {
+                "tvdb" -> fetchTmdbJson("find/${ext.key}?external_source=tvdb_id")?.let { j ->
+                    val r = ((j["tv_results"] as? kotlinx.serialization.json.JsonArray)?.firstOrNull()
+                        ?: (j["movie_results"] as? kotlinx.serialization.json.JsonArray)?.firstOrNull())?.jsonObject
+                    val title = r?.get("name")?.jsonPrimitive?.contentOrNull ?: r?.get("title")?.jsonPrimitive?.contentOrNull
+                    val date = r?.get("first_air_date")?.jsonPrimitive?.contentOrNull ?: r?.get("release_date")?.jsonPrimitive?.contentOrNull
+                    title?.let { it to date?.take(4)?.toIntOrNull() }
+                }
+                "tvmaze" -> getJson("https://api.tvmaze.com/shows/${ext.key}")?.let { j ->
+                    j["name"]?.jsonPrimitive?.contentOrNull?.let { it to j["premiered"]?.jsonPrimitive?.contentOrNull?.take(4)?.toIntOrNull() }
+                }
+                "kitsu" -> getJson("https://kitsu.io/api/edge/anime/${ext.key}", accept = "application/vnd.api+json")?.let { j ->
+                    val a = j["data"]?.jsonObject?.get("attributes")?.jsonObject
+                    val titles = a?.get("titles")?.jsonObject
+                    val title = titles?.get("en")?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+                        ?: a?.get("canonicalTitle")?.jsonPrimitive?.contentOrNull
+                        ?: titles?.get("en_jp")?.jsonPrimitive?.contentOrNull
+                    title?.let { it to a?.get("startDate")?.jsonPrimitive?.contentOrNull?.take(4)?.toIntOrNull() }
+                }
+                "mal" -> aniList("idMal", ext.key)
+                "anilist" -> aniList("id", ext.key)
+                "anidb" -> getJson("https://arm.haglund.dev/api/v2/ids?source=anidb&id=${ext.key}")
+                    ?.get("anilist")?.jsonPrimitive?.contentOrNull?.let { aniList("id", it) }
+                else -> null
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) {
+            ServerState.warn("Resolve ${ext.scheme}:${ext.key} failed: ${e.message?.take(80)}")
+            null
+        }
+        if (result != null) {
+            genericMediaCache[cacheKey] = result
+            ServerState.debug("Resolved ${ext.scheme}:${ext.key} -> '${result.first}' (${result.second})")
+        }
+        return result
+    }
+
+    /**
+     * ID-lookup APIs (Kitsu, AniList, the AniDB mapping) go through OkHttp: Ktor's CIO client
+     * fails the TLS handshake with some of them (arm.haglund.dev: "ProtocolVersion").
+     */
+    private val idApiClient by lazy {
+        okhttp3.OkHttpClient.Builder()
+            .callTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+
+    private suspend fun idApiCall(req: okhttp3.Request): String? = withContext(Dispatchers.IO) {
+        idApiClient.newCall(req).execute().use { r -> if (r.code == 200) r.body?.string() else null }
+    }
+
+    private suspend fun getJson(url: String, accept: String = "application/json"): JsonObject? =
+        idApiCall(okhttp3.Request.Builder().url(url).header("Accept", accept).build())
+            ?.let { serverJson.parseToJsonElement(it).jsonObject }
+
+    /** AniList lookup by its own id or the MAL id: English title, else romaji. */
+    private suspend fun aniList(field: String, key: String): Pair<String, Int?>? {
+        val id = key.toIntOrNull() ?: return null
+        val query = "query{Media(" + field + ":" + id + ",type:ANIME){title{english romaji}seasonYear startDate{year}}}"
+        val body = kotlinx.serialization.json.buildJsonObject { put("query", kotlinx.serialization.json.JsonPrimitive(query)) }.toString()
+        val text = idApiCall(
+            okhttp3.Request.Builder().url("https://graphql.anilist.co")
+                .header("Accept", "application/json")
+                .post(okhttp3.RequestBody.create("application/json".toMediaTypeOrNull(), body))
+                .build()
+        ) ?: return null
+        val media = serverJson.parseToJsonElement(text).jsonObject["data"]?.jsonObject?.get("Media")?.jsonObject ?: return null
+        val t = media["title"]?.jsonObject
+        val title = t?.get("english")?.jsonPrimitive?.contentOrNull?.takeIf { it.isNotBlank() }
+            ?: t?.get("romaji")?.jsonPrimitive?.contentOrNull ?: return null
+        val year = media["seasonYear"]?.jsonPrimitive?.intOrNull
+            ?: media["startDate"]?.jsonObject?.get("year")?.jsonPrimitive?.intOrNull
+        return title to year
+    }
+
     private suspend fun resolveGenericMedia(type: String, tmdbId: String): Pair<String, Int?>? {
         val cacheKey = "$type:$tmdbId"
         genericMediaCache[cacheKey]?.let { return it }
@@ -2432,7 +2519,9 @@ object StremioServer {
         // compares each stream about log2(n) times (6 ms -> well under 1 ms for 250 streams)
         class Keyed(val stream: StremioStream, val providerRank: Int, val provider: String, val quality: Int, val sizeKey: Long)
         val keyed = streams.map { st ->
-            val provider = com.cncverse.stremiobridge.format.StreamVariables.addonOf(st)?.lowercase().orEmpty()
+            // The configure page lists extensions by display name ("4K HDHUB"); a stream's addon
+            // label is often the plugin file name ("FourKHDHub"), so match on the display name
+            val provider = (st.info?.providerName ?: com.cncverse.stremiobridge.format.StreamVariables.addonOf(st))?.lowercase().orEmpty()
             // Largest first via a negated key; unknown size gets +1 so it sorts after every known one
             val sizeKey = if (!bySize) 0L else -(com.cncverse.stremiobridge.format.StreamVariables.sizeBytesOf(st) ?: -1L)
             Keyed(st, rank[provider] ?: Int.MAX_VALUE, provider, streamQualityRank(st), sizeKey)
@@ -2598,7 +2687,7 @@ object StremioServer {
                         withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
                             try {
                                 ServerState.debug("[${api.name}] Loading links for $dataUrl")
-                                var links = api.loadLinks(dataUrl)
+                                var links = api.loadLinksAll(dataUrl)
                                 // Catalog items opened straight from a row (defaultVideoId) carry the
                                 // item URL, not the load() data — e.g. Netflix mirrors need the title
                                 // that only load() adds. Resolve it once and retry.
@@ -2610,7 +2699,7 @@ object StremioServer {
                                     }
                                     if (resolved != null && resolved != dataUrl) {
                                         ServerState.info("[${api.name}] Retrying with load() data")
-                                        links = api.loadLinks(resolved)
+                                        links = api.loadLinksAll(resolved)
                                     }
                                 }
                                 StreamTracker.record(api.pluginInternalName, api.internalName, api.name, links.size, null)
@@ -2645,20 +2734,11 @@ object StremioServer {
         }
 
         // Handle generic Stremio requests with TMDB/IMDB IDs
-        val idParts = id.split(":")
-        val isTmdb = idParts.first() == "tmdb"
-        val baseId = if (isTmdb) idParts.getOrNull(1) ?: id else idParts.first()
-        val mediaType = if (type == "series") "tv" else "movie"
-        val tmdbId = baseId
+        // IMDb, TMDB, TVDB, TVmaze and anime (Kitsu, MAL, AniList, AniDB) ids; anything else
+        // (other add-ons' own items) can never be looked up, so it is skipped right away
+        val ext = ExternalIds.parse(id) ?: return emptyList()
 
-        // Stremio asks every add-on for streams, including other add-ons' items (xtream:…,
-        // nuvio_sport_…, mb:…): only IMDb (tt…) and TMDB ids can be looked up — anything else
-        // used to cost a Cinemeta + TMDB round trip that could never succeed.
-        if (!(baseId.matches(IMDB_ID) || (baseId.isNotEmpty() && baseId.all(Char::isDigit)))) {
-            return emptyList()
-        }
-
-        ServerState.debug("Generic request: id=$id, type=$type, baseId=$baseId, tmdbId=$tmdbId")
+        ServerState.debug("Generic request: id=$id, type=$type, ext=$ext")
 
         // Key on the exact set of extensions this request may use, so profiles with
         // different opt-ins / disables and admin enable/disable changes never share results.
@@ -2669,7 +2749,7 @@ object StremioServer {
 
         return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetchResult(aggCacheKey, null) {
             try {
-                val resolved = resolveGenericMedia(type, tmdbId)
+                val resolved = resolveExternal(type, ext)
                 if (resolved == null) {
                     ServerState.warn("Media resolve failed: no title/year found for $id")
                     return@getOrFetchResult com.cncverse.stremiobridge.cache.StreamCacheManager.FetchResult(emptyList())
@@ -2889,11 +2969,12 @@ object StremioServer {
 
         var dataUrlToLoad = mediaInfo.dataUrl
         if (type == "series" && id.contains(":")) {
-            val parts   = id.split(":")
-            val season  = parts.getOrNull(1)?.toIntOrNull()
-            val episode = parts.getOrNull(2)?.toIntOrNull()
+            val parsed  = ExternalIds.parse(id)
+            val season  = parsed?.season
+            val episode = parsed?.episode
             if (season != null && episode != null) {
-                val ep = mediaInfo.episodes?.find { it.season == season && it.episode == episode }
+                // Anime extensions often leave the season empty: that is season 1
+                val ep = mediaInfo.episodes?.find { (it.season ?: 1) == season && it.episode == episode }
                 if (ep != null) {
                     dataUrlToLoad = ep.dataUrl
                     ServerState.debug("[${api.name}] Found episode S${season}E${episode}")
@@ -2906,7 +2987,7 @@ object StremioServer {
         }
         ServerState.debug("[${api.name}] Loading links for $dataUrlToLoad")
         try {
-            val links = api.loadLinks(dataUrlToLoad)
+            val links = api.loadLinksAll(dataUrlToLoad)
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, links.size, null)
             if (links.isNotEmpty()) {
                 ServerState.debug("[STREAM_SUCCESS] [${api.name}] Resolved ${links.size} streamable link(s) for '$title'")
@@ -6491,6 +6572,67 @@ interface MainApiWrapper {
     suspend fun loadLinks(dataUrl: String): List<StremioStream>
 }
 
+/**
+ * Episodes an extension lists once per dub status (anime: "Subbed" / "Dubbed") are merged into
+ * one episode whose data carries every variant; loading it returns all of them, labelled.
+ */
+object VariantData {
+    private const val PREFIX = "cncvariants:"
+
+    fun encode(parts: List<Pair<String, String>>): String =
+        PREFIX + java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(
+            kotlinx.serialization.json.Json.encodeToString(
+                kotlinx.serialization.serializer<List<List<String>>>(), parts.map { listOf(it.first, it.second) }
+            ).toByteArray()
+        )
+
+    fun decode(data: String): List<Pair<String, String>>? {
+        if (!data.startsWith(PREFIX)) return null
+        return runCatching {
+            val json = String(java.util.Base64.getUrlDecoder().decode(data.removePrefix(PREFIX)))
+            kotlinx.serialization.json.Json.decodeFromString(kotlinx.serialization.serializer<List<List<String>>>(), json)
+                .filter { it.size == 2 }.map { it[0] to it[1] }
+        }.getOrNull()
+    }
+
+    /** "Subbed" -> "Sub", "Dubbed" -> "Dub"; null for "None". */
+    fun label(variant: String?): String? = when (variant?.trim()?.lowercase()) {
+        null, "", "none" -> null
+        "subbed", "sub" -> "Sub"
+        "dubbed", "dub" -> "Dub"
+        else -> variant.trim()
+    }
+}
+
+/**
+ * loadLinks for every variant a merged episode carries, each stream labelled "[Sub]" / "[Dub]",
+ * and every stream tagged with this extension's display name (provider ordering matches on it).
+ */
+suspend fun MainApiWrapper.loadLinksAll(dataUrl: String): List<StremioStream> {
+    val api = this
+    fun tag(s: StremioStream, label: String?): StremioStream {
+        val info = (s.info ?: com.cncverse.stremiobridge.model.StreamInfo(addonName = api.name)).let { i ->
+            i.copy(providerName = api.name, linkName = if (label != null) "[$label] " + (i.linkName ?: s.title.orEmpty()) else i.linkName)
+        }
+        return if (label == null) s.copy(info = info)
+        else s.copy(title = "[$label] " + s.title.orEmpty(), info = info)
+    }
+    val parts = VariantData.decode(dataUrl) ?: return loadLinks(dataUrl).map { tag(it, null) }
+    return kotlinx.coroutines.coroutineScope {
+        parts.map { (variant, data) ->
+            async {
+                try {
+                    loadLinks(data).map { tag(it, VariantData.label(variant)) }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    emptyList()
+                }
+            }
+        }.awaitAll().flatten()
+    }
+}
+
 data class SearchResult(
     val name: String,
     val url: String,
@@ -6512,6 +6654,8 @@ data class MediaInfoEpisode(
     val description: String? = null,
     /** Air date, epoch milliseconds. */
     val releasedMs: Long? = null,
+    /** CloudStream DubStatus key the episode came from ("Subbed", "Dubbed"), when the extension splits them. */
+    val variant: String? = null,
 )
 
 data class CastPerson(val name: String, val character: String? = null, val photo: String? = null)
