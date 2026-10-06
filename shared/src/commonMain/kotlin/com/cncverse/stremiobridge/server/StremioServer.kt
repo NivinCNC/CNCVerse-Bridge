@@ -1742,7 +1742,7 @@ object StremioServer {
 
     private val SUPPORT_STREAM = StremioStream(
         name = "✨ | support the project!",
-        title = "cncverse.pages.dev (you can hide this in your profile settings)",
+        title = "Click to donate this project ❤️ (you can hide this in your profile settings)",
         externalUrl = "https://cncverse.pages.dev",
     )
 
