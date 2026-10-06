@@ -134,6 +134,8 @@ data class StremioStream(
     @SerialName("behaviorHints") val behaviorHints: StreamBehaviorHints? = null,
     @SerialName("clearkey")      val clearkey: String? = null,
     @SerialName("subtitles")     val subtitles: List<StremioSubtitle>? = null,
+    /** Opens a web page instead of playing (the "support the project" entry). */
+    @SerialName("externalUrl")   val externalUrl: String? = null,
     /** Server-side metadata for the stream formatter — never sent to Stremio. */
     @kotlinx.serialization.Transient val info: StreamInfo? = null,
 )

@@ -225,6 +225,8 @@ object StremioServer {
         val maxSizeGb: Double = 0.0,
         /** Extension names in priority order: earlier ones come first inside each group. */
         val providerOrder: List<String> = emptyList(),
+        /** Show the "support the project" entry at the end of stream lists. */
+        val showSupport: Boolean = true,
         /** The profile's own stream formatter choice (null = follow the server's formatter). */
         val formatter: com.cncverse.stremiobridge.format.ProfileFormatter? = null,
         /** User-chosen profile name, shown in the Stremio addon title ("CNCVerse Bridge · Kids"). */
@@ -257,6 +259,7 @@ object StremioServer {
         val minSizeGb: Double = 0.0,
         val maxSizeGb: Double = 0.0,
         val providerOrder: List<String> = emptyList(),
+        val showSupport: Boolean = true,
     )
 
     @Serializable
@@ -699,6 +702,7 @@ object StremioServer {
             maxSizeGb = max,
             providerOrder = r.providerOrder.map { it.trim() }.filter { it.isNotEmpty() && it.length <= 80 }
                 .distinct().take(MAX_PROFILE_EXTENSIONS + 10),
+            showSupport = r.showSupport,
             lastSeen = now,
         )
         saveProfiles()
@@ -811,6 +815,7 @@ object StremioServer {
             ",\"excludeCam\":" + excludeCam +
             ",\"maxStreamsPerResolution\":" + maxStreamsPerResolution +
             ",\"hideSubtitles\":" + (rec?.hideSubtitles ?: false) +
+            ",\"showSupport\":" + (rec?.showSupport ?: true) +
             ",\"groupBy\":\"" + (rec?.groupBy ?: "default") + "\",\"sortBy\":\"" + (rec?.sortBy ?: "default") + "\"" +
             ",\"minSizeGb\":" + (rec?.minSizeGb ?: 0.0) + ",\"maxSizeGb\":" + (rec?.maxSizeGb ?: 0.0) +
             ",\"providerOrder\":" + serverJson.encodeToString(
@@ -1726,9 +1731,20 @@ object StremioServer {
         val out = (if (profileId != null && profiles[profileId]?.hideSubtitles == true) formatted.map { it.copy(subtitles = null) } else formatted)
             .map { withStreamBase(it) }
             .map { LocalRelay.rewriteStream(it) }
+            .let { list ->
+                // "Support the project" entry on top, only above real results; each profile can hide it
+                val show = profileId?.let { profiles[it]?.showSupport } ?: true
+                if (show && list.isNotEmpty()) listOf(SUPPORT_STREAM) + list else list
+            }
             .map { s -> s.subtitles?.let { subs -> s.copy(subtitles = subs.map { it.copy(lang = com.cncverse.stremiobridge.format.SubtitleLangs.normalize(it.lang)) }) } ?: s }
         respond(StremioStreamResponse(out))
     }
+
+    private val SUPPORT_STREAM = StremioStream(
+        name = "✨ | support the project!",
+        title = "cncverse.pages.dev (you can hide this in your profile settings)",
+        externalUrl = "https://cncverse.pages.dev",
+    )
 
     /** Paths of the bridge's own relay endpoints (links that point back at this server). */
     private val RELAY_PATH = Regex("^https?://([^/:]+)(?::[0-9]+)?(/(proxy/|decrypt|init_decrypt).*)$")
@@ -4603,6 +4619,10 @@ input:checked + .slider:before {
         <input type="checkbox" id="pb-hide-subs" onchange="onPlaybackChange()" style="accent-color:var(--accent);cursor:pointer;">
         <span>Hide subtitles</span>
       </label>
+      <label style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;background:var(--surface);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-size:12.5px;font-weight:600;padding:6px 9px;outline:none;">
+        <input type="checkbox" id="pb-show-support" checked onchange="onPlaybackChange()" style="accent-color:var(--accent);cursor:pointer;">
+        <span>Show "support the project"</span>
+      </label>
     </div>
     <div>
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
@@ -6089,7 +6109,9 @@ function applyPlaybackPreferences(p) {
   pData.minSizeGb = p.minSizeGb || 0;
   pData.maxSizeGb = p.maxSizeGb || 0;
   pData.providerOrder = p.providerOrder || [];
+  pData.showSupport = p.showSupport !== false;
   var el = document.getElementById("pb-hide-subs"); if (el) el.checked = pData.hideSubtitles;
+  el = document.getElementById("pb-show-support"); if (el) el.checked = pData.showSupport;
   el = document.getElementById("pb-group"); if (el) el.value = pData.groupBy;
   el = document.getElementById("pb-sort"); if (el) el.value = pData.sortBy;
   el = document.getElementById("pb-min-gb"); if (el) el.value = pData.minSizeGb > 0 ? pData.minSizeGb : "";
@@ -6107,6 +6129,8 @@ function onPlaybackChange() {
   var g = document.getElementById("pb-group");
   var so = document.getElementById("pb-sort");
   pData.hideSubtitles = hs ? hs.checked : false;
+  var ss = document.getElementById("pb-show-support");
+  pData.showSupport = ss ? ss.checked : true;
   pData.groupBy = g ? g.value : "default";
   pData.sortBy = so ? so.value : "default";
   pData.minSizeGb = num("pb-min-gb");
@@ -6127,7 +6151,8 @@ function savePlayback() {
         sortBy: pData.sortBy || "default",
         minSizeGb: pData.minSizeGb || 0,
         maxSizeGb: pData.maxSizeGb || 0,
-        providerOrder: pData.providerOrder || []
+        providerOrder: pData.providerOrder || [],
+        showSupport: pData.showSupport !== false
       })
     }).then(function(r){ return r.json(); })
       .then(function(p){
