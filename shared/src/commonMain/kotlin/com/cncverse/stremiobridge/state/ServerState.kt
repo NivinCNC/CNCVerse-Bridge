@@ -86,6 +86,17 @@ object ServerState {
      *  proxy URLs and admin display URLs reflect the public domain instead of the internal LAN IP. */
     @Volatile var publicBaseUrl: String = ""
 
+    /**
+     * Fixed base for the bridge's own relay links (proxied video, decryption, subtitles), e.g.
+     * http://140.238.244.130 - env CNC_STREAM_BASE_URL. Keeps heavy streaming traffic off the
+     * public domain (a DNS/CDN provider can terminate a domain for it). Null = follow the
+     * address the client used, as before.
+     */
+    /** Host names clients have reached this bridge by (its domain, IP, LAN names) - capped. */
+    val ownHosts: MutableSet<String> = java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    val streamBaseUrl: String? = System.getenv("CNC_STREAM_BASE_URL")?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }
+
     /** Global bridge theme accent configured by the administrator in the dev panel */
     @Volatile var globalAccentHex: String = "#8b5cf6"
     @Volatile var globalAccentGlow: String = "rgba(139, 92, 246, 0.28)"

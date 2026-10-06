@@ -55,7 +55,7 @@ private suspend fun handleMpdProxy(call: ApplicationCall, converter: MpdConverte
                 .also { SegmentCache.putMpd(decodedUrl, it) }
         }
 
-        var proxyBase = "http://${call.request.host()}:" + (ServerState.serverPort)
+        var proxyBase = ServerState.streamBaseUrl ?: ("http://${call.request.host()}:" + (ServerState.serverPort))
         val activeTunnel = ServerState.activeTunnelUrl.value
         if (ServerState.isStremioMode.value && !activeTunnel.isNullOrBlank()) {
             proxyBase = activeTunnel

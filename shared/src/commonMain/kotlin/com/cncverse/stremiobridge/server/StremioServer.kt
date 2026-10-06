@@ -1175,6 +1175,7 @@ object StremioServer {
                 "http://$reqHost"
             }
             ServerState.publicBaseUrl = inferredBase
+            if (ServerState.ownHosts.size < 64) ServerState.ownHosts.add(reqHost.lowercase())
             
             if (call.request.httpMethod == HttpMethod.Options) {
                 call.respond(HttpStatusCode.OK)
@@ -1709,8 +1710,28 @@ object StremioServer {
             profileId?.let { profiles[it]?.formatter },
         )
         // "Hide subtitles": no subtitle tracks go out (after formatting, so the description stays truthful)
-        val out = if (profileId != null && profiles[profileId]?.hideSubtitles == true) formatted.map { it.copy(subtitles = null) } else formatted
+        val out = (if (profileId != null && profiles[profileId]?.hideSubtitles == true) formatted.map { it.copy(subtitles = null) } else formatted)
+            .map { withStreamBase(it) }
         respond(StremioStreamResponse(out))
+    }
+
+    /** Paths of the bridge's own relay endpoints (links that point back at this server). */
+    private val RELAY_PATH = Regex("^https?://([^/:]+)(?::[0-9]+)?(/(proxy/|decrypt|init_decrypt).*)$")
+
+    /**
+     * Points the bridge's own relay links at [ServerState.streamBaseUrl] (the server IP) - also
+     * links cached earlier under the domain. Extension links to other sites are untouched.
+     */
+    private fun withStreamBase(s: StremioStream): StremioStream {
+        val base = ServerState.streamBaseUrl ?: return s
+        fun fix(u: String?): String? {
+            val m = u?.let { RELAY_PATH.matchEntire(it) } ?: return u
+            // Only links back to this bridge; another site's own /proxy/ path is left alone
+            if (m.groupValues[1].lowercase() !in ServerState.ownHosts) return u
+            return base + m.groupValues[2]
+        }
+        val subs = s.subtitles?.map { it.copy(url = fix(it.url) ?: it.url) }
+        return s.copy(url = fix(s.url), subtitles = subs)
     }
 
     private suspend fun ApplicationCall.respondSubtitles(profileId: String?) {

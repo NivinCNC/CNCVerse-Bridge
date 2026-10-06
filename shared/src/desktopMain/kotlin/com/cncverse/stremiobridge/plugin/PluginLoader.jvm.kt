@@ -1292,7 +1292,7 @@ private fun Any.reflectToStreams(pluginName: String, api: MainAPI? = null, plugi
             val encodedMpdUrl = java.net.URLEncoder.encode(url, "UTF-8")
             val hostIp = CloudflaredManager.deviceIp.ifBlank { "127.0.0.1" }
 
-            var proxyBase = ServerState.publicBaseUrl.ifBlank { "http://$hostIp:${ServerState.serverPort}" }
+            var proxyBase = ServerState.streamBaseUrl ?: ServerState.publicBaseUrl.ifBlank { "http://$hostIp:${ServerState.serverPort}" }
             val activeTunnel = ServerState.activeTunnelUrl.value
             if (ServerState.isStremioMode.value && !activeTunnel.isNullOrBlank()) {
                 proxyBase = activeTunnel
@@ -1350,7 +1350,7 @@ private fun Any.reflectToSubtitle(pluginName: String): StremioSubtitle? {
 
         val hostIp = CloudflaredManager.deviceIp.ifBlank { "127.0.0.1" }
 
-        var proxyBase = ServerState.publicBaseUrl.ifBlank { "http://$hostIp:${ServerState.serverPort}" }
+        var proxyBase = ServerState.streamBaseUrl ?: ServerState.publicBaseUrl.ifBlank { "http://$hostIp:${ServerState.serverPort}" }
         val activeTunnel = ServerState.activeTunnelUrl.value
         if (ServerState.isStremioMode.value && !activeTunnel.isNullOrBlank()) {
             proxyBase = activeTunnel
