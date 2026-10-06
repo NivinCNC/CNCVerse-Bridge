@@ -1268,6 +1268,16 @@ object StremioServer {
             // ── User-side stream formatter ───────────────────────────────────
 
             // Presets + variables for the configure page's formatter editor
+            // Links to an extension's own server on this machine (Re:ANIME: http://127.0.0.1:41949/…)
+            get("/proxy/local/{port}/{path...}") {
+                val port = call.parameters["port"]?.toIntOrNull() ?: return@get call.respond(HttpStatusCode.NotFound)
+                LocalRelay.handle(call, port, call.parameters.getAll("path").orEmpty().joinToString("/"), call.request.queryString())
+            }
+            head("/proxy/local/{port}/{path...}") {
+                val port = call.parameters["port"]?.toIntOrNull() ?: return@head call.respond(HttpStatusCode.NotFound)
+                LocalRelay.handle(call, port, call.parameters.getAll("path").orEmpty().joinToString("/"), call.request.queryString())
+            }
+
             get("/api/formatter") {
                 call.respond(com.cncverse.stremiobridge.format.StreamFormatter.catalog())
             }
@@ -1715,6 +1725,7 @@ object StremioServer {
         // "Hide subtitles": no subtitle tracks go out (after formatting, so the description stays truthful)
         val out = (if (profileId != null && profiles[profileId]?.hideSubtitles == true) formatted.map { it.copy(subtitles = null) } else formatted)
             .map { withStreamBase(it) }
+            .map { LocalRelay.rewriteStream(it) }
             .map { s -> s.subtitles?.let { subs -> s.copy(subtitles = subs.map { it.copy(lang = com.cncverse.stremiobridge.format.SubtitleLangs.normalize(it.lang)) }) } ?: s }
         respond(StremioStreamResponse(out))
     }

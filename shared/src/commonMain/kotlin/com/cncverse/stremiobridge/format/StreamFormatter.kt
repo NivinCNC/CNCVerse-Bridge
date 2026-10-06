@@ -798,9 +798,9 @@ object StreamFormatter {
     /** Season/episode from a Stremio stream id like "tt0903747:1:3" or "tmdb:1396:1:3". */
     fun contextFromId(type: String, id: String): StreamRequestContext {
         if (type != "series") return StreamRequestContext()
-        val parts = id.split(":")
-        val nums = parts.drop(if (parts.firstOrNull() == "tmdb") 2 else 1).mapNotNull { it.toIntOrNull() }
-        return if (nums.size >= 2) StreamRequestContext(season = nums[0], episode = nums[1]) else StreamRequestContext()
+        // Every id form (tt…, tmdb:, tvdb:, kitsu:ID:EP…) - "kitsu:7442:2" is episode 2, not season 7442
+        val ext = com.cncverse.stremiobridge.server.ExternalIds.parse(id) ?: return StreamRequestContext()
+        return if (ext.season != null && ext.episode != null) StreamRequestContext(season = ext.season, episode = ext.episode) else StreamRequestContext()
     }
 
     /** Sample streams for the admin preview. */
