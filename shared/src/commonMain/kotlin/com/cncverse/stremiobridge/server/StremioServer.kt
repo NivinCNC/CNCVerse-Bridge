@@ -1287,6 +1287,9 @@ object StremioServer {
                 val port = call.parameters["port"]?.toIntOrNull() ?: return@head call.respond(HttpStatusCode.NotFound)
                 LocalRelay.handle(call, port, call.parameters.getAll("path").orEmpty().joinToString("/"), call.request.queryString())
             }
+            // HLS links that only open from WARP (signed for the network that unlocked them)
+            get("/proxy/bound") { BoundRelay.handle(call) }
+            head("/proxy/bound") { BoundRelay.handle(call) }
 
             get("/api/formatter") {
                 call.respond(com.cncverse.stremiobridge.format.StreamFormatter.catalog())
@@ -1741,6 +1744,7 @@ object StremioServer {
         val out = (if (profileId != null && profiles[profileId]?.hideSubtitles == true) formatted.map { it.copy(subtitles = null) } else formatted)
             .map { withStreamBase(it) }
             .map { LocalRelay.rewriteStream(it) }
+            .let { BoundRelay.wrap(it) }
             .let { list ->
                 // "Support the project" entry on top, only above real results; each profile can hide it
                 val show = profileId?.let { profiles[it]?.showSupport } ?: true
