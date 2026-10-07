@@ -1,6 +1,7 @@
 package com.cncverse.stremiobridge.cache
 
 import com.cncverse.stremiobridge.model.StremioStream
+import com.cncverse.stremiobridge.model.StreamInfo
 import com.cncverse.stremiobridge.state.ServerState
 import kotlinx.coroutines.*
 import kotlinx.serialization.Serializable
@@ -57,6 +58,12 @@ data class CachedStreamEntry(
     val hitCount: Long = 0L,
     /** Per stream (same order): when that link dies (signed URLs); empty = all live until [expiresAt]. */
     val streamExpiresAt: List<Long> = emptyList(),
+    /**
+     * Per stream (same order): StreamInfo (quality, release name, provider, source). It is not part
+     * of the Stremio JSON, so without this a restart brought cached lists back as "Auto" quality with
+     * no release name, and provider order / size sort / size filter could not see them.
+     */
+    val infos: List<StreamInfo?> = emptyList(),
 )
 
 @Serializable
@@ -472,9 +479,16 @@ object StreamCacheManager {
             val now = System.currentTimeMillis()
             var loaded = 0
             list.asSequence().filter { it.expiresAt > now }
+                // Saved by an older build without stream info: those would come back as "Auto"
+                // with no release names, so they are refetched instead
+                .filter { it.streams.isEmpty() || it.infos.size == it.streams.size }
                 .sortedByDescending { it.cachedAt }.take(config.maxRamEntries)
                 .forEach { entry ->
-                    memoryCache[entry.key] = entry
+                    // Re-attach each stream's info (saved alongside, same order)
+                    val restored = if (entry.infos.size == entry.streams.size)
+                        entry.copy(streams = entry.streams.zip(entry.infos) { s, i -> if (i != null) s.copy(info = i) else s }, infos = emptyList())
+                    else entry
+                    memoryCache[entry.key] = restored
                     loaded++
                 }
             ServerState.info("StreamCacheManager: Restored $loaded valid stream entries from disk.")
@@ -494,6 +508,7 @@ object StreamCacheManager {
         try {
             val now = System.currentTimeMillis()
             val active = memoryCache.values.filter { it.expiresAt > now }
+                .map { e -> if (e.streams.any { it.info != null }) e.copy(infos = e.streams.map { it.info }) else e }
             val tmp = File(file.parentFile, "${file.name}.tmp")
             tmp.outputStream().buffered().use { cacheJson.encodeToStream(active, it) }
             java.nio.file.Files.move(

@@ -143,8 +143,10 @@ data class StremioStream(
 /**
  * What we know about a stream beyond its display strings: the extension that
  * produced it, the raw CloudStream link fields and the resolved title. Feeds
- * the stream formatter's template variables.
+ * the stream formatter's template variables. Serializable only so the stream cache can keep
+ * it on disk (it is never sent to Stremio: StremioStream.info is @Transient).
  */
+@Serializable
 data class StreamInfo(
     /** Extension (addon) name, e.g. "Netflix". */
     val addonName: String? = null,
