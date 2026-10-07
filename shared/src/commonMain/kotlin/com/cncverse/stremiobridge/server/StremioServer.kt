@@ -225,8 +225,10 @@ object StremioServer {
         val maxSizeGb: Double = 0.0,
         /** Extension names in priority order: earlier ones come first inside each group. */
         val providerOrder: List<String> = emptyList(),
-        /** Show the "support the project" entry at the end of stream lists. */
+        /** Show the "support the project" entry on top of stream lists. */
         val showSupport: Boolean = true,
+        /** Hide direct-download files whose server cannot seek (no byte ranges). Relay/proxy links are never hidden. */
+        val filterNonSeekable: Boolean = false,
         /** The profile's own stream formatter choice (null = follow the server's formatter). */
         val formatter: com.cncverse.stremiobridge.format.ProfileFormatter? = null,
         /** User-chosen profile name, shown in the Stremio addon title ("CNCVerse Bridge · Kids"). */
@@ -260,6 +262,7 @@ object StremioServer {
         val maxSizeGb: Double = 0.0,
         val providerOrder: List<String> = emptyList(),
         val showSupport: Boolean = true,
+        val filterNonSeekable: Boolean = false,
     )
 
     @Serializable
@@ -703,6 +706,7 @@ object StremioServer {
             providerOrder = r.providerOrder.map { it.trim() }.filter { it.isNotEmpty() && it.length <= 80 }
                 .distinct().take(MAX_PROFILE_EXTENSIONS + 10),
             showSupport = r.showSupport,
+            filterNonSeekable = r.filterNonSeekable,
             lastSeen = now,
         )
         saveProfiles()
@@ -816,6 +820,7 @@ object StremioServer {
             ",\"maxStreamsPerResolution\":" + maxStreamsPerResolution +
             ",\"hideSubtitles\":" + (rec?.hideSubtitles ?: false) +
             ",\"showSupport\":" + (rec?.showSupport ?: true) +
+            ",\"filterNonSeekable\":" + (rec?.filterNonSeekable ?: false) +
             ",\"groupBy\":\"" + (rec?.groupBy ?: "default") + "\",\"sortBy\":\"" + (rec?.sortBy ?: "default") + "\"" +
             ",\"minSizeGb\":" + (rec?.minSizeGb ?: 0.0) + ",\"maxSizeGb\":" + (rec?.maxSizeGb ?: 0.0) +
             ",\"providerOrder\":" + serverJson.encodeToString(
@@ -1716,7 +1721,10 @@ object StremioServer {
 
         // Filter streams according to user profile quality preferences (if requested with a profile)
         val filtered = if (profileId != null) {
-            profiles[profileId]?.let { arrangeStreams(filterStreamsByProfile(sorted, it), it) } ?: sorted
+            profiles[profileId]?.let { p ->
+                val kept = filterStreamsByProfile(sorted, p)
+                arrangeStreams(if (p.filterNonSeekable) SeekProbe.dropNonSeekable(kept) else kept, p)
+            } ?: sorted
         } else {
             sorted
         }
@@ -1742,7 +1750,7 @@ object StremioServer {
 
     private val SUPPORT_STREAM = StremioStream(
         name = "✨ | support the project!",
-        title = "Click to donate this project ❤️ (you can hide this in your profile settings)",
+        title = "Click to donate this project ❤️\n(you can hide this in your profile settings)",
         externalUrl = "https://cncverse.pages.dev",
     )
 
@@ -4623,6 +4631,10 @@ input:checked + .slider:before {
         <input type="checkbox" id="pb-show-support" checked onchange="onPlaybackChange()" style="accent-color:var(--accent);cursor:pointer;">
         <span>Show "support the project"</span>
       </label>
+      <label title="Hides direct downloads that cannot skip around: you would not be able to scrub or seek inside them. Streams through the bridge's relay and HLS streams are never hidden." style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;background:var(--surface);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-size:12.5px;font-weight:600;padding:6px 9px;outline:none;">
+        <input type="checkbox" id="pb-filter-seek" onchange="onPlaybackChange()" style="accent-color:var(--accent);cursor:pointer;">
+        <span>Hide non-seekable files</span>
+      </label>
     </div>
     <div>
       <div style="display:flex;align-items:center;justify-content:space-between;gap:8px;">
@@ -6110,6 +6122,8 @@ function applyPlaybackPreferences(p) {
   pData.maxSizeGb = p.maxSizeGb || 0;
   pData.providerOrder = p.providerOrder || [];
   pData.showSupport = p.showSupport !== false;
+  pData.filterNonSeekable = !!p.filterNonSeekable;
+  var fsk = document.getElementById("pb-filter-seek"); if (fsk) fsk.checked = pData.filterNonSeekable;
   var el = document.getElementById("pb-hide-subs"); if (el) el.checked = pData.hideSubtitles;
   el = document.getElementById("pb-show-support"); if (el) el.checked = pData.showSupport;
   el = document.getElementById("pb-group"); if (el) el.value = pData.groupBy;
@@ -6131,6 +6145,8 @@ function onPlaybackChange() {
   pData.hideSubtitles = hs ? hs.checked : false;
   var ss = document.getElementById("pb-show-support");
   pData.showSupport = ss ? ss.checked : true;
+  var fs = document.getElementById("pb-filter-seek");
+  pData.filterNonSeekable = fs ? fs.checked : false;
   pData.groupBy = g ? g.value : "default";
   pData.sortBy = so ? so.value : "default";
   pData.minSizeGb = num("pb-min-gb");
@@ -6152,7 +6168,8 @@ function savePlayback() {
         minSizeGb: pData.minSizeGb || 0,
         maxSizeGb: pData.maxSizeGb || 0,
         providerOrder: pData.providerOrder || [],
-        showSupport: pData.showSupport !== false
+        showSupport: pData.showSupport !== false,
+        filterNonSeekable: !!pData.filterNonSeekable
       })
     }).then(function(r){ return r.json(); })
       .then(function(p){
