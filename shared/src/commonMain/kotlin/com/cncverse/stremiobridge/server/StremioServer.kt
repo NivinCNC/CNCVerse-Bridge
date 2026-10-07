@@ -1717,6 +1717,8 @@ object StremioServer {
         val id   = parameters["id"]   ?: return respond(HttpStatusCode.BadRequest)
 
         val streams = withContext(pluginDispatcher) { buildStreams(type, id, profileId) }
+            // Archive downloads (".zip" season packs) can never play in any player
+            .filter { !SeekProbe.isArchiveUrl(it.url) }
         val sorted = sortStreamsByQuality(streams)
 
         // Filter streams according to user profile quality preferences (if requested with a profile)
@@ -4631,9 +4633,9 @@ input:checked + .slider:before {
         <input type="checkbox" id="pb-show-support" checked onchange="onPlaybackChange()" style="accent-color:var(--accent);cursor:pointer;">
         <span>Show "support the project"</span>
       </label>
-      <label title="Hides direct downloads that cannot skip around: you would not be able to scrub or seek inside them. Streams through the bridge's relay and HLS streams are never hidden." style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;background:var(--surface);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-size:12.5px;font-weight:600;padding:6px 9px;outline:none;">
+      <label title="Hides direct downloads that cannot skip around (you would not be able to scrub or seek inside them) and archive downloads such as zipped season packs. Streams through the bridge's relay and HLS streams are never hidden." style="cursor:pointer;display:inline-flex;align-items:center;gap:6px;background:var(--surface);border:1.5px solid var(--border);border-radius:7px;color:var(--text);font-size:12.5px;font-weight:600;padding:6px 9px;outline:none;">
         <input type="checkbox" id="pb-filter-seek" onchange="onPlaybackChange()" style="accent-color:var(--accent);cursor:pointer;">
-        <span>Hide non-seekable files</span>
+        <span>Hide non-seekable / non-playable files</span>
       </label>
     </div>
     <div>

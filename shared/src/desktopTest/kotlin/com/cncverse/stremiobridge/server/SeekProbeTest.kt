@@ -35,10 +35,20 @@ class SeekProbeTest {
             ex.responseHeaders.add("Content-Type", "application/vnd.apple.mpegurl")
             ex.sendResponseHeaders(200, body.size.toLong()); ex.responseBody.use { it.write(body) }
         }
+        // Whole-season zip behind a name-less URL (cinecloud /vz/…): ranges work, but not a video
+        server.createContext("/vz/abc") { ex ->
+            ex.responseHeaders.add("Content-Type", "application/zip")
+            ex.sendResponseHeaders(206, 1); ex.responseBody.use { it.write('P'.code) }
+        }
         // Download page answering 206 with one byte of HTML: not a file
         server.createContext("/dl.php") { ex ->
             ex.responseHeaders.add("Content-Type", "text/html; charset=UTF-8")
             ex.sendResponseHeaders(206, 1); ex.responseBody.use { it.write('B'.code) }
+        }
+        // Same host, name-less link that is a real video: must not inherit the zip's verdict
+        server.createContext("/vz/mkv") { ex ->
+            ex.responseHeaders.add("Content-Type", "video/x-matroska")
+            ex.sendResponseHeaders(206, 1); ex.responseBody.use { it.write(0x1a) }
         }
         server.start()
         port = server.address.port
@@ -76,5 +86,24 @@ class SeekProbeTest {
         val playlist = file("http://127.0.0.1:$port/bridge?url=x")
         val page = file("http://localhost:$port/dl.php?link=x")
         assertEquals(listOf(playlist), SeekProbe.dropNonSeekable(listOf(playlist, page)))
+    }
+
+    @Test
+    fun `archives are hidden by name always and by content type when probed`() = runBlocking {
+        assertTrue(SeekProbe.isArchiveUrl("https://pub-x.r2.dev/Show%20%5BS01E01-08%5D%201080p.zip"))
+        assertTrue(SeekProbe.isArchiveUrl("https://host/pack.part.r01"))
+        assertFalse(SeekProbe.isArchiveUrl("https://host/movie.mkv"))
+        assertFalse(SeekProbe.isArchiveUrl("https://new5.cinecloud.site/vz/ebb19ef3?k=1"))
+        SeekProbe.resetForTest()
+        val zip = file("http://127.0.0.1:$port/vz/abc?k=1")
+        assertEquals(emptyList(), SeekProbe.dropNonSeekable(listOf(zip)))
+    }
+
+    @Test
+    fun `name-less links on one host are judged one by one`() = runBlocking {
+        SeekProbe.resetForTest()
+        val zip = file("http://127.0.0.1:$port/vz/abc?k=1")
+        val mkv = file("http://127.0.0.1:$port/vz/mkv?k=2")
+        assertEquals(listOf(mkv), SeekProbe.dropNonSeekable(listOf(zip, mkv)))
     }
 }
