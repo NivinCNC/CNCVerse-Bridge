@@ -29,6 +29,17 @@ class SeekProbeTest {
         server.createContext("/whole.mkv") { ex ->
             ex.sendResponseHeaders(200, 3); ex.responseBody.use { it.write(byteArrayOf(1, 2, 3)) }
         }
+        // HLS playlist behind a URL without .m3u8 (workers.dev bridges): 200, but must be kept
+        server.createContext("/bridge") { ex ->
+            val body = "#EXTM3U".toByteArray()
+            ex.responseHeaders.add("Content-Type", "application/vnd.apple.mpegurl")
+            ex.sendResponseHeaders(200, body.size.toLong()); ex.responseBody.use { it.write(body) }
+        }
+        // Download page answering 206 with one byte of HTML: not a file
+        server.createContext("/dl.php") { ex ->
+            ex.responseHeaders.add("Content-Type", "text/html; charset=UTF-8")
+            ex.sendResponseHeaders(206, 1); ex.responseBody.use { it.write('B'.code) }
+        }
         server.start()
         port = server.address.port
     }
@@ -50,11 +61,20 @@ class SeekProbeTest {
 
     @Test
     fun `a host that ignores ranges is hidden, one that honours them is kept`() = runBlocking {
+        SeekProbe.resetForTest()
         // Two host names for the same test server (verdicts are per host)
         val keep = file("http://127.0.0.1:$port/seekable.mkv")
         val drop = file("http://localhost:$port/whole.mkv")
         val hls = file("http://localhost:$port/live.m3u8", "M3U8")
         val out = SeekProbe.dropNonSeekable(listOf(keep, drop, hls))
         assertEquals(listOf(keep, hls), out)
+    }
+
+    @Test
+    fun `a playlist without m3u8 in the url is kept, a download page is hidden`() = runBlocking {
+        SeekProbe.resetForTest()
+        val playlist = file("http://127.0.0.1:$port/bridge?url=x")
+        val page = file("http://localhost:$port/dl.php?link=x")
+        assertEquals(listOf(playlist), SeekProbe.dropNonSeekable(listOf(playlist, page)))
     }
 }

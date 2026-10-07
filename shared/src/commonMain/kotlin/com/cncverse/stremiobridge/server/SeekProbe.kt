@@ -30,6 +30,9 @@ object SeekProbe {
     private val verdicts = ConcurrentHashMap<String, Pair<Boolean, Long>>()
     private val probeLimit = Semaphore(16)
 
+    /** Tests only: forget every host verdict. */
+    internal fun resetForTest() = verdicts.clear()
+
     private val client by lazy {
         okhttp3.OkHttpClient.Builder()
             .connectTimeout(3, TimeUnit.SECONDS)
@@ -72,10 +75,19 @@ object SeekProbe {
             s.behaviorHints?.proxyHeaders?.request?.forEach { (k, v) -> runCatching { req.header(k, v) } }
             runCatching {
                 client.newCall(req.build()).execute().use { r ->
+                    val type = r.header("Content-Type").orEmpty().lowercase()
+                    val finalHost = r.request.url.host.lowercase()
                     when {
+                        // A playlist behind a plain-looking URL (workers.dev HLS bridges): never hidden
+                        "mpegurl" in type || "dash+xml" in type -> true
+                        r.code !in 200..299 -> null // 403/404/5xx: says nothing about seeking
+                        // A web page is not a file at all (download pages such as gamerxyt dl.php,
+                        // which can even answer 206 with one byte of HTML)
+                        type.startsWith("text/html") -> false
+                        // Google Drive downloads ignore ranges
+                        finalHost == "video-downloads.googleusercontent.com" -> false
                         r.code == 206 -> true
-                        r.code == 200 -> false // ignored the range: sends the whole file
-                        else -> null           // 403/404/5xx: says nothing about seeking
+                        else -> false // 200: ignored the range, sends the whole file
                     }
                 }
             }.getOrNull()
