@@ -47,7 +47,7 @@ class SubDubAndLangTest {
         fun s(addon: String, provider: String) = StremioStream(name = addon, url = "u-$addon",
             info = StreamInfo(addonName = addon, quality = 1080, providerName = provider))
         val streams = listOf(s("VegaMovies", "VegaMovies"), s("FourKHDHub", "4K HDHUB"))
-        val out = StremioServer.arrangeStreams(streams, StremioServer.ProfileRecord(providerOrder = listOf("4K HDHUB", "VegaMovies")))
+        val out = StremioServer.arrangeStreams(streams, StremioServer.StreamPrefs(providerOrder = listOf("4K HDHUB", "VegaMovies")))
         assertEquals(listOf("FourKHDHub", "VegaMovies"), out.map { it.info?.addonName })
     }
 }

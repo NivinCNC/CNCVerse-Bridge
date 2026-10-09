@@ -44,10 +44,10 @@ fun SettingsScreen() {
         )
 
             TunnelSettingsCard()
-            AddonOptionsCard()
+            StreamsCard()
+            CatalogsCard()
             FormatterCard()
             StreamCacheCard()
-            UserPageCard()
 
             // About Section
             AmoledCard {

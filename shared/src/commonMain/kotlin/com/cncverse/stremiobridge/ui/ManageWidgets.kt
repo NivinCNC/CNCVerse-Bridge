@@ -18,13 +18,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.launch
 
-// Small building blocks shared by the management screens (Health, Settings sections).
+// Small building blocks shared by the Settings sections.
 
 private val fallbackScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
 /**
- * Runs [block] on the app-wide scope, so long jobs (health sweeps, audits, bulk
- * installs) keep going when the user switches tabs.
+ * Runs [block] on the app-wide scope, so long jobs (bulk installs, updates)
+ * keep going when the user switches tabs.
  */
 fun launchBackground(block: suspend CoroutineScope.() -> Unit) {
     (BridgeRuntime.appScope ?: fallbackScope).launch(Dispatchers.IO, block = block)
@@ -120,47 +120,6 @@ fun amoledFieldColors() = OutlinedTextFieldDefaults.colors(
     focusedLabelColor = Violet400,
     unfocusedLabelColor = TextMuted,
 )
-
-/** A small coloured pill (health status, verdicts). */
-@Composable
-fun Pill(text: String, color: Color) {
-    Text(
-        text,
-        color = color,
-        fontSize = 10.sp,
-        fontWeight = FontWeight.SemiBold,
-        modifier = Modifier
-            .background(color.copy(alpha = 0.14f), RoundedCornerShape(6.dp))
-            .padding(horizontal = 7.dp, vertical = 2.dp),
-    )
-}
-
-/** Colour + label for a [com.cncverse.stremiobridge.state.HealthStatus] value. */
-fun healthLook(status: String): Pair<Color, String> = when (status) {
-    "working" -> Green400 to "Working"
-    "proxy" -> Blue400 to "Working"
-    "dead" -> Red400 to "Dead"
-    else -> TextMuted to "Unknown"
-}
-
-/** "5 min ago", "3 h ago", "2 d ago", or "never". */
-fun agoText(epochMs: Long, now: Long = System.currentTimeMillis()): String {
-    if (epochMs <= 0L) return "never"
-    val s = (now - epochMs) / 1000
-    return when {
-        s < 0 -> "just now"
-        s < 60 -> "${s}s ago"
-        s < 3600 -> "${s / 60} min ago"
-        s < 86_400 -> "${s / 3600} h ago"
-        else -> "${s / 86_400} d ago"
-    }
-}
-
-/** Local date-time for timestamps shown in the UI. */
-fun timeText(epochMs: Long): String {
-    if (epochMs <= 0L) return "—"
-    return java.text.SimpleDateFormat("MMM d, HH:mm", java.util.Locale.US).format(java.util.Date(epochMs))
-}
 
 /** A label/value pair inside a stats grid. */
 @Composable

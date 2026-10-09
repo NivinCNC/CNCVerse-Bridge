@@ -651,9 +651,10 @@ object StreamFormatter {
     fun init(cacheDir: String) {
         val f = File(cacheDir, "stream_formatter.json")
         file = f
+        // Never configured: the formatter starts on, with the CNCVerse preset
         val loaded = runCatching { if (f.exists()) json.decodeFromString<StreamFormatterConfig>(f.readText()) else null }
             .onFailure { ServerState.warn("Stream formatter config unreadable: ${it.message}") }
-            .getOrNull() ?: StreamFormatterConfig()
+            .getOrNull() ?: StreamFormatterConfig(enabled = true, nameTemplate = PRESET_NAME, descriptionTemplate = PRESET_DESCRIPTION)
         runCatching { install(loaded) }.onFailure {
             ServerState.warn("Stream formatter disabled — template error: ${it.message}")
             config = loaded.copy(enabled = false)

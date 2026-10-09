@@ -75,9 +75,8 @@ The app downloads `cloudflared` on first use.
 
 - **Server** — start/stop, addon URLs for Nuvio (LAN) and Stremio (HTTPS), Stremio Mode
 - **Extensions** — repositories, search & install, update all, install a whole repo, switch extensions on/off, per-extension settings
-- **Health** — which extensions still return links, check one or all, disable dead ones, nightly maintenance with auto-uninstall, home-page audit
 - **Logs** — live log with copy/clear
-- **Settings** — Cloudflare Tunnel, hide catalogs, user profiles, stream formatter (with presets and preview), stream cache, the users' configure-page look and credits
+- **Settings** — Cloudflare Tunnel, streams (resolutions, CAM, size limits, non-seekable files, subtitles, sorting, extension priority), catalogs (hide all or pick which ones; genres come from each home page, refreshed every 30 min), stream formatter (on by default, presets and preview), stream cache
 
 ---
 

@@ -1,7 +1,6 @@
 package com.cncverse.stremiobridge.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -9,7 +8,6 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -24,16 +22,11 @@ import com.cncverse.stremiobridge.format.StreamFormatter
 import com.cncverse.stremiobridge.format.StreamFormatterConfig
 import com.cncverse.stremiobridge.format.TemplateException
 import com.cncverse.stremiobridge.server.StremioServer
-import com.cncverse.stremiobridge.state.AuthorCredit
-import com.cncverse.stremiobridge.state.FooterCredit
 import com.cncverse.stremiobridge.state.ServerState
 import com.cncverse.stremiobridge.state.ServerStatus
 import com.cncverse.stremiobridge.tunnel.CloudflaredManager
 import com.cncverse.stremiobridge.tunnel.TunnelSettings
-import kotlinx.serialization.builtins.ListSerializer
-import kotlinx.serialization.json.Json
 
-private val prettyJson = Json { prettyPrint = true; encodeDefaults = true; ignoreUnknownKeys = true }
 
 // ── Cloudflare Tunnel ─────────────────────────────────────────────────────────
 
@@ -124,52 +117,6 @@ fun TunnelSettingsCard() {
         ).forEach { Text(it, color = TextSecondary, fontSize = 11.sp, lineHeight = 15.sp) }
         TextButton(onClick = { uriHandler.openUri("https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/get-started/create-remote-tunnel/") }) {
             Text("Cloudflare guide", color = Violet400, fontSize = 12.sp)
-        }
-    }
-}
-
-// ── Catalogs & profiles ───────────────────────────────────────────────────────
-
-@Composable
-fun AddonOptionsCard() {
-    var catalogsOff by remember { mutableStateOf(ServerState.disableCatalogsGlobally) }
-    var message by remember { mutableStateOf<String?>(null) }
-    val profiles = remember(message) { StremioServer.profiles.entries.sortedByDescending { it.value.lastSeen }.take(50) }
-
-    AmoledCard(Modifier.fillMaxWidth()) {
-        SectionTitle("Addon", "What every Stremio / Nuvio install of this bridge gets.")
-        SwitchRow(
-            title = "Hide catalogs",
-            description = "Streams and search only — no home-page rows in the apps",
-            checked = catalogsOff,
-            onCheckedChange = {
-                catalogsOff = it
-                ServerState.disableCatalogsGlobally = it
-                StremioServer.saveGlobalCatalogSetting()
-            },
-        )
-        Spacer(Modifier.height(8.dp))
-        HorizontalDivider(color = DividerColor)
-        Spacer(Modifier.height(8.dp))
-        Text("Profiles (${StremioServer.profiles.size})", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
-        Text(
-            "Each user's configure page creates a profile. A profile can use at most ${StremioServer.MAX_PROFILE_EXTENSIONS} extensions.",
-            color = TextMuted, fontSize = 11.sp,
-        )
-        Spacer(Modifier.height(6.dp))
-        ActionButton("Trim profiles over the limit") {
-            val n = StremioServer.enforceProfileExtensionLimit()
-            message = "Trimmed $n profile(s) to ${StremioServer.MAX_PROFILE_EXTENSIONS} extensions"
-        }
-        message?.let { Text(it, color = Violet300, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)) }
-        if (profiles.isNotEmpty()) {
-            Spacer(Modifier.height(6.dp))
-            profiles.forEach { (id, p) ->
-                Text(
-                    "${p.displayName.ifBlank { id }} · seen ${agoText(p.lastSeen)} · ${p.enabledOverrides.size} on / ${p.disabled.size} off",
-                    color = TextSecondary, fontSize = 10.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                )
-            }
         }
     }
 }
@@ -331,47 +278,33 @@ fun StreamCacheCard() {
     }
 }
 
-// ── User page look & credits ──────────────────────────────────────────────────
+// ── Streams: filters & sorting ────────────────────────────────────────────────
 
-/** Accent colour and base theme of the users' configure page, plus the credits it shows. */
+private val RESOLUTIONS = listOf("2160p", "1080p", "720p", "480p", "360p")
+
+/** How stream lists are filtered and ordered (applied to every request). */
 @Composable
-fun UserPageCard() {
-    var accent by remember { mutableStateOf(ServerState.globalAccentHex) }
-    var baseTheme by remember { mutableStateOf(ServerState.globalBaseTheme) }
-    var message by remember { mutableStateOf<String?>(null) }
-    var editing by remember { mutableStateOf<String?>(null) }
-    var creditsText by remember { mutableStateOf("") }
-    var error by remember { mutableStateOf<String?>(null) }
-    val themes = listOf("slate", "charcoal", "navy", "forest", "oled", "light")
-    val swatches = listOf("#8b5cf6", "#3b82f6", "#10b981", "#f59e0b", "#ef4444", "#ec4899", "#14b8a6", "#6366f1")
+fun StreamsCard() {
+    var p by remember { mutableStateOf(StremioServer.streamPrefs) }
+    var minGb by remember { mutableStateOf(p.minSizeGb.takeIf { it > 0 }?.toString().orEmpty()) }
+    var maxGb by remember { mutableStateOf(p.maxSizeGb.takeIf { it > 0 }?.toString().orEmpty()) }
+    var maxPer by remember { mutableStateOf(p.maxStreamsPerResolution.takeIf { it > 0 }?.toString().orEmpty()) }
+    var showOrder by remember { mutableStateOf(false) }
+    var saved by remember { mutableStateOf<String?>(null) }
+    fun update(n: StremioServer.StreamPrefs) { p = n; saved = null }
 
     AmoledCard(Modifier.fillMaxWidth()) {
-        SectionTitle("User page", "Look of the configure page your users open, and the credits it shows.")
-        Text("Accent colour", color = TextSecondary, fontSize = 11.sp)
-        Spacer(Modifier.height(6.dp))
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-            swatches.forEach { hex ->
-                val c = parseHexColor(hex)
-                Box(
-                    Modifier.size(if (accent.equals(hex, true)) 28.dp else 22.dp)
-                        .background(c, CircleShape)
-                        .clickable { accent = hex },
-                )
-            }
-        }
-        Spacer(Modifier.height(8.dp))
-        OutlinedTextField(
-            value = accent, onValueChange = { accent = it.trim() },
-            label = { Text("Accent hex") }, singleLine = true,
-            modifier = Modifier.fillMaxWidth(), colors = amoledFieldColors(),
-        )
-        Spacer(Modifier.height(8.dp))
-        Text("Base theme", color = TextSecondary, fontSize = 11.sp)
+        SectionTitle("Streams", "Which links Stremio / Nuvio get, and in what order.")
+
+        Text("Resolutions", color = TextSecondary, fontSize = 11.sp)
+        Text("None selected = all", color = TextMuted, fontSize = 10.sp)
         FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            themes.forEach { t ->
+            RESOLUTIONS.forEach { r ->
+                val on = r in p.allowedResolutions
                 FilterChip(
-                    selected = baseTheme == t, onClick = { baseTheme = t },
-                    label = { Text(t, fontSize = 11.sp) },
+                    selected = on,
+                    onClick = { update(p.copy(allowedResolutions = if (on) p.allowedResolutions - r else p.allowedResolutions + r)) },
+                    label = { Text(r, fontSize = 11.sp) },
                     colors = FilterChipDefaults.filterChipColors(
                         selectedContainerColor = Violet600, selectedLabelColor = TextPrimary,
                         containerColor = AmoledCard2, labelColor = TextSecondary,
@@ -379,64 +312,150 @@ fun UserPageCard() {
                 )
             }
         }
-        Spacer(Modifier.height(8.dp))
-        ActionButton("Save look", primary = true, enabled = Regex("^#[0-9a-fA-F]{6}$").matches(accent)) {
-            val c = parseHexColor(accent)
-            val glow = "rgba(${(c.red * 255).toInt()}, ${(c.green * 255).toInt()}, ${(c.blue * 255).toInt()}, 0.28)"
-            val hover = "#" + listOf(c.red, c.green, c.blue).joinToString("") { ((it * 0.85f) * 255).toInt().toString(16).padStart(2, '0') }
-            StremioServer.saveThemeConfig(accent, glow, hover, baseTheme)
-            message = "User page look saved"
+        SwitchRow("Hide CAM / TeleSync", "Drops cinema recordings and screeners", p.excludeCam) { update(p.copy(excludeCam = it)) }
+        SwitchRow("Hide non-seekable / non-playable files", "Direct files whose server can't seek, and archives", p.filterNonSeekable) {
+            update(p.copy(filterNonSeekable = it))
         }
-        message?.let { Text(it, color = Green400, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)) }
+        SwitchRow("Hide subtitles", "Streams go out without subtitle tracks", p.hideSubtitles) { update(p.copy(hideSubtitles = it)) }
+        SwitchRow("Show \"support the project\" entry", "One donate link on top of stream lists", p.showSupport) { update(p.copy(showSupport = it)) }
 
-        Spacer(Modifier.height(12.dp))
-        HorizontalDivider(color = DividerColor)
-        Spacer(Modifier.height(8.dp))
-        Text("Credits", color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
-        Text(
-            "${StremioServer.getCreditsList().size} author credit(s) · ${StremioServer.getFooterCredits().size} footer link(s). Edited as JSON.",
-            color = TextMuted, fontSize = 11.sp,
-        )
         Spacer(Modifier.height(6.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            ActionButton("Edit author credits") {
-                editing = "authors"; error = null
-                creditsText = prettyJson.encodeToString(ListSerializer(AuthorCredit.serializer()), StremioServer.getCreditsList())
-            }
-            ActionButton("Edit footer links") {
-                editing = "footer"; error = null
-                creditsText = prettyJson.encodeToString(ListSerializer(FooterCredit.serializer()), StremioServer.getFooterCredits())
-            }
-        }
-        if (editing != null) {
-            Spacer(Modifier.height(8.dp))
             OutlinedTextField(
-                value = creditsText, onValueChange = { creditsText = it; error = null },
-                textStyle = LocalTextStyle.current.copy(fontFamily = FontFamily.Monospace, fontSize = 11.sp),
-                modifier = Modifier.fillMaxWidth().heightIn(min = 160.dp, max = 360.dp),
-                colors = amoledFieldColors(),
+                value = maxPer, onValueChange = { v -> maxPer = v.filter { it.isDigit() }.take(3); saved = null },
+                label = { Text("Max per quality") }, placeholder = { Text("no limit", color = TextMuted) }, singleLine = true,
+                modifier = Modifier.weight(1f), colors = amoledFieldColors(),
             )
-            Spacer(Modifier.height(6.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                ActionButton("Save", primary = true) {
-                    runCatching {
-                        if (editing == "authors") {
-                            val list = prettyJson.decodeFromString(ListSerializer(AuthorCredit.serializer()), creditsText)
-                            StremioServer.saveCredits(list); "Saved ${list.size} author credit(s)"
-                        } else {
-                            val list = prettyJson.decodeFromString(ListSerializer(FooterCredit.serializer()), creditsText)
-                            StremioServer.saveFooterCredits(list); "Saved ${list.size} footer link(s)"
-                        }
-                    }.onSuccess { message = it; editing = null }
-                        .onFailure { error = "Invalid JSON — nothing saved (${it.message?.take(120)})" }
-                }
-                ActionButton("Cancel") { editing = null }
-            }
-            error?.let { Text(it, color = Red400, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)) }
+            OutlinedTextField(
+                value = minGb, onValueChange = { v -> minGb = v.filter { it.isDigit() || it == '.' }.take(6); saved = null },
+                label = { Text("Min GB") }, singleLine = true,
+                modifier = Modifier.weight(1f), colors = amoledFieldColors(),
+            )
+            OutlinedTextField(
+                value = maxGb, onValueChange = { v -> maxGb = v.filter { it.isDigit() || it == '.' }.take(6); saved = null },
+                label = { Text("Max GB") }, singleLine = true,
+                modifier = Modifier.weight(1f), colors = amoledFieldColors(),
+            )
         }
+
+        Spacer(Modifier.height(10.dp))
+        Text("Sort", color = TextSecondary, fontSize = 11.sp)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf(
+                Triple("default", "default", "Best quality first"),
+                Triple("default", "size", "Quality, then biggest file"),
+                Triple("provider", "default", "By extension"),
+                Triple("provider", "size", "By extension, biggest first"),
+            ).forEach { (group, sort, label) ->
+                FilterChip(
+                    selected = p.groupBy == group && p.sortBy == sort,
+                    onClick = { update(p.copy(groupBy = group, sortBy = sort)) },
+                    label = { Text(label, fontSize = 11.sp) },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = Violet600, selectedLabelColor = TextPrimary,
+                        containerColor = AmoledCard2, labelColor = TextSecondary,
+                    ),
+                )
+            }
+        }
+
+        // Extension priority: earlier ones come first inside each group
+        TextButton(onClick = { showOrder = !showOrder }) {
+            Text(
+                if (showOrder) "Hide extension priority" else "Extension priority (${p.providerOrder.size} set)",
+                color = Violet400, fontSize = 12.sp,
+            )
+        }
+        if (showOrder) {
+            val names = remember(p.providerOrder) {
+                val loaded = StremioServer.loadedApis.filter { !StremioServer.isGloballyDisabled(it) }.map { it.name }.distinct()
+                p.providerOrder.filter { it in loaded } + loaded.filter { it !in p.providerOrder }.sorted()
+            }
+            Text("Move extensions up to have their links listed first.", color = TextMuted, fontSize = 10.sp)
+            names.forEachIndexed { i, name ->
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth().padding(vertical = 1.dp)) {
+                    Text("${i + 1}.", color = TextMuted, fontSize = 11.sp, modifier = Modifier.width(28.dp))
+                    Text(name, color = TextPrimary, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                    TextButton(enabled = i > 0, onClick = {
+                        val l = names.toMutableList(); l.add(i - 1, l.removeAt(i)); update(p.copy(providerOrder = l))
+                    }) { Text("Up", fontSize = 11.sp) }
+                    TextButton(enabled = i < names.size - 1, onClick = {
+                        val l = names.toMutableList(); l.add(i + 1, l.removeAt(i)); update(p.copy(providerOrder = l))
+                    }) { Text("Down", fontSize = 11.sp) }
+                }
+            }
+            if (p.providerOrder.isNotEmpty()) {
+                TextButton(onClick = { update(p.copy(providerOrder = emptyList())) }) { Text("Reset priority", color = Red400, fontSize = 11.sp) }
+            }
+        }
+
+        Spacer(Modifier.height(8.dp))
+        ActionButton("Save", primary = true) {
+            StremioServer.updateStreamPrefs(
+                p.copy(
+                    maxStreamsPerResolution = maxPer.toIntOrNull() ?: 0,
+                    minSizeGb = minGb.toDoubleOrNull() ?: 0.0,
+                    maxSizeGb = maxGb.toDoubleOrNull() ?: 0.0,
+                )
+            )
+            p = StremioServer.streamPrefs
+            saved = "Saved — applies to the next stream request"
+        }
+        saved?.let { Text(it, color = Green400, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)) }
     }
 }
 
-private fun parseHexColor(hex: String): Color = runCatching {
-    Color(("ff" + hex.removePrefix("#")).toLong(16))
-}.getOrDefault(Violet500)
+// ── Catalogs ──────────────────────────────────────────────────────────────────
+
+/** Which catalogs (home-page rows) the addon offers. */
+@Composable
+fun CatalogsCard() {
+    var catalogsOff by remember { mutableStateOf(ServerState.disableCatalogsGlobally) }
+    var disabled by remember { mutableStateOf(StremioServer.streamPrefs.disabledCatalogs) }
+    var expanded by remember { mutableStateOf(false) }
+    var filter by remember { mutableStateOf("") }
+
+    fun save(set: Set<String>) {
+        disabled = set
+        StremioServer.updateStreamPrefs(StremioServer.streamPrefs.copy(disabledCatalogs = set))
+    }
+
+    AmoledCard(Modifier.fillMaxWidth()) {
+        SectionTitle("Catalogs", "Home-page rows shown in Stremio / Nuvio. Genres come from each extension's home page.")
+        SwitchRow(
+            title = "Hide all catalogs",
+            description = "Streams and search only",
+            checked = catalogsOff,
+            onCheckedChange = {
+                catalogsOff = it
+                ServerState.disableCatalogsGlobally = it
+                StremioServer.saveGlobalCatalogSetting()
+            },
+        )
+        if (!catalogsOff) {
+            val all = remember(expanded) { StremioServer.allCatalogs() }
+            TextButton(onClick = { expanded = !expanded }) {
+                Text(
+                    if (expanded) "Hide catalog list" else "Choose catalogs (${all.count { it.first !in disabled }} of ${all.size} on)",
+                    color = Violet400, fontSize = 12.sp,
+                )
+            }
+            if (expanded) {
+                OutlinedTextField(
+                    value = filter, onValueChange = { filter = it },
+                    placeholder = { Text("Filter catalogs", color = TextMuted) }, singleLine = true,
+                    modifier = Modifier.fillMaxWidth(), colors = amoledFieldColors(),
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(vertical = 6.dp)) {
+                    ActionButton("All on") { save(emptySet()) }
+                    ActionButton("All off") { save(all.map { it.first }.toSet()) }
+                }
+                all.filter { filter.isBlank() || it.second.contains(filter, ignoreCase = true) }.forEach { (key, name) ->
+                    SwitchRow(title = name, checked = key !in disabled, onCheckedChange = { on ->
+                        save(if (on) disabled - key else disabled + key)
+                    })
+                }
+            }
+        }
+    }
+}

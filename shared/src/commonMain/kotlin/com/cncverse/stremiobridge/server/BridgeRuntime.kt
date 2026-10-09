@@ -102,7 +102,6 @@ object BridgeRuntime {
         synchronized(this) {
             if (stateLoaded) return
             com.cncverse.stremiobridge.state.StreamTracker.init(cacheDir)
-            com.cncverse.stremiobridge.maintenance.Maintenance.init(cacheDir)
             StremioServer.loadConfig(cacheDir)
             stateLoaded = true
         }
@@ -160,27 +159,26 @@ object BridgeRuntime {
     /**
      * Removes a repository together with every extension it installed: deletes
      * their .cs3 / converted jar files, strips them from the global disabled
-     * set and every profile, then hot-reloads once.
+     * set, then hot-reloads once.
      */
     suspend fun removeRepo(url: String) = pluginMutationMutex.withLock {
         val pluginsToRemove = RepoState.installedPlugins.value
             .filter { it.repoUrl == url }
             .map { it.internalName }
             .toSet()
-        // Profiles may store the display-name slug — collect it while the APIs are still loaded
-        val profileCleanupIds = pluginsToRemove.toMutableSet()
+        // The disabled set may hold the display-name slug — collect it while the APIs are still loaded
+        val cleanupIds = pluginsToRemove.toMutableSet()
         StremioServer.loadedApis.forEach { api ->
             if (api.pluginInternalName in pluginsToRemove || api.internalName in pluginsToRemove) {
-                profileCleanupIds += StremioServer.publicNameSlug(api.name)
+                cleanupIds += StremioServer.publicNameSlug(api.name)
             }
         }
 
         val removed = withContext(Dispatchers.IO) { RepoManager.removeRepo(url, cacheDir) }
-        profileCleanupIds += removed
+        cleanupIds += removed
 
-        profileCleanupIds.forEach { StremioServer.disabledPlugins.remove(it) }
+        cleanupIds.forEach { StremioServer.disabledPlugins.remove(it) }
         StremioServer.saveDisabledPlugins()
-        StremioServer.cleanRemovedPluginsFromProfiles(profileCleanupIds)
         forceReloadPlugins()
     }
 
@@ -341,9 +339,9 @@ object BridgeRuntime {
         )
         ServerState.info("🎬 Bridge running at http://$ipAddress:$boundPort/manifest.json")
 
-        // Pre-warm all plugin home pages once the server is ready
+        // Load every home page (genres + items) once the server is ready; StremioServer
+        // refreshes them every 30 minutes after that
         appScope?.launch(Dispatchers.IO) {
-            delay(5_000)   // brief pause so Ktor is fully accepting connections
             runCatching { StremioServer.preWarmHomepages() }
                 .onFailure { e -> ServerState.warn("Startup pre-warm error: ${e.message}") }
         }
@@ -351,8 +349,6 @@ object BridgeRuntime {
         // Start 30-min extension update checker
         startPeriodicUpdateCheck()
 
-        // Nightly 00:00 IST: reload plugins, refresh home pages, health sweep, auto-uninstall
-        appScope?.let { com.cncverse.stremiobridge.maintenance.Maintenance.start(it) }
     }
 
     /** Launches a background loop that refreshes repos and auto-updates plugins every 30 minutes. */
@@ -373,8 +369,8 @@ object BridgeRuntime {
                         ServerState.info("Auto-updating ${toUpdate.size} plugin(s)…")
                         PluginInstaller.autoUpdateInstalled(cacheDir)
                         forceReloadPlugins()
-                        // Updated plugins need fresh home pages; otherwise pages are only
-                        // refreshed when someone opens them (no timed full pre-warm).
+                        // Updated plugins need fresh home pages now rather than at the
+                        // next 30-minute refresh
                         runCatching { StremioServer.preWarmHomepages() }
                             .onFailure { e -> ServerState.warn("Periodic pre-warm error: ${e.message}") }
                     } else {

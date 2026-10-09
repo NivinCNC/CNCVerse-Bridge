@@ -290,7 +290,6 @@ fun ExtensionsScreen(
                         installState = installState,
                         loadedInfo = loadedInfo,
                         enabled = enabledTick.let { !com.cncverse.stremiobridge.server.StremioServer.isIdGloballyDisabled(name) },
-                        health = com.cncverse.stremiobridge.state.StreamTracker.statusOf(name),
                         onToggleEnabled = { on ->
                             com.cncverse.stremiobridge.server.StremioServer.setPluginDisabled(name, !on)
                             com.cncverse.stremiobridge.server.StremioServer.saveDisabledPlugins()
@@ -328,7 +327,6 @@ private fun PluginCard(
     installState: PluginInstallState,
     loadedInfo: LoadedPluginInfo?,
     enabled: Boolean,
-    health: String,
     onToggleEnabled: (Boolean) -> Unit,
     onInstall: () -> Unit,
     onUninstall: () -> Unit,
@@ -462,8 +460,6 @@ private fun PluginCard(
 
             if (isInstalled) {
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
-                    val (hColor, hLabel) = healthLook(health)
-                    Pill(hLabel, hColor)
                     Spacer(Modifier.weight(1f))
                     Text(if (enabled) "On" else "Off", color = if (enabled) Green400 else TextMuted, fontSize = 10.sp)
                     Spacer(Modifier.width(4.dp))
