@@ -910,9 +910,18 @@ object StremioServer {
         throw BindException("No available ports found between $defaultPort and ${defaultPort + 50}")
     }
 
-    suspend fun start(port: Int = 8080, cacheDir: String? = null): Int {
-        if (engine != null) return activePort
-        if (cacheDir != null) {
+    @Volatile private var configLoadedFrom: String? = null
+
+    /**
+     * Loads the saved configuration (disabled extensions, profiles, credits, theme,
+     * catalogs switch, formatter, stream cache) from [cacheDir] once. Called at app
+     * start so the settings screens edit the real, persisted values before the
+     * server runs, and again (no-op) by [start].
+     */
+    fun loadConfig(cacheDir: String) {
+        if (configLoadedFrom == cacheDir) return
+        synchronized(this) {
+            if (configLoadedFrom == cacheDir) return
             disabledPluginsFile = File(cacheDir, "disabled_plugins.json")
             loadDisabledPlugins()
             profilesFile = File(cacheDir, "profiles.json")
@@ -927,6 +936,14 @@ object StremioServer {
             ServerState.disableCatalogsGlobally = catalogsOffMarker?.exists() == true
             com.cncverse.stremiobridge.format.StreamFormatter.init(cacheDir)
             com.cncverse.stremiobridge.cache.StreamCacheManager.init(cacheDir)
+            configLoadedFrom = cacheDir
+        }
+    }
+
+    suspend fun start(port: Int = 8080, cacheDir: String? = null): Int {
+        if (engine != null) return activePort
+        if (cacheDir != null) {
+            loadConfig(cacheDir)
         } else {
             val defaultCache = System.getProperty("user.home") + "/.cncverse_bridge"
             com.cncverse.stremiobridge.cache.StreamCacheManager.init(defaultCache)

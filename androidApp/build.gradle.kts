@@ -17,6 +17,8 @@ kotlin {
             compileTaskProvider.configure {
                 compilerOptions {
                     jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
+                    // Same as :shared / :desktopApp — CloudStream pulls a newer kotlin-stdlib
+                    freeCompilerArgs.add("-Xskip-metadata-version-check")
                 }
             }
         }

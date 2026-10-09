@@ -43,6 +43,12 @@ fun SettingsScreen() {
             modifier = Modifier.padding(bottom = 8.dp)
         )
 
+            TunnelSettingsCard()
+            AddonOptionsCard()
+            FormatterCard()
+            StreamCacheCard()
+            UserPageCard()
+
             // About Section
             AmoledCard {
                 Text(

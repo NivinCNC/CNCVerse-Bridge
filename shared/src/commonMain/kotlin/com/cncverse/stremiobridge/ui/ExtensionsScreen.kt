@@ -48,6 +48,8 @@ fun ExtensionsScreen(
     var selectedRepoFilter by remember { mutableStateOf<String?>(null) }
     var showAddRepoDialog by remember { mutableStateOf(false) }
     var showOnlyInstalled by remember { mutableStateOf(false) }
+    // Bumped when an extension is switched on/off (the disabled set is not observable)
+    var enabledTick by remember { mutableStateOf(0) }
 
     // Filter available plugins
     val filteredPlugins = remember(availablePlugins, searchQuery, selectedRepoFilter, showOnlyInstalled, installedPlugins) {
@@ -88,7 +90,28 @@ fun ExtensionsScreen(
                     fontSize = 11.sp,
                 )
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                val updatable = installedPlugins.filter { installStates[it.internalName] is PluginInstallState.UpdateAvailable }
+                if (updatable.isNotEmpty()) {
+                    OutlinedButton(
+                        onClick = {
+                            launchBackground {
+                                updatable.forEach { inst ->
+                                    availablePlugins.find { it.plugin.internalName == inst.internalName && it.repoEntry.url == inst.repoUrl }
+                                        ?.let { com.cncverse.stremiobridge.server.BridgeRuntime.installPlugin(it) }
+                                }
+                            }
+                        },
+                        modifier = Modifier.height(36.dp),
+                        shape = RoundedCornerShape(18.dp),
+                        border = BorderStroke(1.dp, Amber400),
+                        contentPadding = PaddingValues(horizontal = 12.dp),
+                    ) {
+                        Icon(Icons.Filled.Upgrade, contentDescription = null, tint = Amber400, modifier = Modifier.size(14.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Update all (${updatable.size})", color = Amber400, fontSize = 11.sp)
+                    }
+                }
                 if (isRefreshing) {
                     CircularProgressIndicator(
                         color = Violet400,
@@ -224,6 +247,22 @@ fun ExtensionsScreen(
             Spacer(Modifier.height(12.dp))
         }
 
+        // Bulk install for the selected repo (one reload at the end)
+        selectedRepoFilter?.let { repoUrl ->
+            val missing = availablePlugins.count { ap -> ap.repoEntry.url == repoUrl && installedPlugins.none { it.internalName == ap.plugin.internalName } }
+            if (missing > 0) {
+                Row(Modifier.padding(horizontal = 20.dp).padding(bottom = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text("$missing not installed from this repo", color = TextMuted, fontSize = 11.sp, modifier = Modifier.weight(1f))
+                    ActionButton("Install all", primary = true) {
+                        launchBackground {
+                            val n = com.cncverse.stremiobridge.server.BridgeRuntime.installAllFromRepo(repoUrl, disableNewPluginsByDefault = false)
+                            ServerState.info("Installed $n extension(s) from $repoUrl")
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Plugin List ────────────────────────────────────────────────────
         if (availablePlugins.isEmpty() && !isRefreshing) {
             EmptyExtensionsState(onAddRepo = { showAddRepoDialog = true })
@@ -245,10 +284,18 @@ fun ExtensionsScreen(
                         globalState
                     }
                     val loadedInfo = globalLoadedPlugins.find { it.internalName == ap.plugin.internalName }
+                    val name = ap.plugin.internalName
                     PluginCard(
                         ap = ap,
                         installState = installState,
                         loadedInfo = loadedInfo,
+                        enabled = enabledTick.let { !com.cncverse.stremiobridge.server.StremioServer.isIdGloballyDisabled(name) },
+                        health = com.cncverse.stremiobridge.state.StreamTracker.statusOf(name),
+                        onToggleEnabled = { on ->
+                            com.cncverse.stremiobridge.server.StremioServer.setPluginDisabled(name, !on)
+                            com.cncverse.stremiobridge.server.StremioServer.saveDisabledPlugins()
+                            enabledTick++
+                        },
                         onInstall = { scope.launch { onInstallPlugin(ap) } },
                         onUninstall = { scope.launch { onUninstallPlugin(ap.plugin.internalName) } },
                         onOpenSettings = { onOpenSettings(ap.plugin.internalName) },
@@ -280,6 +327,9 @@ private fun PluginCard(
     ap: AvailablePlugin,
     installState: PluginInstallState,
     loadedInfo: LoadedPluginInfo?,
+    enabled: Boolean,
+    health: String,
+    onToggleEnabled: (Boolean) -> Unit,
     onInstall: () -> Unit,
     onUninstall: () -> Unit,
     onOpenSettings: () -> Unit,
@@ -408,6 +458,27 @@ private fun PluginCard(
                     fontSize = 9.sp,
                     modifier = Modifier.padding(top = 2.dp),
                 )
+            }
+
+            if (isInstalled) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 4.dp)) {
+                    val (hColor, hLabel) = healthLook(health)
+                    Pill(hLabel, hColor)
+                    Spacer(Modifier.weight(1f))
+                    Text(if (enabled) "On" else "Off", color = if (enabled) Green400 else TextMuted, fontSize = 10.sp)
+                    Spacer(Modifier.width(4.dp))
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = onToggleEnabled,
+                        modifier = Modifier.height(28.dp),
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = TextPrimary,
+                            checkedTrackColor = Violet500,
+                            uncheckedThumbColor = TextMuted,
+                            uncheckedTrackColor = AmoledCard2,
+                        ),
+                    )
+                }
             }
         }
 

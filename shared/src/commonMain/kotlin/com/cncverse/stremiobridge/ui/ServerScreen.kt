@@ -28,7 +28,7 @@ import androidx.compose.ui.unit.sp
 import com.cncverse.stremiobridge.state.*
 
 import com.cncverse.stremiobridge.tunnel.CloudflaredManager
-import com.cncverse.stremiobridge.tunnel.DeviceIdManager
+import com.cncverse.stremiobridge.tunnel.TunnelSettings
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -64,8 +64,10 @@ fun ServerScreen(
     onStop: () -> Unit,
     onCopyUrl: (String) -> Unit,
     onOpenSettings: (String) -> Unit,
+    onOpenTunnelSettings: () -> Unit = {},
 ) {
     var showCloudflaredDialog by remember { mutableStateOf(false) }
+    var showTunnelSetupDialog by remember { mutableStateOf(false) }
     var cloudflaredDownloadProgress by remember { mutableStateOf<Float?>(null) }
     var isDownloadingCloudflared by remember { mutableStateOf(false) }
     val activeTunnelUrl by ServerState.activeTunnelUrl.collectAsState()
@@ -169,7 +171,7 @@ fun ServerScreen(
                                 showCloudflaredDialog = false
                                 ServerState.isStremioMode.value = true
                                 if (status is ServerStatus.Running) {
-                                    CloudflaredManager.startTunnel(status.port)
+                                    if (!CloudflaredManager.startTunnel(status.port)) ServerState.isStremioMode.value = false
                                 }
                             }
                         }
@@ -185,6 +187,37 @@ fun ServerScreen(
                     }
                 }
             }
+        )
+    }
+
+    if (showTunnelSetupDialog) {
+        AlertDialog(
+            onDismissRequest = { showTunnelSetupDialog = false },
+            containerColor = AmoledCard,
+            titleContentColor = TextPrimary,
+            textContentColor = TextSecondary,
+            shape = RoundedCornerShape(16.dp),
+            title = { Text("Set up your Cloudflare Tunnel", fontWeight = FontWeight.Bold, fontSize = 18.sp) },
+            text = {
+                Text(
+                    "Stremio Mode serves the bridge over HTTPS through your own Cloudflare Tunnel. " +
+                        "Add your tunnel token and domain in Settings → Cloudflare Tunnel first.",
+                    fontSize = 13.sp,
+                )
+            },
+            confirmButton = {
+                Button(
+                    colors = ButtonDefaults.buttonColors(containerColor = Violet500, contentColor = TextPrimary),
+                    shape = CircleShape,
+                    onClick = {
+                        showTunnelSetupDialog = false
+                        onOpenTunnelSettings()
+                    },
+                ) { Text("Open Settings") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showTunnelSetupDialog = false }) { Text("Cancel", color = TextMuted) }
+            },
         )
     }
 
@@ -387,12 +420,14 @@ fun ServerScreen(
                                     checked = isStremioMode,
                                     onCheckedChange = { enable ->
                                         if (enable) {
-                                            if (!CloudflaredManager.isInstalled()) {
+                                            if (!TunnelSettings.isConfigured) {
+                                                showTunnelSetupDialog = true
+                                            } else if (!CloudflaredManager.isInstalled()) {
                                                 showCloudflaredDialog = true
                                             } else {
                                                 ServerState.isStremioMode.value = true
                                                 if (status is ServerStatus.Running) {
-                                                    CloudflaredManager.startTunnel(status.port)
+                                                    if (!CloudflaredManager.startTunnel(status.port)) ServerState.isStremioMode.value = false
                                                 }
                                             }
                                         } else {

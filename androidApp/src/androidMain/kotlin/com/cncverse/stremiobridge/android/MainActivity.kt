@@ -18,7 +18,7 @@ import androidx.compose.material3.windowsizeclass.WindowWidthSizeClass
 import androidx.compose.material3.windowsizeclass.calculateWindowSizeClass
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
-import com.cncverse.stremiobridge.repo.PluginInstaller
+import com.cncverse.stremiobridge.server.BridgeRuntime
 import com.cncverse.stremiobridge.repo.RepoManager
 import com.cncverse.stremiobridge.state.*
 import com.cncverse.stremiobridge.ui.MainScreen
@@ -96,19 +96,12 @@ class MainActivity : com.lagradost.cloudstream3.MainActivity() {
         // Pre-load repo list into state (before setContent so UI sees initial data)
         RepoManager.loadSavedRepos()
 
-        // Pre-load installed plugins
-        val cacheDir = filesDir.absolutePath
+        // Pre-load installed plugins so the Extensions screen is browsable before the server starts
         activityScope.launch(Dispatchers.IO) {
-            val installed = PluginInstaller.loadInstalledPlugins(cacheDir)
-            RepoState.setInstalledPlugins(installed)
-            installed.forEach { RepoState.setInstallState(it.internalName, PluginInstallState.Installed) }
-
-            // Initialize PluginLoader globally and load plugins immediately
             if (GlobalPluginManager.loader == null) {
                 GlobalPluginManager.loader = PluginLoader(applicationContext)
             }
-            val cs3Files = PluginInstaller.getInstalledFiles(cacheDir)
-            GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
+            BridgeRuntime.ensurePluginsLoaded()
 
             // Fetch metadata and available plugins immediately so the UI is populated
             RepoManager.refreshAllRepos()
@@ -124,40 +117,11 @@ class MainActivity : com.lagradost.cloudstream3.MainActivity() {
                 onCopyUrl           = { url -> copyToClipboard("Stremio URL", url) },
                 onCopyLogs          = { logText -> copyToClipboard("Logs", logText) },
                 onOpenSettings      = { id -> GlobalPluginManager.loader?.openPluginSettings(id, this@MainActivity) },
-                onInstallPlugin     = { ap ->
-                    val success = PluginInstaller.installPlugin(ap, cacheDir)
-                    if (success) {
-                        ServerState.info("Loading installed plugin '${ap.plugin.name}'…")
-                        val installed = PluginInstaller.loadInstalledPlugins(cacheDir)
-                        RepoState.setInstalledPlugins(installed)
-                        installed.forEach { RepoState.setInstallState(it.internalName, PluginInstallState.Installed) }
-                        
-                        val cs3Files = PluginInstaller.getInstalledFiles(cacheDir)
-                        GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
-                        
-                        // We no longer restart the server. StremioServer automatically uses 
-                        // the updated StremioServer.loadedApis which were populated by reloadAllPlugins.
-                    }
-                },
-                onUninstallPlugin   = { internalName ->
-                    PluginInstaller.uninstallPlugin(internalName, cacheDir)
-                    
-                    val installed = PluginInstaller.loadInstalledPlugins(cacheDir)
-                    RepoState.setInstalledPlugins(installed)
-                    
-                    val cs3Files = PluginInstaller.getInstalledFiles(cacheDir)
-                    activityScope.launch(Dispatchers.IO) {
-                        GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
-                    }
-                },
+                // The running server picks up reloaded plugins through StremioServer.loadedApis
+                onInstallPlugin     = { ap -> BridgeRuntime.installPlugin(ap) },
+                onUninstallPlugin   = { internalName -> BridgeRuntime.uninstallPlugin(internalName) },
                 onAddRepo           = { url -> RepoManager.addRepo(url) },
-                onRemoveRepo        = { url ->
-                    activityScope.launch(Dispatchers.IO) {
-                        RepoManager.removeRepo(url, cacheDir)
-                        val installed = PluginInstaller.loadInstalledPlugins(cacheDir)
-                        GlobalPluginManager.reloadAllPlugins(installed, PluginInstaller.getInstalledFiles(cacheDir))
-                    }
-                },
+                onRemoveRepo        = { url -> activityScope.launch(Dispatchers.IO) { BridgeRuntime.removeRepo(url) } },
                 onRefreshRepos      = { RepoManager.refreshAllRepos() },
                 windowWidthClass    = windowSizeClass.widthSizeClass,
             )
@@ -183,8 +147,7 @@ class MainActivity : com.lagradost.cloudstream3.MainActivity() {
     private fun onStopPressed() {
         bridgeService?.stopServer()
         stopService(Intent(this, StremioForegroundService::class.java))
-        ServerState.updateStatus(ServerStatus.Stopped)
-        ServerState.info("Server stopped by user")
+        if (ServerState.status.value !is ServerStatus.Stopped) BridgeRuntime.stopBridge()
     }
 
     private fun startBridgeService() {

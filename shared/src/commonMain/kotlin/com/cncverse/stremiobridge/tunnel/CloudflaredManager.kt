@@ -12,7 +12,6 @@ import java.io.File
 import java.io.InputStreamReader
 
 object CloudflaredManager {
-    private const val WORKER_URL = "xxxxxxxxx"
 
     private var tunnelProcess: Process? = null
     private var tunnelScope: CoroutineScope? = null
@@ -67,32 +66,22 @@ object CloudflaredManager {
         }
     }
 
-    private suspend fun fetchTunnelToken(deviceId: String): String? = withContext(Dispatchers.IO) {
-        try {
-            val response: HttpResponse = httpClient.post(WORKER_URL) {
-                header("Content-Type", "application/json")
-                setBody("{\"deviceId\":\"$deviceId\"}")
-            }
-            if (response.status.value in 200..299) {
-                val responseText = response.bodyAsText()
-                ServerState.info("Tunnel Token fetched successfully: $responseText")
-                // Simple regex to extract token from JSON {"success":true,"token":"...","domain":"..."}
-                val match = Regex("\"token\":\"([^\"]+)\"").find(responseText)
-                return@withContext match?.groupValues?.get(1)
-            }
-            else{
-                ServerState.error("Failed to fetch tunnel token: HTTP ${response.status.value} Body: ${response.bodyAsText()}")
-            }
-        } catch (e: Exception) {
-            ServerState.warn("Failed to fetch tunnel token: ${e.message}")
-        }
-        return@withContext null
-    }
-
-    fun startTunnel(port: Int) {
+    /**
+     * Runs the user's own Cloudflare Tunnel ([TunnelSettings]: token + public
+     * hostname). The hostname's route (service `http://localhost:<port>`) is set
+     * up in the Cloudflare dashboard; `--url` covers tunnels without one.
+     * Returns false (and logs why) when the tunnel isn't set up in Settings.
+     */
+    fun startTunnel(port: Int): Boolean {
         if (tunnelProcess != null && tunnelProcess?.isAlive == true) {
             ServerState.info("Cloudflare Tunnel is already running")
-            return
+            return true
+        }
+        val token = TunnelSettings.token
+        val publicUrl = TunnelSettings.publicUrl
+        if (token == null || publicUrl == null) {
+            ServerState.warn("Cloudflare Tunnel is not set up — add your tunnel token and domain in Settings")
+            return false
         }
 
         stopTunnel()
@@ -105,35 +94,24 @@ object CloudflaredManager {
 
         scope.launch {
             try {
-                // Always fetch a fresh token from the worker on every start
-                ServerState.info("Fetching Tunnel Token from Worker...")
-                val deviceId = DeviceIdManager.getDeviceId()
-                val token = fetchTunnelToken(deviceId)
-                if (token != null) {
-                    DeviceIdManager.setTunnelToken(token)
-                } else {
-                    ServerState.error("Failed to provision Cloudflare Tunnel")
-                    return@launch
-                }
+                ServerState.info("Starting Cloudflare Tunnel for $publicUrl (local port $port) ...")
 
-                ServerState.info("Starting Cloudflare Tunnel on port $port ...")
-                
                 // Get edge IPs (bypasses DNS issue on Android 10+)
                 val edgeIps = resolveCloudflareEdgeIps()
                 val cmd = mutableListOf(
-                    binaryPath, "tunnel", 
-                    "--url", "http://${deviceIp}:$port", 
+                    binaryPath, "tunnel",
+                    "--url", "http://${deviceIp}:$port",
                     "--edge-ip-version", "4",
                     "--no-autoupdate"
                 )
-                
+
                 // Add up to 4 edge IPs
                 for (ip in edgeIps.take(4)) {
                     cmd.addAll(listOf("--edge", ip))
                 }
-                
+
                 cmd.addAll(listOf("run", "--token", token))
-                
+
                 val pb = ProcessBuilder(cmd)
                 pb.redirectErrorStream(true)
 
@@ -143,24 +121,19 @@ object CloudflaredManager {
                 val reader = BufferedReader(InputStreamReader(process.inputStream))
                 var line: String?
 
-                val tryCloudflareRegex = Regex("https://[a-zA-Z0-9-]+\\.trycloudflare\\.com")
-
                 while (isActive && process.isAlive) {
                     line = reader.readLine() ?: break
                     if (line.isNotBlank()) {
-                        ServerState.info("[cloudflared] $line")
+                        // The token is never echoed by cloudflared, but keep it out of the log regardless
+                        ServerState.info("[cloudflared] ${line.replace(token, "***")}")
 
                         if (line.contains("Registered tunnel connection") || (line.contains("Connection ") && line.contains("registered"))) {
-                            val url = DeviceIdManager.getDeviceSubdomainUrl()
-                            ServerState.activeTunnelUrl.value = url
-                            ServerState.info("🚀 Cloudflare Tunnel connected: $url")
-                        } else {
-                            val match = tryCloudflareRegex.find(line)
-                            if (match != null) {
-                                val url = match.value
-                                ServerState.activeTunnelUrl.value = url
-                                ServerState.info("🚀 Cloudflare Tunnel active: $url")
+                            if (ServerState.activeTunnelUrl.value != publicUrl) {
+                                ServerState.activeTunnelUrl.value = publicUrl
+                                ServerState.info("🚀 Cloudflare Tunnel connected: $publicUrl")
                             }
+                        } else if (line.contains("Unauthorized", ignoreCase = true) || line.contains("invalid token", ignoreCase = true)) {
+                            ServerState.error("Cloudflare rejected the tunnel token — check it in Settings")
                         }
                     }
                 }
@@ -175,6 +148,7 @@ object CloudflaredManager {
                 ServerState.activeTunnelUrl.value = null
             }
         }
+        return true
     }
 
     fun stopTunnel() {

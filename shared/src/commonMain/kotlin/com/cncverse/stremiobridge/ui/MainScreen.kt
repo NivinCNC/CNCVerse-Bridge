@@ -81,6 +81,7 @@ fun CNCVerseTheme(content: @Composable () -> Unit) {
 enum class NavDest(val label: String, val icon: ImageVector) {
     Server(     "Server",     Icons.Filled.PlayArrow),
     Extensions( "Extensions", Icons.Filled.Extension),
+    Health(     "Health",     Icons.Filled.MonitorHeart),
     Logs(       "Logs",       Icons.AutoMirrored.Filled.List),
     Settings(   "Settings",   Icons.Filled.Settings),
 }
@@ -220,6 +221,7 @@ fun MainScreen(
                     Box(modifier = Modifier.weight(1f)) {
                         NavContent(
                             dest = selectedDest,
+                            onNavigate = { selectedDest = it },
                             status = status,
                             logs = logs,
                             repos = repos,
@@ -257,6 +259,7 @@ fun MainScreen(
                     ) {
                         NavContent(
                             dest = selectedDest,
+                            onNavigate = { selectedDest = it },
                             status = status,
                             logs = logs,
                             repos = repos,
@@ -287,6 +290,7 @@ fun MainScreen(
 @Composable
 private fun NavContent(
     dest: NavDest,
+    onNavigate: (NavDest) -> Unit,
     status: ServerStatus,
     logs: List<LogEntry>,
     repos: List<RepoEntry>,
@@ -319,6 +323,7 @@ private fun NavContent(
                 onStop = onStop,
                 onCopyUrl = onCopyUrl,
                 onOpenSettings = onOpenSettings,
+                onOpenTunnelSettings = { onNavigate(NavDest.Settings) },
             )
             NavDest.Extensions -> ExtensionsScreen(
                 status = status,
@@ -334,6 +339,7 @@ private fun NavContent(
                 onRefreshRepos = onRefreshRepos,
                 onOpenSettings = onOpenSettings,
             )
+            NavDest.Health -> HealthScreen()
             NavDest.Logs -> LogsScreen(
                 logs = logs,
                 onCopyLogs = onCopyLogs,

@@ -20,11 +20,10 @@ sealed class ServerStatus {
         val localhostUrl: String get() = "http://127.0.0.1:$port/manifest.json"
         val stremioModeStremioUrl: String get() {
             val tunnel = ServerState.activeTunnelUrl.value
-            return if (!tunnel.isNullOrBlank()) {
-                "$tunnel/manifest.json"
-            } else {
-                "${com.cncverse.stremiobridge.tunnel.DeviceIdManager.getDeviceSubdomainUrl()}/manifest.json"
-            }
+            val base = tunnel?.takeIf { it.isNotBlank() }
+                ?: com.cncverse.stremiobridge.tunnel.TunnelSettings.publicUrl
+                ?: return ""
+            return "$base/manifest.json"
         }
         val stremioModeLocalhostUrl: String get() = stremioModeStremioUrl
     }

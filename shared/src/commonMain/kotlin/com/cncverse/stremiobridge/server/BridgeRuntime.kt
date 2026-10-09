@@ -94,7 +94,22 @@ object BridgeRuntime {
 
     private val pluginMutationMutex = Mutex()
 
+    @Volatile private var stateLoaded = false
+
+    /** Loads health stats and maintenance settings once (the Health screen works before the server starts). */
+    fun initState() {
+        if (stateLoaded || cacheDir.isBlank()) return
+        synchronized(this) {
+            if (stateLoaded) return
+            com.cncverse.stremiobridge.state.StreamTracker.init(cacheDir)
+            com.cncverse.stremiobridge.maintenance.Maintenance.init(cacheDir)
+            StremioServer.loadConfig(cacheDir)
+            stateLoaded = true
+        }
+    }
+
     private suspend fun doReloadPlugins() {
+        initState()
         val installed = withContext(Dispatchers.IO) { PluginInstaller.loadInstalledPlugins(cacheDir) }
         RepoState.setInstalledPlugins(installed)
         installed.forEach { RepoState.setInstallState(it.internalName, PluginInstallState.Installed) }
@@ -247,8 +262,7 @@ object BridgeRuntime {
      */
     suspend fun startBridge(preferredPort: Int = 8080) {
         ServerState.updateStatus(ServerStatus.Starting("Loading plugin registry…"))
-        com.cncverse.stremiobridge.state.StreamTracker.init(cacheDir)
-        com.cncverse.stremiobridge.maintenance.Maintenance.init(cacheDir)
+        initState()
         RepoManager.loadSavedRepos()
         // Drop extensions whose repo was deleted + stray .cs3/.jar files left by older builds
         val pruned = withContext(Dispatchers.IO) {

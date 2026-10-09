@@ -14,6 +14,11 @@ class StremioApp : Application() {
         super.onCreate()
         appContext = this
         AndroidContextHolder.appContext = this
+        // Shared bridge runtime (same lifecycle code as the desktop app); the scope lives
+        // as long as the process so health sweeps / updates outlive the activity
+        com.cncverse.stremiobridge.server.BridgeRuntime.cacheDir = filesDir.absolutePath
+        com.cncverse.stremiobridge.server.BridgeRuntime.appScope =
+            kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Default)
         createNotificationChannel()
     }
 

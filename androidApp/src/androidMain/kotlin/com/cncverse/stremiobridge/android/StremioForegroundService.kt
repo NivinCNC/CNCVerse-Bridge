@@ -14,6 +14,7 @@ import com.cncverse.stremiobridge.plugin.GlobalPluginManager
 import com.cncverse.stremiobridge.plugin.PluginLoader
 import com.cncverse.stremiobridge.repo.PluginInstaller
 import com.cncverse.stremiobridge.repo.RepoManager
+import com.cncverse.stremiobridge.server.BridgeRuntime
 import com.cncverse.stremiobridge.server.StremioServer
 import com.cncverse.stremiobridge.state.*
 import kotlinx.coroutines.*
@@ -76,64 +77,12 @@ class StremioForegroundService : Service() {
     }
 
     private suspend fun startBridge() {
-        val port = DEFAULT_PORT
-        ServerState.serverPort = port
-        val cacheDir = filesDir.absolutePath
-
-        // ── 1. Load installed plugins from disk ────────────────────────────
-        ServerState.updateStatus(ServerStatus.Starting("Loading plugin registry…"))
-        val installedPlugins = withContext(Dispatchers.IO) {
-            PluginInstaller.loadInstalledPlugins(cacheDir)
-        }
-        RepoState.setInstalledPlugins(installedPlugins)
-        // Mark all installed as Installed state
-        installedPlugins.forEach { inst ->
-            RepoState.setInstallState(inst.internalName, PluginInstallState.Installed)
-        }
-        ServerState.info("Found ${installedPlugins.size} installed plugin(s)")
-
-        // ── 2. Load repos and kick off background refresh ──────────────────
-        RepoManager.loadSavedRepos()
-        ServerState.updateStatus(ServerStatus.Starting("Refreshing repos…"))
-        updateNotification("Refreshing repos…")
-
-        // Refresh repos in background (does NOT block server startup)
-        serviceScope.launch(Dispatchers.IO) {
-            runCatching {
-                RepoManager.refreshAllRepos()
-                // After refresh, auto-update any outdated installed plugins
-                val toUpdate = RepoState.installedPlugins.value.filter {
-                    RepoState.getInstallState(it.internalName) is PluginInstallState.UpdateAvailable
-                }
-                if (toUpdate.isNotEmpty()) {
-                    ServerState.info("Auto-updating ${toUpdate.size} plugin(s)…")
-                    PluginInstaller.autoUpdateInstalled(cacheDir)
-                }
-            }.onFailure { e ->
-                ServerState.warn("Repo refresh error: ${e.message}")
-            }
-        }
-
-        // ── 3. (Removed) Load installed .cs3 files ───────────────────────────────────
-        // Plugins are now loaded globally by GlobalPluginManager in MainActivity on app launch.
-        ServerState.updateStatus(ServerStatus.Starting("Waiting for plugins…"))
-        GlobalPluginManager.isPluginsLoaded.first { it }
-        val loadedInfos = ServerState.globalLoadedPlugins.value
-
-        // ── 4. Start Ktor server ───────────────────────────────────────────
-        val ipAddress = getLocalIpAddress() ?: "127.0.0.1"
-        com.cncverse.stremiobridge.tunnel.CloudflaredManager.deviceIp = ipAddress
-        val boundPort = StremioServer.start(port, cacheDir)
-
-        // ── 5. Update state to Running ─────────────────────────────────────
-        val runningStatus = ServerStatus.Running(
-            port          = boundPort,
-            loadedPlugins = loadedInfos,
-            ipAddress     = ipAddress,
-        )
-        ServerState.updateStatus(runningStatus)
-        updateNotification("Running on $ipAddress:$boundPort · ${loadedInfos.count { it.apiRegistered }} plugins active")
-        ServerState.info("🎬 Stremio Bridge running at http://$ipAddress:$boundPort")
+        updateNotification("Starting CNCVerse Bridge…")
+        // Same lifecycle as the desktop app: registry → repo refresh + auto-update →
+        // plugins → Ktor server, plus health tracking, nightly maintenance and pre-warm
+        BridgeRuntime.startBridge(DEFAULT_PORT)
+        val running = ServerState.status.value as? ServerStatus.Running ?: return
+        updateNotification("Running on ${running.ipAddress}:${running.port} · ${running.loadedPlugins.count { it.apiRegistered }} plugins active")
     }
 
     override fun onDestroy() {
@@ -144,7 +93,7 @@ class StremioForegroundService : Service() {
     }
 
     fun stopServer() {
-        StremioServer.stop()
+        BridgeRuntime.stopBridge()
         if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.N) {
             stopForeground(STOP_FOREGROUND_REMOVE)
         } else {
