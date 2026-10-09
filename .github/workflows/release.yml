@@ -105,25 +105,41 @@ jobs:
     needs: [android, windows, linux]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # full history + tags for the changelog
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+      - name: Write release notes (changelog since the previous release)
+        run: |
+          git fetch --tags --force --quiet
+          ref="$TAG"; git rev-parse -q --verify "refs/tags/$TAG" >/dev/null || ref="${{ github.sha }}"
+          prev=$(git describe --tags --abbrev=0 "${ref}^" 2>/dev/null || true)
+          range="${prev:+$prev..}$ref"
+          {
+            echo "## Downloads"
+            echo "- **Android:** \`CNCVerse-Bridge-${TAG}.apk\`"
+            echo "- **Windows:** \`CNCVerse-Bridge-${TAG}.msi\` (or \`CNCVerse-Bridge-${TAG}-setup.exe\`)"
+            echo "- **Linux (Debian/Ubuntu):** \`CNCVerse-Bridge-${TAG}_amd64.deb\`"
+            echo
+            echo "## Changelog${prev:+ since $prev}"
+            git log --no-merges --pretty='- %s (%h)' "$range"
+            [ -n "$prev" ] && { echo; echo "**Full diff:** https://github.com/${{ github.repository }}/compare/${prev}...${TAG}"; }
+          } > notes.md
+          echo "$(grep -c '^- .*([0-9a-f]\{7,\})$' notes.md) commit(s) in the changelog"
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           ls -l dist
-          notes="CNCVerse Bridge ${TAG}
-
-          - Android: CNCVerse-Bridge-${TAG}.apk
-          - Windows: CNCVerse-Bridge-${TAG}.msi (or the -setup.exe)
-          - Linux (Debian/Ubuntu): CNCVerse-Bridge-${TAG}_amd64.deb"
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
+            gh release edit "$TAG" --notes-file notes.md
           else
-            gh release create "$TAG" dist/* --title "CNCVerse Bridge ${TAG}" --notes "$notes" --target "${{ github.sha }}"
+            gh release create "$TAG" dist/* --title "CNCVerse Bridge ${TAG}" --notes-file notes.md --target "${{ github.sha }}"
           fi
       - name: Announce on Discord and Telegram
         env:
