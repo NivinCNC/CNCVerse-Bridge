@@ -133,6 +133,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
+          GH_DEBUG: api   # temporary: show why release creation is refused
         run: |
           ls -l dist
           if gh release view "$TAG" >/dev/null 2>&1; then
