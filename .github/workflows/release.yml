@@ -119,14 +119,14 @@ jobs:
           prev=$(git describe --tags --abbrev=0 "${ref}^" 2>/dev/null || true)
           range="${prev:+$prev..}$ref"
           {
+            echo "## Changelog${prev:+ since $prev}"
+            git log --no-merges --pretty='- %s (%h)' "$range"
+            [ -n "$prev" ] && { echo; echo "**Full diff:** https://github.com/${{ github.repository }}/compare/${prev}...${TAG}"; }
+            echo
             echo "## Downloads"
             echo "- **Android:** \`CNCVerse-Bridge-${TAG}.apk\`"
             echo "- **Windows:** \`CNCVerse-Bridge-${TAG}.msi\` (or \`CNCVerse-Bridge-${TAG}-setup.exe\`)"
             echo "- **Linux (Debian/Ubuntu):** \`CNCVerse-Bridge-${TAG}_amd64.deb\`"
-            echo
-            echo "## Changelog${prev:+ since $prev}"
-            git log --no-merges --pretty='- %s (%h)' "$range"
-            [ -n "$prev" ] && { echo; echo "**Full diff:** https://github.com/${{ github.repository }}/compare/${prev}...${TAG}"; }
           } > notes.md
           echo "$(grep -c '^- .*([0-9a-f]\{7,\})$' notes.md) commit(s) in the changelog"
       - name: Publish GitHub release
