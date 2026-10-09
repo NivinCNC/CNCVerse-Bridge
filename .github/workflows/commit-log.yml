@@ -1,8 +1,9 @@
 name: Commit log
 
-# Posts every push's commits to the "Github Logs" topic of the CNCVerse Telegram group.
-# Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_TOPIC_ID.
-# (Discord gets the same pushes through the repository webhook.)
+# Posts every push's commits to Discord (#github-logs webhook) and to the "Github Logs"
+# topic of the CNCVerse Telegram group, with full commit titles (Discord's built-in
+# GitHub webhook cuts them at ~50 characters).
+# Secrets: DISCORD_WEBHOOK_URL, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_TOPIC_ID.
 
 on:
   push:
@@ -12,9 +13,36 @@ permissions:
   contents: read
 
 jobs:
-  telegram:
+  notify:
     runs-on: ubuntu-latest
     steps:
+      - name: Send to Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then echo "Discord secret not set — skipping"; exit 0; fi
+          event="$GITHUB_EVENT_PATH"
+          [ "$(jq '.commits | length' "$event")" -eq 0 ] && { echo "No commits in this push"; exit 0; }
+          # Embed: one line per commit with the full title (newest last, at most 20), whole
+          # description kept under Discord's 4096-character limit
+          payload=$(jq --arg branch "${GITHUB_REF#refs/heads/}" '
+            (.commits | length) as $n
+            | ([.commits[-20:][] | "[`\(.id[0:7])`](\(.url)) \(.message | split("\n")[0]) — *\(.author.name)*"] | join("\n")) as $lines
+            | {
+                username: "GitHub",
+                embeds: [{
+                  title: "[\(.repository.name):\($branch)] \($n) new commit\(if $n == 1 then "" else "s" end)",
+                  url: .compare,
+                  color: 7506394,
+                  author: { name: (.pusher.name // .sender.login), icon_url: .sender.avatar_url },
+                  description: (($lines + (if $n > 20 then "\n…and \($n - 20) more" else "" end))[0:4000]),
+                  timestamp: (.head_commit.timestamp // null)
+                }]
+              }' "$event")
+          code=$(curl -s -o /tmp/discord.txt -w '%{http_code}' -H 'Content-Type: application/json' -d "$payload" "$DISCORD_WEBHOOK")
+          [ "$code" -lt 300 ] || { echo "Discord error $code: $(cat /tmp/discord.txt)"; exit 1; }
+
+
       - name: Send to Telegram
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
