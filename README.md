@@ -15,7 +15,8 @@ CNCVerse Bridge is available for Android and Desktop (Windows/Linux).
 
 Go to the **[Releases](../../releases)** page to download:
 - **Android:** Download the `.apk` file.
-- **Desktop:** Download the `.msi`/`.exe` for Windows or the `.deb` for Linux (Debian/Ubuntu and derivatives).
+- **Desktop:** Download the `.msi`/`.exe` for Windows.
+- **Server:** Download the `.deb` for Linux (Debian/Ubuntu and derivatives).
 
 ---
 
