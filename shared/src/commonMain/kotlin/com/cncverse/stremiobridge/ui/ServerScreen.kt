@@ -316,6 +316,19 @@ fun ServerScreen(
             AnimatedVisibility(visible = isRunning) {
                 if (status is ServerStatus.Running) {
                     Column(modifier = Modifier.padding(top = 20.dp)) {
+                        // The users' configure page (extensions per profile, filters, formatter) —
+                        // opened locally: the bridge runs on this device
+                        OutlinedButton(
+                            onClick = { uriHandler.openUri("http://127.0.0.1:${status.port}/configure") },
+                            modifier = Modifier.fillMaxWidth().height(46.dp),
+                            shape = RoundedCornerShape(14.dp),
+                            border = BorderStroke(1.dp, Violet500),
+                        ) {
+                            Icon(Icons.Filled.Tune, contentDescription = null, tint = Violet400, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text("Open configure page", color = Violet300, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                        }
+                        Spacer(Modifier.height(20.dp))
                         HorizontalDivider(color = DividerColor)
                         Spacer(Modifier.height(16.dp))
                         
