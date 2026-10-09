@@ -133,14 +133,15 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          GH_DEBUG: api   # temporary: show why release creation is refused
         run: |
           ls -l dist
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
             gh release edit "$TAG" --notes-file notes.md
           else
-            gh release create "$TAG" dist/* --title "CNCVerse Bridge ${TAG}" --notes-file notes.md --target "${{ github.sha }}"
+            # The tag already exists: no --target (pinning a commit that changes workflow files
+            # needs the workflows permission, which the job token never has → HTTP 403)
+            gh release create "$TAG" dist/* --title "CNCVerse Bridge ${TAG}" --notes-file notes.md --verify-tag
           fi
       - name: Announce on Discord and Telegram
         env:
