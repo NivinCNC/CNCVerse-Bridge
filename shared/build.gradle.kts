@@ -137,6 +137,11 @@ android {
     dependencies {
         coreLibraryDesugaring(libs.desugar.jdk.libs)
     }
+
+    // Release builds merge Java resources: several jars ship the same generic module file
+    packaging {
+        resources.pickFirsts += setOf("META-INF/library.kotlin_module")
+    }
 }
 
 

@@ -62,18 +62,25 @@ android {
         versionName = versionProps.getProperty("android.versionName", "0.0.22")
     }
 
+    // Release signing: CI passes the keystore through environment variables (GitHub
+    // secrets, see .github/workflows/release.yml); locally a key/release.jks is used
+    // when present. Without either, release builds stay unsigned.
+    val keystorePath = System.getenv("ANDROID_KEYSTORE_PATH")?.takeIf { it.isNotBlank() }
+        ?: rootProject.file("key/release.jks").takeIf { it.exists() }?.absolutePath
     signingConfigs {
-        create("release") {
-            storeFile = file("../key/release.jks")
-            storePassword = "android"
-            keyAlias = "release"
-            keyPassword = "android"
+        if (keystorePath != null) {
+            create("release") {
+                storeFile = file(keystorePath)
+                storePassword = System.getenv("ANDROID_KEYSTORE_PASSWORD") ?: "android"
+                keyAlias = System.getenv("ANDROID_KEY_ALIAS") ?: "release"
+                keyPassword = System.getenv("ANDROID_KEY_PASSWORD") ?: "android"
+            }
         }
     }
 
     buildTypes {
         release {
-            signingConfig = signingConfigs.getByName("release")
+            signingConfigs.findByName("release")?.let { signingConfig = it }
         }
     }
 
@@ -103,5 +110,6 @@ android {
             "META-INF/LICENSE.txt",
             "META-INF/NOTICE",
         )
+        resources.pickFirsts += setOf("META-INF/library.kotlin_module")
     }
 }

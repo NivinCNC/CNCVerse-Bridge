@@ -13,3 +13,8 @@ Thumbs.db
 serverApp/dist/
 
 .kotlin/
+
+# Android release keystore (CI gets it from GitHub secrets)
+key/
+*.jks
+*.keystore

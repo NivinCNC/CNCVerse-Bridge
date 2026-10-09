@@ -1,0 +1,127 @@
+name: Release
+
+# Builds the apps (Android APK, Windows MSI/EXE, Linux DEB) and publishes them as a
+# GitHub release. Runs when a version tag is pushed (git tag v1.0.0 && git push origin v1.0.0)
+# or by hand from the Actions tab.
+#
+# Secrets (Settings → Secrets and variables → Actions):
+#   ANDROID_KEYSTORE_BASE64   base64 of the release keystore (.jks)
+#   ANDROID_KEYSTORE_PASSWORD keystore password
+#   ANDROID_KEY_ALIAS         key alias
+#   ANDROID_KEY_PASSWORD      key password
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Restore signing keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then echo "::error::ANDROID_KEYSTORE_BASE64 secret is missing"; exit 1; fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          echo "ANDROID_KEYSTORE_PATH=$RUNNER_TEMP/release.jks" >> "$GITHUB_ENV"
+      - name: Build release APK
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :androidApp:assembleRelease
+          mkdir -p out
+          apk=$(find androidApp/build/outputs/apk/release -name '*.apk' | head -1)
+          cp "$apk" "out/CNCVerse-Bridge-${TAG}.apk"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: out/*
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build MSI and EXE
+        shell: bash
+        run: |
+          ./gradlew --no-daemon :desktopApp:packageReleaseDistributionForCurrentOS
+          mkdir -p out
+          find desktopApp/build/compose/binaries -name '*.msi' -exec cp {} "out/CNCVerse-Bridge-${TAG}.msi" \;
+          find desktopApp/build/compose/binaries -name '*.exe' -exec cp {} "out/CNCVerse-Bridge-${TAG}-setup.exe" \;
+          ls -l out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: out/*
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+      - uses: gradle/actions/setup-gradle@v4
+      - name: Build DEB
+        run: |
+          chmod +x gradlew
+          ./gradlew --no-daemon :desktopApp:packageReleaseDeb
+          mkdir -p out
+          deb=$(find desktopApp/build/compose/binaries -name '*.deb' | head -1)
+          cp "$deb" "out/CNCVerse-Bridge-${TAG}_amd64.deb"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out/*
+
+  release:
+    needs: [android, windows, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          ls -l dist
+          notes="CNCVerse Bridge ${TAG}
+
+          - Android: CNCVerse-Bridge-${TAG}.apk
+          - Windows: CNCVerse-Bridge-${TAG}.msi (or the -setup.exe)
+          - Linux (Debian/Ubuntu): CNCVerse-Bridge-${TAG}_amd64.deb"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "CNCVerse Bridge ${TAG}" --notes "$notes" --target "${{ github.sha }}"
+          fi
