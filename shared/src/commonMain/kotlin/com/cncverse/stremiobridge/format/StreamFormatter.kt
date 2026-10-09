@@ -612,10 +612,10 @@ object StreamFormatter {
             id = "mediafusion",
             title = "💎 MediaFusion Pro",
             description = "Detailed specifications with HDR/DV tags, codecs, and server tags.",
-            nameTemplate = "⚡ CNCVerse | {stream.resolution::=2160p[\"💎 4K UHD\"||\"📺 {stream.resolution::default('FHD')}\"]} | {addon.name}",
+            nameTemplate = "⚡ CNCVerse | {stream.resolution::=2160p[\"💎 4K UHD\"||\"📺 {stream.resolution::default('Auto')}\"]} | {addon.name}",
             descriptionTemplate = "🎬 {metadata.title}{stream.seasonEpisode::exists[\" [{stream.seasonEpisode::join('')}]\"||\"\"]}\n" +
                 "⚙️ Specs: {stream.specs::join(' • ')}\n" +
-                "📦 Size: {stream.size::>0[\"{stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"Direct Stream\"]} • Host: {addon.name}\n" +
+                "📦 Size: {stream.size::>0[\"{stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"Unknown\"]} • Host: {addon.name}\n" +
                 "🔊 Audio: {stream.languages::default('Original')}\n" +
                 "{stream.subtitles::exists[\"📝 Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
         ),

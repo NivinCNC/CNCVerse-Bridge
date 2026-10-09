@@ -6748,13 +6748,17 @@ data class MediaInfo(
     val contentRating: String? = null,
 )
 
+/** Names that are only dashes/underscores (providers' "no title" filler) → an invisible blank, so the tile shows no mark. */
+private val FILLER_NAME = Regex("^[\\s\\-_\u2010-\u2015]*$")
+internal fun tileName(name: String?): String = if (name == null || FILLER_NAME.matches(name)) "\u2800" else name
+
 fun SearchResult.toStremiMeta(pluginInternalName: String, stremioType: String): StremioMeta {
     val encodedId = StremioIds.encode(pluginInternalName, url)
     val resolvedType = cs3TvTypeToStremio(type)
     return StremioMeta(
         id          = encodedId,
         type        = resolvedType,
-        name        = name,
+        name        = tileName(name),
         poster      = PublicUrls.safeForBrowser(posterUrl),
         background  = if (isHorizontal) PublicUrls.safeForBrowser(posterUrl) else null,
         posterShape = if (isHorizontal) "landscape" else "poster",
@@ -6770,7 +6774,7 @@ fun SearchResult.toStremiMeta(pluginInternalName: String, stremioType: String): 
 fun MediaInfo.toStremiMeta(pluginInternalName: String, stremioType: String) = StremioMeta(
     id          = StremioIds.encode(pluginInternalName, dataUrl),
     type        = cs3TvTypeToStremio(type),
-    name        = name,
+    name        = tileName(name),
     poster      = PublicUrls.safeForBrowser(posterUrl),
     background  = PublicUrls.safeForBrowser(backgroundUrl),
     logo        = PublicUrls.safeForBrowser(logoUrl),
