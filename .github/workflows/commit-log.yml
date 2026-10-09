@@ -1,0 +1,43 @@
+name: Commit log
+
+# Posts every push's commits to the "Github Logs" topic of the CNCVerse Telegram group.
+# Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_TOPIC_ID.
+# (Discord gets the same pushes through the repository webhook.)
+
+on:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  telegram:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send to Telegram
+        env:
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TG_TOPIC: ${{ secrets.TELEGRAM_TOPIC_ID }}
+        run: |
+          if [ -z "$TG_TOKEN" ] || [ -z "$TG_CHAT" ]; then echo "Telegram secrets not set — skipping"; exit 0; fi
+          esc() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'; }
+          event="$GITHUB_EVENT_PATH"
+          repo=$(jq -r '.repository.name' "$event")
+          branch="${GITHUB_REF#refs/heads/}"
+          pusher=$(jq -r '.pusher.name // .sender.login' "$event")
+          compare=$(jq -r '.compare' "$event")
+          count=$(jq '.commits | length' "$event")
+          [ "$count" -eq 0 ] && { echo "No commits in this push"; exit 0; }
+          # One line per commit (first line of the message), newest last, at most 15
+          lines=$(jq -r '.commits[-15:][] | "\(.id[0:7])\t\(.url)\t\(.message | split("\n")[0])\t\(.author.name)"' "$event" |
+            while IFS=$'\t' read -r sha url msg author; do
+              printf '• <a href="%s">%s</a> %s — <i>%s</i>\n' "$url" "$sha" "$(printf '%s' "$msg" | cut -c1-150 | esc)" "$(printf '%s' "$author" | esc)"
+            done)
+          more=""; [ "$count" -gt 15 ] && more=$'\n'"…and $((count - 15)) more"
+          text="🔨 <b>$(printf '%s' "$repo" | esc)</b> · <code>$(printf '%s' "$branch" | esc)</code> — $count commit(s) by $(printf '%s' "$pusher" | esc)"$'\n\n'"$lines$more"$'\n\n'"<a href=\"$compare\">View changes</a>"
+          args=(-d chat_id="$TG_CHAT" -d parse_mode=HTML -d disable_web_page_preview=true --data-urlencode "text=$text")
+          [ -n "$TG_TOPIC" ] && args+=(-d message_thread_id="$TG_TOPIC")
+          resp=$(curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" "${args[@]}")
+          echo "$resp" | jq -e '.ok' > /dev/null || { echo "Telegram error: $(echo "$resp" | jq -r '.description')"; exit 1; }
