@@ -155,13 +155,21 @@ jobs:
           apk="CNCVerse-Bridge-${TAG}.apk"; msi="CNCVerse-Bridge-${TAG}.msi"
           exe="CNCVerse-Bridge-${TAG}-setup.exe"; deb="CNCVerse-Bridge-${TAG}_amd64.deb"
           if [ -n "$DISCORD_WEBHOOK" ]; then
-            payload=$(jq -n --arg tag "$TAG" --arg url "$url" --arg dl "$dl" --arg apk "$apk" --arg msi "$msi" --arg exe "$exe" --arg deb "$deb" '{
-              username: "GitHub",
+            payload=$(jq -n --arg tag "$TAG" --arg url "$url" --arg dl "$dl" --arg apk "$apk" --arg msi "$msi" --arg exe "$exe" --arg deb "$deb" \
+              --arg repo "https://github.com/${GH_REPO}" '{
+              content: null,
               embeds: [{
-                title: "🚀 CNCVerse Bridge \($tag) released",
+                title: "🚀 CNCVerse Bridge \($tag)",
+                description: "Choose your platform below to download the latest release.",
                 url: $url,
-                color: 5763719,
-                description: "📱 **Android:** [\($apk)](\($dl)/\($apk))\n🪟 **Windows:** [\($msi)](\($dl)/\($msi)) · [setup.exe](\($dl)/\($exe))\n🐧 **Linux:** [\($deb)](\($dl)/\($deb))\n\n[Release notes](\($url))"
+                color: 1122867,
+                fields: [
+                  { name: "📱 Android", value: "[**Download APK**](\($dl)/\($apk))", inline: true },
+                  { name: "🪟 Windows", value: "[**MSI Installer**](\($dl)/\($msi))\n[Setup EXE](\($dl)/\($exe))", inline: true },
+                  { name: "🐧 Linux", value: "[**Download DEB**](\($dl)/\($deb))", inline: true }
+                ],
+                author: { name: "CNCVerse • Release Announcement", url: $repo },
+                footer: { text: "CNCVerse Bridge • Version \($tag | ltrimstr("v"))" }
               }]
             }')
             curl -sf -H 'Content-Type: application/json' -d "$payload" "$DISCORD_WEBHOOK" || echo "::warning::Discord announcement failed"
