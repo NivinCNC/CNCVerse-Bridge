@@ -40,14 +40,16 @@ private suspend fun handleMpdProxy(call: ApplicationCall, converter: MpdConverte
         // Strip trailing '?' or '&' — Jio/Akamai stream URLs sometimes end with a bare '?'
         // which gets URL-decoded and included in the __hdnea__ HMAC query value, corrupting
         // the signature and causing an immediate HTTP 403 from the CDN.
-        val decodedUrl = URLDecoder.decode(destinationUrl, "UTF-8").trimEnd('?', '&')
+        val (decodedUrl, pipeHeaders) = splitPipeHeaders(URLDecoder.decode(destinationUrl, "UTF-8"))
         mpdUrl = decodedUrl
         val repId = call.request.queryParameters["rep_id"]
         val clearKey = call.request.queryParameters["clearkey"]
             ?: buildClearKey(call.request.queryParameters["key_id"], call.request.queryParameters["key"])
 
         val queryParams = call.request.queryParameters.entries().associate { it.key to it.value.firstOrNull().orEmpty() }
-        val customHeaders = HttpClientManager.extractHeadersFromParams(queryParams)
+        // Headers the extension set explicitly (h_*) win over ones riding on the URL
+        val explicit = HttpClientManager.extractHeadersFromParams(queryParams)
+        val customHeaders = pipeHeaders.filterKeys { k -> explicit.keys.none { it.equals(k, ignoreCase = true) } } + explicit
 
         // Live manifests refresh every few seconds for every viewer — fetch once, share the result
         val mpdContent = SegmentCache.getMpd(decodedUrl) ?: SegmentCache.singleFlight("mpd:" + decodedUrl) {
@@ -95,6 +97,27 @@ private suspend fun handleMpdProxy(call: ApplicationCall, converter: MpdConverte
         try { call.respond(HttpStatusCode.InternalServerError, mapOf("error" to "MPD proxy error: ${e.message}")) } catch (_: Exception) {}
     }
 }
+
+/**
+ * Splits a Kodi-style `url|Header=value&Header2=value` into the URL and its headers.
+ * LivXow's JioTV playlist ships `index.mpd?__hdnea__=…&xxx=%7Ccookie=…`: once decoded the
+ * `|` is an illegal URI character and every channel failed. A dangling empty parameter
+ * left in front of the pipe (`&xxx=`) and a trailing `?`/`&` are dropped too — Jio/Akamai
+ * URLs sometimes end with a bare '?' that would otherwise corrupt the __hdnea__ HMAC → 403.
+ */
+internal fun splitPipeHeaders(url: String): Pair<String, Map<String, String>> {
+    val pipe = url.indexOf('|')
+    if (pipe < 0) return url.trimEnd('?', '&') to emptyMap()
+    val headers = url.substring(pipe + 1).split('&').mapNotNull { pair ->
+        val kv = pair.split('=', limit = 2)
+        val key = kv[0].trim()
+        if (kv.size == 2 && key.isNotEmpty()) key to kv[1].trim().removeSurrounding("\"") else null
+    }.toMap()
+    val clean = url.substring(0, pipe).replace(EMPTY_LAST_PARAM, "").trimEnd('?', '&')
+    return clean to headers
+}
+
+private val EMPTY_LAST_PARAM = Regex("[?&][^=&?]+=$")
 
 private fun buildClearKey(keyId: String?, key: String?): String? {
     if (keyId.isNullOrBlank() || key.isNullOrBlank()) return null
