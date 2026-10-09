@@ -7,7 +7,7 @@ name: Commit log
 
 on:
   push:
-    branches: ["**"]
+    branches: [main]   # commit logs only for main
 
 permissions:
   contents: read
