@@ -101,27 +101,12 @@ object BridgeRuntime {
         val cs3Files = PluginInstaller.getInstalledFiles(cacheDir)
         GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
         StremioServer.initFastCatalogs()
-        registerGeoPlugins(installed)
+        startSeenClock(installed)
     }
 
-    /** Tells the geo proxy router each extension's names and languages (→ country). */
-    private fun registerGeoPlugins(installed: List<com.cncverse.stremiobridge.state.InstalledPlugin>) {
-        runCatching {
-            val byPlugin = StremioServer.loadedApis.groupBy { it.pluginInternalName }
-            val infos = installed.map { ip ->
-                val apis = byPlugin[ip.internalName].orEmpty()
-                com.cncverse.stremiobridge.network.geo.GeoRouter.PluginGeoInfo(
-                    internalName = ip.internalName,
-                    displayName = ip.displayName,
-                    names = listOf(ip.displayName, ip.internalName) + apis.map { it.name },
-                    sectionNames = apis.flatMap { it.staticSectionNames },
-                    languages = listOf(ip.language) + apis.map { it.pluginLanguage } + apis.map { it.apiLang },
-                )
-            }
-            com.cncverse.stremiobridge.network.geo.GeoRouter.registerPlugins(infos)
-            // Start the "installed since" clock used by auto-uninstall
-            installed.forEach { com.cncverse.stremiobridge.state.StreamTracker.ensureSeen(it.internalName, it.displayName) }
-        }.onFailure { ServerState.warn("Geo proxy registration failed: ${it.message}") }
+    /** Starts the "installed since" clock used by auto-uninstall. */
+    private fun startSeenClock(installed: List<com.cncverse.stremiobridge.state.InstalledPlugin>) {
+        installed.forEach { com.cncverse.stremiobridge.state.StreamTracker.ensureSeen(it.internalName, it.displayName) }
     }
 
     /** Install a plugin and hot-reload it into the running server. */
@@ -262,7 +247,6 @@ object BridgeRuntime {
      */
     suspend fun startBridge(preferredPort: Int = 8080) {
         ServerState.updateStatus(ServerStatus.Starting("Loading plugin registry…"))
-        com.cncverse.stremiobridge.network.geo.GeoRouter.init(cacheDir)
         com.cncverse.stremiobridge.state.StreamTracker.init(cacheDir)
         com.cncverse.stremiobridge.maintenance.Maintenance.init(cacheDir)
         RepoManager.loadSavedRepos()

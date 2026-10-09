@@ -9,8 +9,6 @@ import com.cncverse.stremiobridge.plugin.PluginLoader
 import com.cncverse.stremiobridge.repo.RepoManager
 import com.cncverse.stremiobridge.server.BridgeRuntime
 import com.cncverse.stremiobridge.server.PlatformPaths
-import com.cncverse.stremiobridge.server.web.AdminServer
-import com.cncverse.stremiobridge.server.web.WebAdmin
 import com.cncverse.stremiobridge.state.*
 import com.cncverse.stremiobridge.update.GithubRelease
 import com.cncverse.stremiobridge.update.OtaUpdater
@@ -62,11 +60,9 @@ fun main() = application {
     // Register the loader globally before anything else runs
     GlobalPluginManager.loader = pluginLoader
 
-    // Shared runtime wiring (also used by the web admin when CNC_WEB_ADMIN=1)
+    // Shared runtime wiring
     BridgeRuntime.cacheDir = CACHE_DIR
     BridgeRuntime.appScope = appScope
-    WebAdmin.appScope = appScope
-    WebAdmin.preferredPort = DEFAULT_PORT
 
     fun startServer() {
         if (ServerState.status.value is ServerStatus.Running) return
@@ -82,12 +78,7 @@ fun main() = application {
     fun stopServer() {
         serverJob?.cancel()
         serverJob = null
-        val port = ServerState.serverPort
         BridgeRuntime.stopBridge()
-        // Keep the web admin panel reachable when it is enabled
-        if (WebAdmin.isEnabled) {
-            appScope.launch { AdminServer.ensureRunning(port) }
-        }
     }
 
     // ── App startup init (mirrors Android MainActivity.onCreate) ──────────
@@ -155,11 +146,6 @@ fun main() = application {
                     exitApplication()
                 }
             }
-        }
-
-        if (WebAdmin.isEnabled) {
-            ServerState.info("Web admin panel will be available at /admin once the server starts" +
-                (WebAdmin.adminToken?.let { " (protected by CNC_ADMIN_TOKEN)" } ?: ""))
         }
 
         // OTA Update check

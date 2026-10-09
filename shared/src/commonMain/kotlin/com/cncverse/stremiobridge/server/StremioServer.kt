@@ -1199,7 +1199,6 @@ object StremioServer {
 
     private fun Application.setupRoutes() {
         setupMpdProxyRoutes()
-        setupWebAdminRoutes()
         routing {
             // 📺 User-facing index page 📺
             get("/") {
@@ -1287,9 +1286,6 @@ object StremioServer {
                 val port = call.parameters["port"]?.toIntOrNull() ?: return@head call.respond(HttpStatusCode.NotFound)
                 LocalRelay.handle(call, port, call.parameters.getAll("path").orEmpty().joinToString("/"), call.request.queryString())
             }
-            // HLS links that only open from WARP (signed for the network that unlocked them)
-            get("/proxy/bound") { BoundRelay.handle(call) }
-            head("/proxy/bound") { BoundRelay.handle(call) }
 
             get("/api/formatter") {
                 call.respond(com.cncverse.stremiobridge.format.StreamFormatter.catalog())
@@ -1744,7 +1740,6 @@ object StremioServer {
         val out = (if (profileId != null && profiles[profileId]?.hideSubtitles == true) formatted.map { it.copy(subtitles = null) } else formatted)
             .map { withStreamBase(it) }
             .map { LocalRelay.rewriteStream(it) }
-            .let { BoundRelay.wrap(it) }
             .let { list ->
                 // "Support the project" entry on top, only above real results; each profile can hide it
                 val show = profileId?.let { profiles[it]?.showSupport } ?: true
@@ -6798,11 +6793,4 @@ fun MediaInfo.toStremiMeta(pluginInternalName: String, stremioType: String) = St
 )
 
 expect fun Application.setupMpdProxyRoutes()
-
-/**
- * Platform hook for the web admin panel routes. Mounted inside the main addon
- * server engine when enabled (desktop with CNC_WEB_ADMIN=1, always on in the
- * headless server app); a no-op on Android.
- */
-expect fun Application.setupWebAdminRoutes()
 

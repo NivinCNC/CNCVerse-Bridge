@@ -180,10 +180,6 @@ object SystemBrowserCdpBypass {
         val browserPath = browserFile.absolutePath
         ServerState.info("[$TAG] Launching CF solver: browser=${browserFile.name} port=$port url=$rootUrl")
         val privateFlag = if (browserPath.contains("msedge", ignoreCase = true)) "--inprivate" else "--incognito"
-        // Same exit as the requests that will reuse the cf_clearance cookie (it is bound to the IP):
-        // WARP when configured — the server no longer runs under proxychains.
-        val warpFlag = com.cncverse.stremiobridge.network.geo.GeoRouter.settings.warpProxy.trim()
-            .takeIf { it.isNotEmpty() }?.let { "--proxy-server=" + it.replace("socks5h://", "socks5://") }
         val process = ProcessBuilder(listOfNotNull(
             browserPath,
             "--app=$rootUrl",
@@ -202,7 +198,6 @@ object SystemBrowserCdpBypass {
             "--disable-background-networking",
             "--disable-default-apps",
             "--disable-component-update",
-            warpFlag,
         )).start()
 
         val session = ProxySession(

@@ -1,9 +1,5 @@
 package com.cncverse.stremiobridge.maintenance
 
-import com.cncverse.stremiobridge.network.geo.GeoRouter
-import com.cncverse.stremiobridge.network.geo.NetContext
-import com.cncverse.stremiobridge.network.geo.ProxyPool
-import com.cncverse.stremiobridge.network.geo.RouteMode
 import com.cncverse.stremiobridge.server.BridgeRuntime
 import com.cncverse.stremiobridge.server.MainApiWrapper
 import com.cncverse.stremiobridge.server.StremioServer
@@ -32,8 +28,7 @@ import java.time.ZonedDateTime
 import java.util.concurrent.atomic.AtomicInteger
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Health probe: does an extension still produce links — directly, or only
-// through a proxy of its country?
+// Health probe: does an extension still produce links?
 // ─────────────────────────────────────────────────────────────────────────────
 
 object HealthProbe {
@@ -44,12 +39,12 @@ object HealthProbe {
     private const val MODE_TIMEOUT_MS = 150_000L
 
     /**
-     * One probe run in [mode]: the extension's own home page first (first few
+     * One probe run: the extension's own home page first (first few
      * items → load → links), falling back to a search when it has none. Uses no
-     * caches so a direct failure never short-circuits the proxy run.
+     * caches, so the answer reflects the site right now.
      */
-    suspend fun probeOnce(api: MainApiWrapper, mode: RouteMode): Outcome =
-        withContext(Dispatchers.IO + NetContext.RouteModeElement(mode)) {
+    suspend fun probeOnce(api: MainApiWrapper): Outcome =
+        withContext(Dispatchers.IO) {
             withTimeoutOrNull(MODE_TIMEOUT_MS) { runFlow(api) } ?: Outcome(0, "timed out", timedOut = true)
         }
 
@@ -73,51 +68,19 @@ object HealthProbe {
     }
 
     /**
-     * Direct first; when that finds nothing and the extension has a country,
-     * again through that country's proxy pool. Records the outcome and teaches
-     * the geo router when the extension only works through a proxy.
+     * Probes [api] once and records the outcome: links → working, a clean
+     * "no links" → dead, a timeout → unknown (proves nothing).
      */
     suspend fun probe(api: MainApiWrapper): String {
         val plugin = api.pluginInternalName
-        val direct = probeOnce(api, RouteMode.FORCE_DIRECT)
-        if (direct.streams > 0) {
-            StreamTracker.recordProbe(plugin, api.internalName, api.name, direct.streams, -1, null, "direct: ${direct.note}")
-            if (GeoRouter.needsProxy(plugin)) GeoRouter.markPluginNeedsProxy(plugin, false)
-            return HealthStatus.WORKING
+        val run = probeOnce(api)
+        // A clean "0 links" is the evidence for DEAD; a run that timed out proves nothing
+        StreamTracker.recordProbe(plugin, api.internalName, api.name, if (run.timedOut) -1 else run.streams, -1, null, run.note)
+        return when {
+            run.streams > 0 -> HealthStatus.WORKING
+            run.timedOut -> HealthStatus.UNKNOWN
+            else -> HealthStatus.DEAD
         }
-        val country = GeoRouter.countryFor(plugin)
-        if (country == null || !GeoRouter.settings.enabled) {
-            // No proxy route exists: a clean "0 links" is the whole evidence; a timeout is none
-            StreamTracker.recordProbe(plugin, api.internalName, api.name, if (direct.timedOut) -1 else 0, -1, null,
-                "direct: ${direct.note}; no proxy country")
-            return if (direct.timedOut) HealthStatus.UNKNOWN else HealthStatus.DEAD
-        }
-        ProxyPool.pickAwait(country)
-        // Datacenter proxies get refused/challenged by the same sites that block this
-        // server, so a failed run through them proves nothing — only a residential or
-        // private proxy can turn "no links" into DEAD (auto-uninstall depends on it).
-        if (ProxyPool.healthy(country).none { it.residential || it.custom }) {
-            StreamTracker.recordProbe(plugin, api.internalName, api.name, 0, -2, country,
-                "direct: ${direct.note}; no residential $country proxy available to verify")
-            return HealthStatus.UNKNOWN
-        }
-        GeoRouter.resetProbeMisses(plugin)
-        val proxied = probeOnce(api, RouteMode.FORCE_PROXY)
-        val misses = GeoRouter.probeMisses(plugin)
-        val note = "direct: ${direct.note}; $country proxy: ${proxied.note}" +
-            (if (misses > 0) " ($misses request(s) found no working proxy)" else "")
-        if (proxied.streams > 0) {
-            StreamTracker.recordProbe(plugin, api.internalName, api.name, 0, proxied.streams, country, note)
-            GeoRouter.markPluginNeedsProxy(plugin, true)
-            return HealthStatus.PROXY
-        }
-        // DEAD needs two clean "no links" answers; a run that timed out proves nothing (-2 = inconclusive)
-        if (direct.timedOut || proxied.timedOut || misses > 0) {
-            StreamTracker.recordProbe(plugin, api.internalName, api.name, 0, -2, country, "$note (inconclusive)")
-            return HealthStatus.UNKNOWN
-        }
-        StreamTracker.recordProbe(plugin, api.internalName, api.name, 0, 0, country, note)
-        return HealthStatus.DEAD
     }
 }
 
@@ -193,7 +156,7 @@ object HealthSweep {
             state = state.copy(running = false, finishedAt = System.currentTimeMillis())
             StreamTracker.saveNow()
             ServerState.info(
-                "[Health] sweep done: ${state.working} working, ${state.proxy} via proxy, " +
+                "[Health] sweep done: ${state.working} working, " +
                     "${state.dead} dead, ${state.unknown} unknown"
             )
             return state
@@ -357,7 +320,7 @@ object Maintenance {
     }
 
     /**
-     * Opted-in extensions that are DEAD (probed direct + proxy, no links) and
+     * Opted-in extensions that are DEAD (probed, no links) and
      * produced nothing for [autoUninstallDays] days — counted from the latest
      * of: last links, first seen, opt-in.
      */
@@ -385,7 +348,6 @@ object Maintenance {
         ServerState.warn("[Maintenance] auto-uninstalling ${names.size} dead extension(s): ${names.joinToString()}")
         BridgeRuntime.uninstallPlugins(names)
         StreamTracker.forget(names)
-        names.forEach { GeoRouter.clearLearned(it) }
         val now = System.currentTimeMillis()
         synchronized(this) {
             val records = candidates.map { (p, r) ->
@@ -402,8 +364,7 @@ object Maintenance {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Home-page audit: uninstall extensions whose home page loads neither directly
-// nor through a proxy of their country.
+// Home-page audit: uninstall extensions whose home page no longer loads.
 // ─────────────────────────────────────────────────────────────────────────────
 
 @Serializable
@@ -435,8 +396,8 @@ object HomePageAudit {
 
     fun isRunning() = mutex.isLocked
 
-    private suspend fun homeItems(api: MainApiWrapper, mode: RouteMode): Pair<Int, Boolean> =
-        withContext(Dispatchers.IO + NetContext.RouteModeElement(mode)) {
+    private suspend fun homeItems(api: MainApiWrapper): Pair<Int, Boolean> =
+        withContext(Dispatchers.IO) {
             val type = api.supportedTypes.firstOrNull() ?: "movie"
             val r = withTimeoutOrNull(TIMEOUT_MS) { runCatching { api.getMainPage(1, type, null) }.getOrDefault(emptyList()) }
             if (r == null) 0 to true else r.size to false
@@ -448,27 +409,10 @@ object HomePageAudit {
         // Loaded fine recently (pre-warm / users) — no need to fetch it again
         val cached = StremioServer.cachedHomeItems(api)
         if (cached > 0) return HomeAuditRow(plugin, api.name, "ok", "$cached items (cached home page)")
-        val (direct, directTimeout) = homeItems(api, RouteMode.FORCE_DIRECT)
-        if (direct > 0) return HomeAuditRow(plugin, api.name, "ok", "$direct items directly")
-        val country = GeoRouter.countryFor(plugin) ?: "IN"
-        ProxyPool.pickAwait(country, timeoutMs = 60_000)
-        if (ProxyPool.healthy(country).none { it.residential || it.custom }) {
-            return HomeAuditRow(plugin, api.name, "inconclusive", "empty directly; no residential $country proxy")
-        }
-        GeoRouter.resetProbeMisses(plugin)
-        val (proxied, proxyTimeout) = homeItems(api, RouteMode.FORCE_PROXY)
-        val misses = GeoRouter.probeMisses(plugin)
-        if (proxied > 0) {
-            GeoRouter.markPluginNeedsProxy(plugin, true)
-            return HomeAuditRow(plugin, api.name, "ok", "$proxied items via $country proxy")
-        }
-        if (directTimeout || proxyTimeout || misses > 0) {
-            return HomeAuditRow(plugin, api.name, "inconclusive",
-                "empty; " + listOfNotNull(if (directTimeout) "direct timed out" else null,
-                    if (proxyTimeout) "proxy timed out" else null,
-                    if (misses > 0) "$misses request(s) found no proxy" else null).joinToString(", "))
-        }
-        return HomeAuditRow(plugin, api.name, "dead", "home page empty directly and via $country proxy")
+        val (items, timedOut) = homeItems(api)
+        if (items > 0) return HomeAuditRow(plugin, api.name, "ok", "$items items")
+        if (timedOut) return HomeAuditRow(plugin, api.name, "inconclusive", "home page timed out")
+        return HomeAuditRow(plugin, api.name, "dead", "home page empty")
     }
 
     /** Audits every loaded API; with [uninstall], removes plugins whose every home page is dead. */
@@ -477,7 +421,7 @@ object HomePageAudit {
         try {
             val apis = StremioServer.loadedApis.toList()
             state = HomeAuditState(running = true, total = apis.size, startedAt = System.currentTimeMillis(), uninstall = uninstall)
-            ServerState.info("[HomeAudit] checking ${apis.size} API(s) — direct, then via proxy")
+            ServerState.info("[HomeAudit] checking ${apis.size} API(s)")
             val rows = java.util.concurrent.ConcurrentLinkedQueue<HomeAuditRow>()
             val done = AtomicInteger()
             val sem = Semaphore(4)
@@ -504,7 +448,6 @@ object HomePageAudit {
                 ServerState.warn("[HomeAudit] uninstalling ${dead.size} extension(s) with a dead home page: ${dead.joinToString()}")
                 BridgeRuntime.uninstallPlugins(dead)
                 StreamTracker.forget(dead)
-                dead.forEach { GeoRouter.clearLearned(it) }
                 state = state.copy(uninstalled = dead)
             }
             state = state.copy(running = false, finishedAt = System.currentTimeMillis())

@@ -140,13 +140,7 @@ actual class PluginLoader {
 
     /** Reconfigures the global NiceHttp `app` client used by plugins with AdaptiveHostDns + CloudflareKiller. */
     private fun configureAppClientNetwork() {
-        val current = java.net.ProxySelector.getDefault()
-        if (current !is com.cncverse.stremiobridge.network.geo.GeoRouter.Selector) {
-            // Wrap (not replace) the system selector so http.proxyHost etc. still apply when not geo-routed
-            java.net.ProxySelector.setDefault(com.cncverse.stremiobridge.network.geo.GeoRouter.Selector(current))
-            ServerState.info("Installed geo proxy selector as JVM default (covers all OkHttpClient instances)")
-        }
-        com.cncverse.stremiobridge.network.geo.NetContext.stackResolver = { PluginCallContext.getCallingPluginName() }
+        com.cncverse.stremiobridge.network.NetContext.stackResolver = { PluginCallContext.getCallingPluginName() }
 
         val cfKiller = com.lagradost.cloudstream3.network.CloudflareKiller()
 
@@ -166,7 +160,6 @@ actual class PluginLoader {
 
             val newOk = existingOk.newBuilder()
                 .addInterceptor(cfKiller)
-                .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
                 .dns(AdaptiveHostDns)
                 .fastFallback(true)
                 .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
@@ -178,7 +171,7 @@ actual class PluginLoader {
                 .eventListenerFactory(LeakSafeEventListener.FACTORY)
                 .build()
             okClientField.set(currentNiceClient, newOk)
-            ServerState.info("Configured AdaptiveHostDns + CloudflareKiller + geo proxy routing on app.client (global)")
+            ServerState.info("Configured AdaptiveHostDns + CloudflareKiller on app.client (global)")
         } catch (t: Throwable) {
             ServerState.warn("Failed to configure global app.client: ${t.message}")
         }
@@ -208,7 +201,6 @@ actual class PluginLoader {
                     if (!alreadyHas) {
                         val patched = existing.newBuilder()
                             .addInterceptor(cfKiller)
-                            .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
                             .dns(AdaptiveHostDns)
                             .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
                             .addInterceptor(TMDB_HOST_REWRITE)
@@ -217,7 +209,7 @@ actual class PluginLoader {
                             .build()
                         runCatching { baseClientField.set(target, patched) }
                         runCatching { baseClientField.set(null, patched) }
-                        ServerState.info("Configured CloudflareKiller + geo proxy routing on NiceHttp Requests.baseClient")
+                        ServerState.info("Configured CloudflareKiller on NiceHttp Requests.baseClient")
                     }
                 }
             } else {
@@ -256,14 +248,12 @@ actual class PluginLoader {
                 if (existing.interceptors.none { it is com.lagradost.cloudstream3.network.CloudflareKiller }) {
                     val patched = existing.newBuilder()
                         .addInterceptor(cfKiller)
-                        .addInterceptor(com.cncverse.stremiobridge.network.geo.GeoRouter.ProxyInterceptor)
-                        // Tags each call with its plugin — without it geo routing sees no plugin
                         .addInterceptor(TMDB_HOST_REWRITE)
                         .dispatcher(PLUGIN_DISPATCHER)
                         .eventListenerFactory(LeakSafeEventListener.FACTORY)
                         .build()
                     okField.set(requests, patched)
-                    ServerState.info("[CF] Patched CloudflareKiller + geo proxy routing into com.horis.cncverse.UtilsKt.app")
+                    ServerState.info("[CF] Patched CloudflareKiller into com.horis.cncverse.UtilsKt.app")
                 }
             }
 
@@ -788,7 +778,7 @@ private class LeakSafeEventListener : EventListener() {
         val prev = slowLogged.put(url.host, now)
         if (prev != null && now - prev < 60_000L) { slowLogged[url.host] = prev; return }
         if (slowLogged.size > 2_000) slowLogged.entries.removeIf { now - it.value > 60_000L }
-        val plugin = com.cncverse.stremiobridge.network.geo.NetContext.tagFor(call)?.plugin ?: "?"
+        val plugin = com.cncverse.stremiobridge.network.NetContext.tagFor(call)?.plugin ?: "?"
         val outcome = ioe?.let { "${it.javaClass.simpleName}: ${it.message?.take(60)}" } ?: "HTTP $status"
         com.cncverse.stremiobridge.state.ServerState.warn(
             "[SlowHTTP] $plugin ${url.host}${url.encodedPath.take(60)} ${ms / 1000.0}s ($outcome)"
@@ -796,7 +786,7 @@ private class LeakSafeEventListener : EventListener() {
     }
 
     private fun closeIfLeaked(call: Call) {
-        com.cncverse.stremiobridge.network.geo.NetContext.forget(call)
+        com.cncverse.stremiobridge.network.NetContext.forget(call)
         val ref = liveResponses.remove(call) ?: return
         val response = ref.get() ?: return
         try {
@@ -815,10 +805,9 @@ private class LeakSafeEventListener : EventListener() {
 
         /** Singleton factory — one listener instance per call (stateful, not shared). */
         // create() runs on the thread that built the Call (the plugin coroutine), so it is
-        // where the call gets tagged with its plugin for geo proxy routing.
+        // where the call gets tagged with its plugin (for the slow-request log).
         val FACTORY: Factory = Factory { call ->
-            com.cncverse.stremiobridge.network.geo.NetContext.attributeCall(call)
-            if (System.getenv("CNC_GEO_DEBUG") == "1") com.cncverse.stremiobridge.state.ServerState.info("[GeoProxy:debug] newCall " + call.request().url.host + " plugin=" + com.cncverse.stremiobridge.network.geo.NetContext.currentPlugin() + " thread=" + Thread.currentThread().name)
+            com.cncverse.stremiobridge.network.NetContext.attributeCall(call)
             LeakSafeEventListener()
         }
     }
@@ -849,8 +838,8 @@ private class DirectMainApiWrapper(
     override val internalName: String get() = plugin.internalName + "_" + StremioServer.publicNameSlug(api.name)
     override val pluginInternalName: String get() = plugin.internalName
 
-    /** Tags all network traffic of these calls with the plugin (geo proxy routing). */
-    private val netCtx = com.cncverse.stremiobridge.network.geo.NetContext.PluginNetElement(plugin.internalName)
+    /** Tags all network traffic of these calls with the plugin (slow-request log). */
+    private val netCtx = com.cncverse.stremiobridge.network.NetContext.PluginNetElement(plugin.internalName)
 
     override val staticSectionNames: List<String> get() = runCatching { api.mainPage.map { it.name } }.getOrDefault(emptyList())
     override val apiLang: String? get() = runCatching { api.lang }.getOrNull()

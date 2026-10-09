@@ -1,14 +1,11 @@
-package com.cncverse.stremiobridge.network.geo
+package com.cncverse.stremiobridge.network
 
 import kotlinx.coroutines.ThreadContextElement
 import kotlin.coroutines.AbstractCoroutineContextElement
 import kotlin.coroutines.CoroutineContext
 
-/** How a plugin call's HTTP traffic may be routed (set by health probes). */
-enum class RouteMode { AUTO, FORCE_DIRECT, FORCE_PROXY }
-
 /**
- * Attributes HTTP traffic to the plugin that issued it.
+ * Attributes HTTP traffic to the plugin that issued it (used by the slow-request log).
  *
  * Every plugin entry point (search/load/loadLinks/getMainPage) runs inside a
  * [PluginNetElement]; the element sets a thread-local on whichever thread the
@@ -19,27 +16,23 @@ enum class RouteMode { AUTO, FORCE_DIRECT, FORCE_PROXY }
  */
 object NetContext {
     private val plugin = ThreadLocal<String?>()
-    private val mode = ThreadLocal<RouteMode?>()
 
     /** Fallback attribution (stack walk over plugin classloaders), installed by the desktop loader. */
     @Volatile
     var stackResolver: (() -> String?)? = null
 
     fun currentPlugin(): String? = plugin.get()
-    fun currentMode(): RouteMode = mode.get() ?: RouteMode.AUTO
 
     /** Plugin for the current thread: coroutine context first, then a stack walk. */
     fun resolvePlugin(): String? = plugin.get() ?: runCatching { stackResolver?.invoke() }.getOrNull()
 
-    data class Tag(val plugin: String?, val mode: RouteMode)
+    data class Tag(val plugin: String?)
 
     private val callTags = java.util.Collections.synchronizedMap(java.util.WeakHashMap<Any, Tag>())
 
     /** Records the issuing plugin for an OkHttp call (called from EventListener.Factory.create). */
     fun attributeCall(call: Any) {
-        val p = resolvePlugin()
-        val m = currentMode()
-        if (p != null || m != RouteMode.AUTO) callTags[call] = Tag(p, m)
+        resolvePlugin()?.let { callTags[call] = Tag(it) }
     }
 
     fun tagFor(call: Any): Tag? = callTags[call]
@@ -56,19 +49,6 @@ object NetContext {
 
         override fun restoreThreadContext(context: CoroutineContext, oldState: String?) {
             plugin.set(oldState)
-        }
-    }
-
-    class RouteModeElement(val routeMode: RouteMode) :
-        ThreadContextElement<RouteMode?>, AbstractCoroutineContextElement(Key) {
-        companion object Key : CoroutineContext.Key<RouteModeElement>
-
-        override fun updateThreadContext(context: CoroutineContext): RouteMode? {
-            val old = mode.get(); mode.set(routeMode); return old
-        }
-
-        override fun restoreThreadContext(context: CoroutineContext, oldState: RouteMode?) {
-            mode.set(oldState)
         }
     }
 }
