@@ -125,3 +125,34 @@ jobs:
           else
             gh release create "$TAG" dist/* --title "CNCVerse Bridge ${TAG}" --notes "$notes" --target "${{ github.sha }}"
           fi
+      - name: Announce on Discord and Telegram
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TG_TOPIC: ${{ secrets.TELEGRAM_TOPIC_ID }}
+        run: |
+          url="https://github.com/${GH_REPO}/releases/tag/${TAG}"
+          dl="https://github.com/${GH_REPO}/releases/download/${TAG}"
+          apk="CNCVerse-Bridge-${TAG}.apk"; msi="CNCVerse-Bridge-${TAG}.msi"
+          exe="CNCVerse-Bridge-${TAG}-setup.exe"; deb="CNCVerse-Bridge-${TAG}_amd64.deb"
+          if [ -n "$DISCORD_WEBHOOK" ]; then
+            payload=$(jq -n --arg tag "$TAG" --arg url "$url" --arg dl "$dl" --arg apk "$apk" --arg msi "$msi" --arg exe "$exe" --arg deb "$deb" '{
+              username: "GitHub",
+              embeds: [{
+                title: "🚀 CNCVerse Bridge \($tag) released",
+                url: $url,
+                color: 5763719,
+                description: "📱 **Android:** [\($apk)](\($dl)/\($apk))\n🪟 **Windows:** [\($msi)](\($dl)/\($msi)) · [setup.exe](\($dl)/\($exe))\n🐧 **Linux:** [\($deb)](\($dl)/\($deb))\n\n[Release notes](\($url))"
+              }]
+            }')
+            curl -sf -H 'Content-Type: application/json' -d "$payload" "$DISCORD_WEBHOOK" || echo "::warning::Discord announcement failed"
+          fi
+          if [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ]; then
+            text="🚀 <b>CNCVerse Bridge ${TAG} released</b>"$'\n\n'"📱 Android: <a href=\"${dl}/${apk}\">${apk}</a>"$'\n'"🪟 Windows: <a href=\"${dl}/${msi}\">${msi}</a> · <a href=\"${dl}/${exe}\">setup.exe</a>"$'\n'"🐧 Linux: <a href=\"${dl}/${deb}\">${deb}</a>"$'\n\n'"<a href=\"${url}\">Release notes</a>"
+            args=(-d chat_id="$TG_CHAT" -d parse_mode=HTML -d disable_web_page_preview=true --data-urlencode "text=$text")
+            [ -n "$TG_TOPIC" ] && args+=(-d message_thread_id="$TG_TOPIC")
+            curl -s -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" "${args[@]}" | jq -e '.ok' >/dev/null || echo "::warning::Telegram announcement failed"
+          fi
