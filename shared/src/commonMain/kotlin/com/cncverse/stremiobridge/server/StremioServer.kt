@@ -2491,7 +2491,10 @@ object StremioServer {
                 val info = SearchLoadCache.getLoad(key, dataUrl)?.info
                     ?: kotlinx.coroutines.withTimeoutOrNull(META_LOAD_TIMEOUT_MS) { api.load(dataUrl) }
                         ?.also { SearchLoadCache.putLoad(key, dataUrl, it) }
-                info?.toStremiMeta(nameSlug(api.name), type)
+                // The meta keeps the id it was asked for. toStremiMeta() names a movie by its
+                // load() data (often a JSON blob of players); clients that store the returned
+                // id (Nuvio) then asked meta for that blob, which load() can't open → 404.
+                info?.toStremiMeta(nameSlug(api.name), type)?.copy(id = id)
             } catch (e: kotlinx.coroutines.CancellationException) {
                 throw e
             } catch (e: Throwable) {
@@ -2728,17 +2731,21 @@ object StremioServer {
                         withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
                             try {
                                 ServerState.debug("[${api.name}] Loading links for $dataUrl")
-                                var links = api.loadLinksAll(dataUrl)
+                                fun loadData(mi: MediaInfo?) = mi?.let {
+                                    it.dataUrl.takeIf { d -> d.isNotBlank() && d != dataUrl }
+                                        ?: it.episodes?.firstOrNull()?.dataUrl
+                                }?.takeIf { it != dataUrl }
+                                // A movie's id is its page URL (the id the client asked meta for); its
+                                // detail page was usually just opened, so load() is cached — go straight
+                                // to the links instead of trying the page URL first.
+                                val cachedData = loadData(SearchLoadCache.getLoad(apiKey(api), dataUrl)?.info)
+                                var links = api.loadLinksAll(cachedData ?: dataUrl)
                                 // Catalog items opened straight from a row (defaultVideoId) carry the
                                 // item URL, not the load() data — e.g. Netflix mirrors need the title
                                 // that only load() adds. Resolve it once and retry.
-                                if (links.isEmpty() && !api.supportedTypes.all { it == "tv" }) {
-                                    val info = runCatching { api.load(dataUrl) }.getOrNull()
-                                    val resolved = info?.let { mi ->
-                                        mi.dataUrl.takeIf { it.isNotBlank() && it != dataUrl }
-                                            ?: mi.episodes?.firstOrNull()?.dataUrl
-                                    }
-                                    if (resolved != null && resolved != dataUrl) {
+                                if (links.isEmpty() && cachedData == null && !api.supportedTypes.all { it == "tv" }) {
+                                    val resolved = loadData(runCatching { api.load(dataUrl) }.getOrNull())
+                                    if (resolved != null) {
                                         ServerState.info("[${api.name}] Retrying with load() data")
                                         links = api.loadLinksAll(resolved)
                                     }
