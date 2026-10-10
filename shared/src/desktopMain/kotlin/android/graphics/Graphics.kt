@@ -1,5 +1,12 @@
 package android.graphics
 
+/** Binary-compatible desktop placeholder for Android's Bitmap.Config constants. */
+class Bitmap private constructor() {
+    enum class Config {
+        ALPHA_8, RGB_565, ARGB_4444, ARGB_8888, RGBA_F16, HARDWARE
+    }
+}
+
 /** android.graphics stubs. Color is functional (parseColor is used at runtime). */
 object Color {
     @JvmField val BLACK: Int = -0x1000000
