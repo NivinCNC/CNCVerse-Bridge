@@ -237,6 +237,7 @@ object MediaServer {
         val p = prefs
         if (!p.enabled || root == null) return s
         val url = s.url ?: return s
+        if (s.info?.source == "upstream") return s
         if (s.externalUrl != null || s.infoHash != null || s.ytId != null || s.clearkey != null) return s
         if (!url.startsWith("http", true) || OWN_PATH.containsMatchIn(url)) return s
         val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrNull() ?: return s
@@ -716,6 +717,35 @@ object MediaServer {
     private fun relTarget(id: String, url: String, playlist: Boolean): String =
         if (playlist) "../pl/${token(id, url)}.m3u8" else "../seg/${token(id, url)}"
 
+    private val ATTRS = Regex("([A-Z0-9-]+)=(\"[^\"]*\"|[^,]*)")
+
+    /** A master playlist cut down to its highest rendition (tallest, then highest bitrate); audio / subtitle groups stay. */
+    private fun keepBestVariant(text: String): String {
+        if (!text.contains("#EXT-X-STREAM-INF")) return text
+        val lines = text.lines()
+        class V(val infoIdx: Int, val urlIdx: Int, val height: Int, val bw: Long)
+        val vs = ArrayList<V>()
+        var i = 0
+        while (i < lines.size) {
+            val l = lines[i].trim()
+            if (l.startsWith("#EXT-X-STREAM-INF")) {
+                val a = ATTRS.findAll(l.substringAfter(':')).associate { it.groupValues[1] to it.groupValues[2].trim('"') }
+                val h = a["RESOLUTION"]?.lowercase()?.split('x')?.getOrNull(1)?.toIntOrNull() ?: 0
+                val bw = a["AVERAGE-BANDWIDTH"]?.toLongOrNull() ?: a["BANDWIDTH"]?.toLongOrNull() ?: 0L
+                var j = i + 1
+                while (j < lines.size && (lines[j].isBlank() || lines[j].startsWith("#"))) j++
+                if (j < lines.size) vs += V(i, j, h, bw)
+                i = j
+            }
+            i++
+        }
+        if (vs.size < 2) return text
+        val top = vs.maxWithOrNull(compareBy<V>({ it.height }, { it.bw })) ?: return text
+        val drop = HashSet<Int>()
+        for (v in vs) if (v !== top) { drop += v.infoIdx; for (k in v.infoIdx..v.urlIdx) drop += k }
+        return lines.filterIndexed { idx, _ -> idx !in drop }.joinToString("\n")
+    }
+
     /** Rewrites every URI of a playlist to this server (relative links, so any host/port works). */
     private fun rewritePlaylist(id: String, playlistUrl: String, text: String, playlistKey: String): String {
         val out = StringBuilder()
@@ -766,12 +796,13 @@ object MediaServer {
             if (!raw.trimStart().startsWith("#EXTM3U")) {
                 return call.respondText("Source did not return a playlist", status = HttpStatusCode.BadGateway)
             }
-            val rewritten = rewritePlaylist(id, url, raw, key)
+            val useRaw = if (StremioServer.streamPrefs.bestHls) keepBestVariant(raw) else raw
+            val rewritten = rewritePlaylist(id, url, useRaw, key)
             if (playlistCache.size > 500) playlistCache.clear()
             playlistCache[key] = CachedPlaylist(System.currentTimeMillis(), rewritten)
             // Start fetching the first segments right away
             if (raw.contains("#EXTINF")) prefetch(id, src, key, 0)
-            if (raw.contains("#EXT-X-STREAM-INF")) warmVariants(id, src, url, raw)
+            if (useRaw.contains("#EXT-X-STREAM-INF")) warmVariants(id, src, url, useRaw)
             rewritten
         }
         call.response.header(HttpHeaders.CacheControl, "no-store")
@@ -860,7 +891,7 @@ object MediaServer {
         // Some hosts hand out playlists under names without ".m3u8": recognise them by content and rewrite them too
         if (bytes.size in 8..2_000_000 && bytes[0] == '#'.code.toByte() && String(bytes, 0, 7) == "#EXTM3U") {
             val key = "$id|$url"
-            val rewritten = rewritePlaylist(id, url, String(bytes), key)
+            val rewritten = rewritePlaylist(id, url, String(bytes).let { if (StremioServer.streamPrefs.bestHls) keepBestVariant(it) else it }, key)
             playlistCache[key] = CachedPlaylist(System.currentTimeMillis(), rewritten)
             if (rewritten.contains("#EXTINF")) prefetch(id, src, key, 0)
             call.response.header(HttpHeaders.CacheControl, "no-store")

@@ -49,7 +49,7 @@ object SettingsBackup {
         "enabled_sources.json",
         "stream_formatter.json",
         "stream_cache_config.json",
-        "media_server.json",
+        "media_server.json", "upstream_addons.json",
     )
 
     private const val CATALOGS_MARKER = "catalogs_disabled_globally"

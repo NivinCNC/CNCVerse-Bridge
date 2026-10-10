@@ -26,7 +26,10 @@ import java.util.concurrent.TimeUnit
 object QualityProbe {
     class Variant(val url: String, val height: Int, val bandwidth: Long)
 
-    private class Cached(val at: Long, val variants: List<Variant>)
+    /** What a master playlist lists; [externalAudio] = the sound lives in separate playlists (the master must stay). */
+    class Probe(val variants: List<Variant>, val externalAudio: Boolean)
+
+    private class Cached(val at: Long, val probe: Probe)
 
     private const val TTL_MS = 30 * 60_000L
     private val cache = ConcurrentHashMap<String, Cached>()
@@ -122,34 +125,40 @@ object QualityProbe {
         }
     }
 
-    private fun fetchVariants(s: StremioStream): List<Variant> {
-        val url = s.url ?: return emptyList()
-        cache[url]?.let { if (System.currentTimeMillis() - it.at < TTL_MS) return it.variants }
-        val variants = try {
+    private val AUDIO_GROUP = Regex("#EXT-X-MEDIA:[^\\n]*TYPE=AUDIO[^\\n]*URI=\"", RegexOption.IGNORE_CASE)
+
+    /** The highest rendition: tallest picture, then highest bitrate. */
+    fun topVariant(variants: List<Variant>): Variant? =
+        variants.filter { it.url.isNotBlank() }.maxWithOrNull(compareBy<Variant>({ it.height }, { it.bandwidth }))
+
+    private fun fetchVariants(s: StremioStream): Probe {
+        val url = s.url ?: return Probe(emptyList(), false)
+        cache[url]?.let { if (System.currentTimeMillis() - it.at < TTL_MS) return it.probe }
+        val probe = try {
             val b = okhttp3.Request.Builder().url(url).header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0 Safari/537.36")
             s.behaviorHints?.proxyHeaders?.request?.forEach { (k, v) -> runCatching { b.header(k, v) } }
             client.newCall(b.build()).execute().use { r ->
-                if (!r.isSuccessful) emptyList() else {
+                if (!r.isSuccessful) Probe(emptyList(), false) else {
                     val text = readLimited(r.body?.byteStream(), 512 * 1024)
-                    parseMaster(text, r.request.url.toString())
+                    Probe(parseMaster(text, r.request.url.toString()), AUDIO_GROUP.containsMatchIn(text))
                 }
             }
         } catch (e: Exception) {
-            emptyList()
+            Probe(emptyList(), false)
         }
         if (cache.size > 3_000) cache.clear()
-        cache[url] = Cached(System.currentTimeMillis(), variants)
-        return variants
+        cache[url] = Cached(System.currentTimeMillis(), probe)
+        return probe
     }
 
     /**
      * Fills in the resolution of HLS streams that have none. Anything not answered within [budgetMs]
      * stays as it was (and the playlist read is kept for the next request).
      */
-    suspend fun enrich(streams: List<StremioStream>, split: Boolean, budgetMs: Long = 3_500L): List<StremioStream> {
+    suspend fun enrich(streams: List<StremioStream>, split: Boolean, budgetMs: Long = 3_500L, bestOnly: Boolean = true): List<StremioStream> {
         val todo = streams.filter { isHlsCandidate(it) && StreamVariables.resolutionOf(it) == null }
         if (todo.isEmpty()) return streams
-        val found = ConcurrentHashMap<StremioStream, List<Variant>>()
+        val found = ConcurrentHashMap<StremioStream, Probe>()
         withTimeoutOrNull(budgetMs) {
             coroutineScope {
                 todo.map { s ->
@@ -162,13 +171,18 @@ object QualityProbe {
         val out = ArrayList<StremioStream>(streams.size + 4)
         val seen = HashSet<String>()
         for (s in streams) {
-            val variants = found[s]?.takeIf { it.isNotEmpty() }
-            if (variants == null) { out += s; continue }
+            val probe = found[s]?.takeIf { it.variants.isNotEmpty() }
+            if (probe == null) { out += s; continue }
+            val variants = probe.variants
             val best = variants.maxOf { it.height }
             if (best <= 0) { out += s; continue }
             val info = s.info ?: com.cncverse.stremiobridge.model.StreamInfo()
             if (!split || variants.size < 2) {
-                out += s.copy(info = info.copy(quality = best))
+                // Play the highest rendition every time (when the sound is inside it), and label it with that resolution
+                val top = if (bestOnly && !probe.externalAudio) topVariant(variants) else null
+                out += if (top != null && top.url != s.url) {
+                    s.copy(url = top.url, info = info.copy(quality = best, linkType = s.info?.linkType ?: "M3U8"))
+                } else s.copy(info = info.copy(quality = best))
                 continue
             }
             // One entry per rendition (best bandwidth for each height), best first, and the adaptive original last

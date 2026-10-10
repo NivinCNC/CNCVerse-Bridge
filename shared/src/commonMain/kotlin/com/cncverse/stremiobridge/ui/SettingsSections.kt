@@ -348,6 +348,9 @@ fun StreamsCard() {
         SwitchRow("Load the next episode in advance", "While you watch, the links of the next episode are loaded in the background", p.prefetchNext) {
             update(p.copy(prefetchNext = it))
         }
+        SwitchRow("Always play the highest resolution of adaptive streams", "Auto-resolution links are labelled with their best resolution and start at it, instead of the player choosing a lower one", p.bestHls) {
+            update(p.copy(bestHls = it))
+        }
         SwitchRow("Detect the quality of adaptive streams", "Reads HLS playlists to find the real resolution instead of listing them as Auto", p.probeHls) {
             update(p.copy(probeHls = it))
         }
@@ -616,6 +619,61 @@ fun MediaServerCard() {
             }
             ActionButton("Refresh") { tick++ }
             ActionButton("Clear cache", danger = true) { message = "Deleted ${MediaServer.clearCache()} cached item(s)"; tick++ }
+        }
+        message?.let { Text(it, color = Green400, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)) }
+    }
+}
+
+// ── Upstream add-ons (pencarimovie / Telegram servers) ───────────────────────
+
+/** Other Stremio add-ons (e.g. a pencarimovie Telegram server) whose streams are merged into the results. */
+@Composable
+fun UpstreamAddonsCard() {
+    var items by remember { mutableStateOf(com.cncverse.stremiobridge.server.UpstreamAddons.all()) }
+    var name by remember { mutableStateOf("") }
+    var url by remember { mutableStateOf("") }
+    var message by remember { mutableStateOf<String?>(null) }
+
+    AmoledCard(Modifier.fillMaxWidth()) {
+        SectionTitle(
+            "Upstream add-ons",
+            "Paste the link of another Stremio add-on, such as your pencarimovie Telegram server (https://host/manifest.json). " +
+                "Its streams are added to every result list; its Telegram files already stream with seeking, so they are passed through as they are.",
+        )
+        items.forEach { a ->
+            SwitchRow(a.name, a.url, a.enabled) {
+                com.cncverse.stremiobridge.server.UpstreamAddons.setEnabled(a.url, it)
+                items = com.cncverse.stremiobridge.server.UpstreamAddons.all()
+            }
+            ActionButton("Remove ${a.name}", danger = true) {
+                com.cncverse.stremiobridge.server.UpstreamAddons.remove(a.url)
+                items = com.cncverse.stremiobridge.server.UpstreamAddons.all()
+            }
+        }
+        OutlinedTextField(
+            value = name, onValueChange = { name = it; message = null },
+            label = { Text("Name (optional)") }, singleLine = true,
+            modifier = Modifier.fillMaxWidth(), colors = amoledFieldColors(),
+        )
+        Spacer(Modifier.height(6.dp))
+        OutlinedTextField(
+            value = url, onValueChange = { url = it; message = null },
+            label = { Text("Add-on link") }, singleLine = true,
+            modifier = Modifier.fillMaxWidth(), colors = amoledFieldColors(),
+        )
+        Spacer(Modifier.height(8.dp))
+        ActionButton("Test and add", primary = true, enabled = url.isNotBlank()) {
+            val u = url; val n = name
+            message = "Checking..."
+            launchBackground {
+                val r = com.cncverse.stremiobridge.server.UpstreamAddons.test(u)
+                r.onSuccess { found ->
+                    com.cncverse.stremiobridge.server.UpstreamAddons.add(n.ifBlank { found }, u)
+                    items = com.cncverse.stremiobridge.server.UpstreamAddons.all()
+                    url = ""; name = ""
+                    message = "Added $found - clear the stream cache to see its links on titles you already opened"
+                }.onFailure { message = "Could not reach that add-on: ${it.message}" }
+            }
         }
         message?.let { Text(it, color = Green400, fontSize = 11.sp, modifier = Modifier.padding(top = 4.dp)) }
     }

@@ -49,6 +49,7 @@ fun SettingsScreen() {
             FormatterCard()
             StreamCacheCard()
             MediaServerCard()
+            UpstreamAddonsCard()
             BackupCard()
 
             // About Section

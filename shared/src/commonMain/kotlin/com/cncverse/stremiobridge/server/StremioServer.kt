@@ -222,6 +222,8 @@ object StremioServer {
         val probeHls: Boolean = true,
         /** Show the results once, when every extension has answered (up to 45 s) instead of after a few seconds. */
         val waitForAll: Boolean = true,
+        /** Adaptive (auto-resolution) HLS streams always play their highest resolution and are labelled with it. */
+        val bestHls: Boolean = true,
         /** After an episode's links are loaded, load the next episode's links in the background. */
         val prefetchNext: Boolean = true,
         /** Offer each rendition of an adaptive HLS playlist as its own stream (1080p / 720p / ...). */
@@ -375,6 +377,7 @@ object StremioServer {
             com.cncverse.stremiobridge.format.StreamFormatter.init(cacheDir)
             com.cncverse.stremiobridge.cache.StreamCacheManager.init(cacheDir)
             MediaServer.init(cacheDir)
+            UpstreamAddons.init(cacheDir)
             configLoadedFrom = cacheDir
         }
     }
@@ -854,7 +857,7 @@ object StremioServer {
         // Filters and ordering from the app's stream settings
         val p = streamPrefs
         // Adaptive HLS links report no quality: read their playlist for the real resolution
-        val probed = if (p.probeHls || p.splitHls) QualityProbe.enrich(streams, p.splitHls, 6_000L) else streams
+        val probed = if (p.probeHls || p.splitHls) QualityProbe.enrich(streams, p.splitHls, 6_000L, p.bestHls) else streams
         val sorted = sortStreamsByQuality(probed)
 
         val kept = filterStreamsByProfile(sorted, p)
@@ -1995,7 +1998,7 @@ object StremioServer {
         // different opt-ins / disables and admin enable/disable changes never share results.
         val activeSig = loadedApis.asSequence()
             .filter { api -> !isGloballyDisabled(api) && api.supportedTypes.any { it != "tv" } }
-            .map { it.internalName }.sorted().joinToString(",").hashCode()
+            .map { it.internalName }.sorted().plus(UpstreamAddons.active().map { it.url }).joinToString(",").hashCode()
         val aggCacheKey = "stream:generic:$type:$id:$activeSig"
 
         return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetchResult(aggCacheKey, null) {
@@ -2048,6 +2051,20 @@ object StremioServer {
                             if (res == null) {
                                 ServerState.debug("[STREAM_TIMEOUT] [${api.name}] Provider timed out after ${PROVIDER_TIMEOUT_MS}ms")
                                 StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Timed out after ${PROVIDER_TIMEOUT_MS}ms")
+                            }
+                        }
+                        if (answered.get() && accumulated.isNotEmpty()) publish()
+                    }
+                } + UpstreamAddons.active().map { up ->
+                    streamSearchScope.launch {
+                        withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
+                            try {
+                                val got = UpstreamAddons.fetch(up, type, id)
+                                accumulated.addAll(got)
+                                ServerState.info("[Upstream] ${up.name}: ${got.size} stream(s)")
+                            } catch (e: Throwable) {
+                                kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                                ServerState.warn("[Upstream] ${up.name}: ${e.message}")
                             }
                         }
                         if (answered.get() && accumulated.isNotEmpty()) publish()

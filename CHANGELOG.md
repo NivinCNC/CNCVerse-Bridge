@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.4.0
+
+- **Always the best resolution:** adaptive (auto-resolution) streams are now looked into and replaced by their highest-resolution rendition when the audio is inside the video, so they are labelled with the real maximum (e.g. 1080p) and play at it every time instead of starting low. Streams that keep audio in a separate track are left adaptive so sound is never lost. Through the media server, master playlists are narrowed to the best rendition too. Setting: Streams -> best HLS quality.
+- **Telegram / pencarimovie streaming:** new "Upstream add-ons" card in Settings. Paste the link of your pencarimovie server (or any Stremio add-on) and its streams are merged into every result list. Its Telegram files already stream with seeking, so they are passed through untouched. Included in settings backups.
+- AnimePahe: the earlier settings fix (1.3.0) is the intended fix; the older AnimePahe copy in the reference repository was not adopted because the installed extension is newer.
+
 ## 1.3.0
 
 - **AnimePahe and other extensions with saved settings:** plain-text settings (domain, user agent, Cloudflare cookie, provider lists) were handed to extensions in a form they could not read, so AnimePahe found nothing and logged JSON errors. They now read correctly.
