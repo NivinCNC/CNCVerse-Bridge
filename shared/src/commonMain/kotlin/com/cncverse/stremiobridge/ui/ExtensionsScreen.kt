@@ -593,44 +593,47 @@ private fun AddRepoDialog(
             if (existingRepos.isNotEmpty()) {
                 Text("Added Repos", color = TextSecondary, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.5.sp)
                 Spacer(Modifier.height(8.dp))
-                existingRepos.forEach { repo ->
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(AmoledCard2)
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                repo.name.ifBlank { repo.url.removePrefix("https://").removePrefix("http://").take(30) },
-                                color = TextPrimary,
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.Medium,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                repo.url,
-                                color = TextMuted,
-                                fontSize = 10.sp,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                        }
-                        if (repo.isLoading) {
-                            CircularProgressIndicator(color = Violet400, modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                        } else if (repo.url != com.cncverse.stremiobridge.repo.DEFAULT_REPO_URL) {
-                            IconButton(
-                                onClick = { onRemove(repo.url) },
-                                modifier = Modifier.size(28.dp),
-                            ) {
-                                Icon(Icons.Filled.Delete, contentDescription = "Remove", tint = Red400, modifier = Modifier.size(14.dp))
+                // Capped and scrollable, so the URL field and buttons stay on screen however many repos there are
+                Column(modifier = Modifier.heightIn(max = 280.dp).verticalScroll(rememberScrollState())) {
+                    existingRepos.forEach { repo ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(AmoledCard2)
+                                .padding(horizontal = 12.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    repo.name.ifBlank { repo.url.removePrefix("https://").removePrefix("http://").take(30) },
+                                    color = TextPrimary,
+                                    fontSize = 13.sp,
+                                    fontWeight = FontWeight.Medium,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    repo.url,
+                                    color = TextMuted,
+                                    fontSize = 10.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                            }
+                            if (repo.isLoading) {
+                                CircularProgressIndicator(color = Violet400, modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                            } else if (repo.url != com.cncverse.stremiobridge.repo.DEFAULT_REPO_URL) {
+                                IconButton(
+                                    onClick = { onRemove(repo.url) },
+                                    modifier = Modifier.size(28.dp),
+                                ) {
+                                    Icon(Icons.Filled.Delete, contentDescription = "Remove", tint = Red400, modifier = Modifier.size(14.dp))
+                                }
                             }
                         }
+                        Spacer(Modifier.height(6.dp))
                     }
-                    Spacer(Modifier.height(6.dp))
                 }
                 Spacer(Modifier.height(12.dp))
             }
