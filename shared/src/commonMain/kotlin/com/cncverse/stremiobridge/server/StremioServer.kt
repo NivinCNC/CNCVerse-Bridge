@@ -1741,7 +1741,6 @@ object StremioServer {
     private fun streamQualityRank(stream: StremioStream): Int = resolutionHeight(stream) ?: 0
 
     /** Lowest resolution that is ever shown. Streams with a KNOWN lower resolution are always dropped. */
-    private const val MIN_RESOLUTION_HEIGHT = 720
 
     /** The stream's resolution as a pixel height (2160, 1080, 720, 480, 360 ...), or null when it cannot be found. */
     fun resolutionHeight(stream: StremioStream): Int? =
@@ -1754,12 +1753,14 @@ object StremioServer {
      * The sort is stable, so inside one resolution the order chosen by the other settings (provider order,
      * size, hardsub first, anime audio) is kept.
      */
-    fun enforceResolutionOrder(streams: List<StremioStream>): List<StremioStream> =
-        streams
-            .map { it to resolutionHeight(it) }
-            .filter { (_, h) -> h == null || h >= MIN_RESOLUTION_HEIGHT }
-            .sortedByDescending { (_, h) -> h ?: 0 }
-            .map { it.first }
+    fun enforceResolutionOrder(streams: List<StremioStream>): List<StremioStream> {
+        // Settings -> Streams -> "Hide links below" (default 720p; "" = show all)
+        val min = streamPrefs.minResolution.filter { it.isDigit() }.toIntOrNull() ?: 0
+        val keyed = streams.map { it to resolutionHeight(it) }
+        // Never leave a title with no links just because every link is low quality
+        val visible = keyed.filter { (_, h) -> h == null || h >= min }.ifEmpty { keyed }
+        return visible.sortedByDescending { (_, h) -> h ?: 0 }.map { it.first }
+    }
 
     /**
      * Best quality first. Ties are broken the same way on every load (provider, then name, then link) -
@@ -1840,14 +1841,6 @@ object StremioServer {
         // 1. Exclude CAM / Screener rips
         if (profile.excludeCam) {
             result = result.filter { !isCamStream(it) }
-        }
-
-        // 1a. Below the minimum resolution (only when the resolution is known - unknown quality stays, listed last)
-        val minTier = tierRank(profile.minResolution.takeIf { it.isNotEmpty() })
-        if (minTier > 0) {
-            val kept = result.filter { val t = tierRank(detectStreamResolution(it)); t == 0 || t >= minTier }
-            // never leave the list empty because of this filter
-            if (kept.isNotEmpty()) result = kept
         }
 
         // 1b. Streams whose resolution cannot be found at all
