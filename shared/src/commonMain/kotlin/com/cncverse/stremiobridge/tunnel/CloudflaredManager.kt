@@ -18,6 +18,8 @@ object CloudflaredManager {
 
     var deviceIp: String = "127.0.0.1"
 
+    private val QUICK_URL = Regex("https://[a-z0-9-]+\\.trycloudflare\\.com")
+
     private val httpClient by lazy {
         HttpClient(CIO)
     }
@@ -79,10 +81,9 @@ object CloudflaredManager {
         }
         val token = TunnelSettings.token
         val publicUrl = TunnelSettings.publicUrl
-        if (token == null || publicUrl == null) {
-            ServerState.warn("Cloudflare Tunnel is not set up — add your tunnel token and domain in Settings")
-            return false
-        }
+        // No token / domain set: a free "quick tunnel" (random https://....trycloudflare.com link, no account)
+        val quick = token == null || publicUrl == null
+        if (quick) ServerState.info("No Cloudflare token set - starting a free quick tunnel (temporary https link)")
 
         stopTunnel()
 
@@ -94,7 +95,7 @@ object CloudflaredManager {
 
         scope.launch {
             try {
-                ServerState.info("Starting Cloudflare Tunnel for $publicUrl (local port $port) ...")
+                ServerState.info(if (quick) "Starting free Cloudflare quick tunnel (local port $port) ..." else "Starting Cloudflare Tunnel for $publicUrl (local port $port) ...")
 
                 // Get edge IPs (bypasses DNS issue on Android 10+)
                 val edgeIps = resolveCloudflareEdgeIps()
@@ -110,7 +111,7 @@ object CloudflaredManager {
                     cmd.addAll(listOf("--edge", ip))
                 }
 
-                cmd.addAll(listOf("run", "--token", token))
+                if (!quick && token != null) cmd.addAll(listOf("run", "--token", token))
 
                 val pb = ProcessBuilder(cmd)
                 pb.redirectErrorStream(true)
@@ -125,14 +126,22 @@ object CloudflaredManager {
                     line = reader.readLine() ?: break
                     if (line.isNotBlank()) {
                         // The token is never echoed by cloudflared, but keep it out of the log regardless
-                        ServerState.info("[cloudflared] ${line.replace(token, "***")}")
+                        ServerState.info("[cloudflared] ${if (token != null) line.replace(token, "***") else line}")
+                        if (quick) {
+                            QUICK_URL.find(line)?.value?.let { u ->
+                                if (ServerState.activeTunnelUrl.value != u) {
+                                    ServerState.activeTunnelUrl.value = u
+                                    ServerState.info("🚀 Free Cloudflare tunnel ready: $u  (Stremio add-on: $u/manifest.json)")
+                                }
+                            }
+                        }
 
-                        if (line.contains("Registered tunnel connection") || (line.contains("Connection ") && line.contains("registered"))) {
+                        if (!quick && line.contains("Registered tunnel connection") || (line.contains("Connection ") && line.contains("registered"))) {
                             if (ServerState.activeTunnelUrl.value != publicUrl) {
                                 ServerState.activeTunnelUrl.value = publicUrl
                                 ServerState.info("🚀 Cloudflare Tunnel connected: $publicUrl")
                             }
-                        } else if (line.contains("Unauthorized", ignoreCase = true) || line.contains("invalid token", ignoreCase = true)) {
+                        } else if (!quick && line.contains("Unauthorized", ignoreCase = true) || line.contains("invalid token", ignoreCase = true)) {
                             ServerState.error("Cloudflare rejected the tunnel token — check it in Settings")
                         }
                     }

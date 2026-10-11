@@ -50,7 +50,7 @@ fun TunnelSettingsCard() {
     AmoledCard(Modifier.fillMaxWidth()) {
         SectionTitle(
             "Cloudflare Tunnel",
-            "Stremio Mode serves the bridge over HTTPS through your own Cloudflare Tunnel and domain.",
+            "Stremio Mode serves the bridge over HTTPS. Leave this empty for a free temporary https link (changes each time it starts), or add your own Cloudflare Tunnel token and domain for a fixed link.",
         )
         OutlinedTextField(
             value = token,

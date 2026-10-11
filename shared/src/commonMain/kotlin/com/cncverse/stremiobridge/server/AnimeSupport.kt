@@ -292,14 +292,67 @@ object AnimeMatcher {
     }
 
     /** Search terms to try, most promising first (an extension's search can be picky about the spelling). */
-    fun searchTerms(info: AnimeInfo): List<String> {
+    fun searchTerms(info: AnimeInfo, max: Int = 9): List<String> {
         val out = ArrayList<String>()
-        for (t in info.titles) {
-            val cleaned = t.trim()
-            if (cleaned.isNotEmpty() && out.none { it.equals(cleaned, true) }) out += cleaned
-            if (out.size >= 3) break
+        fun add(t: String?) {
+            val c = t?.trim().orEmpty()
+            if (c.length >= 2 && out.none { it.equals(c, true) }) out += c
         }
-        return out
+        // 1. every known title as it is (romaji, English, synonyms)
+        for (t in info.titles) add(t)
+        // 2. without season / part words: sites often list "Title" and "Title 2nd Season" under the plain name
+        for (t in info.titles) add(base(normalize(t)))
+        // 3. before the subtitle ("Title: Long Subtitle" -> "Title")
+        for (t in info.titles) {
+            val head = t.substringBefore(":").substringBefore(" - ").trim()
+            if (head.length >= 4 && head.length < t.length) add(head)
+        }
+        // 4. first words only (a long title is easily mistyped on the site)
+        for (t in info.titles.take(2)) {
+            val w = base(normalize(t)).split(' ').filter { it.isNotBlank() }
+            if (w.size > 4) add(w.take(3).joinToString(" "))
+        }
+        return out.take(max)
+    }
+
+    /** Fuzzy pick for movies and series: close spelling, same year (or none), same season. */
+    fun pickFuzzy(results: List<SearchResult>, title: String, year: Int?, season: Int?, minScore: Double = 0.84): SearchResult? {
+        val nt = normalize(title)
+        val bt = base(nt)
+        if (bt.isEmpty()) return null
+        val wantSeason = season ?: seasonNumber(nt) ?: 1
+        var best: SearchResult? = null
+        var bestScore = 0.0
+        for (r in results) {
+            val nr = normalize(r.name)
+            val br = base(nr)
+            if (br.isEmpty()) continue
+            var sc = if (br == bt) 1.0 else dice(br, bt)
+            if (sc < 0.5) continue
+            val gotSeason = seasonNumber(nr)
+            // series sites list each season on its own, movies never have one
+            if (season != null && gotSeason != null && gotSeason != wantSeason) continue
+            if (season == null && gotSeason != null && gotSeason != 1 && seasonNumber(nt) == null) continue
+            val ry = r.year
+            if (year != null && ry != null) {
+                val d = kotlin.math.abs(ry - year)
+                if (d == 0) sc = minOf(1.0, sc + 0.04) else if (d > 1 && season == null) continue
+            }
+            if (sc > bestScore) { bestScore = sc; best = r }
+        }
+        return if (bestScore >= minScore) best else null
+    }
+
+    /** Other ways to type a title for the site's own search box. */
+    fun altQueries(title: String): List<String> {
+        val out = ArrayList<String>()
+        val head = title.substringBefore(":").substringBefore(" - ").trim()
+        if (head.length >= 3 && head != title) out += head
+        val n = normalize(title)
+        if (n.isNotBlank() && !n.equals(title, true)) out += n
+        val noThe = n.removePrefix("the ").trim()
+        if (noThe.isNotBlank() && noThe != n) out += noThe
+        return out.distinct()
     }
 }
 

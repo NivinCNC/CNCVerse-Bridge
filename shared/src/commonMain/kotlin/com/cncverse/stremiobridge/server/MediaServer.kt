@@ -350,6 +350,10 @@ object MediaServer {
             if (k.equals("user-agent", true)) hasUa = true
             if (!k.equals("host", true) && !k.equals("range", true) && !k.startsWith("X-Cnc-", true)) runCatching { b.header(k, v) }
         }
+        // A site whose Cloudflare check was solved before: its cookie + the browser User-Agent it was solved with
+        val cf = if (src.headers.keys.none { it.equals("cookie", true) })
+            runCatching { com.cncverse.stremiobridge.network.CfCookieStore.get(java.net.URI(url).host.orEmpty()) }.getOrNull() else null
+        if (cf != null) { b.header("Cookie", cf.cookie); b.header("User-Agent", cf.userAgent); hasUa = true }
         if (!hasUa) b.header("User-Agent", UA)
         if (range != null) b.header("Range", range)
         return b.build()
@@ -510,7 +514,8 @@ object MediaServer {
                         if (f >= 0 && e.ranges && f != off && e.have.contiguousEnd(f) == f) break // a seek: reconnect there
                         // Do not run far past what is being watched
                         val ahead = prefs.readAheadMb * 1024L * 1024L
-                        if (ahead > 0 && off - e.lastRead > ahead) {
+                        // An origin that cannot seek is downloaded completely, at full speed: stopping would mean starting over
+                        if (ahead > 0 && e.ranges && off - e.lastRead > ahead) {
                             if (System.currentTimeMillis() - e.lastAccess > 180_000) { e.stop = true; break }
                             Thread.sleep(400)
                             continue

@@ -105,7 +105,7 @@ object UpstreamAddons {
                     name = if (s.name.isNullOrBlank()) addon.name else s.name,
                     info = StreamInfo(
                         addonName = addon.name,
-                        linkName = s.title ?: label,
+                        linkName = listOfNotNull(s.name, s.title).joinToString(" ").ifBlank { label },
                         source = "upstream",
                         providerName = addon.name,
                     ),

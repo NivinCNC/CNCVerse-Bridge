@@ -378,6 +378,7 @@ object StremioServer {
             com.cncverse.stremiobridge.cache.StreamCacheManager.init(cacheDir)
             MediaServer.init(cacheDir)
             UpstreamAddons.init(cacheDir)
+            com.cncverse.stremiobridge.network.CfCookieStore.initIfNeeded(cacheDir)
             configLoadedFrom = cacheDir
         }
     }
@@ -861,9 +862,9 @@ object StremioServer {
         val sorted = sortStreamsByQuality(probed)
 
         val kept = filterStreamsByProfile(sorted, p)
-        val filtered = applyAnimeAudio(
+        val filtered = hardsubFirst(applyAnimeAudio(
             arrangeStreams(if (p.filterNonSeekable) SeekProbe.dropNonSeekable(kept) else kept, p), p
-        )
+        ))
 
         // Drop results whose link is exactly the same as an earlier (better ranked) one; different links are never merged
         val unique = filtered.distinctBy<StremioStream, Any> { it.url ?: it.externalUrl ?: it.infoHash?.let { h -> "magnet:$h" } ?: it.ytId?.let { y -> "yt:$y" } ?: it }
@@ -929,6 +930,20 @@ object StremioServer {
             SUB_TAG.containsMatchIn(text) -> "sub"
             else -> null
         }
+    }
+
+    /**
+     * Anime: links with the subtitles burned into the video (hardsub) go on top - they play in every
+     * player with no subtitle setup. Order inside each group is unchanged (best quality first). Lists
+     * without any hardsub link are left exactly as they are.
+     */
+    fun hardsubFirst(streams: List<StremioStream>): List<StremioStream> {
+        val hard = streams.filter { com.cncverse.stremiobridge.format.StreamVariables.subTypeOf(it) == "Hardsub" }
+        if (hard.isEmpty() || hard.size == streams.size) return streams
+        val dubs = streams.filter { audioKind(it) == "dub" }
+        // A dub list keeps the dub on top when the dub is what was asked for
+        val keep = if (streamPrefs.animeAudio == "dub" && dubs.isNotEmpty()) return streams else hard
+        return keep + streams.filter { it !in keep }
     }
 
     /** Anime: the preferred audio (sub or dub) first; optionally the other kind is hidden. */
@@ -2204,9 +2219,12 @@ object StremioServer {
         val requestedSeason = if (type == "series" && id.contains(":")) ExternalIds.parse(id)?.season else null
 
         val bestMatch = (if (anime != null) {
-            // Anime: fuzzy match against every known title; extensions index the same show under another spelling
-            var found = AnimeMatcher.pickBest(searchResults, anime)
-            if (found == null) {
+            // Anime: fuzzy match against every known title (romaji, English, synonyms) and the season;
+            // results of all spellings are pooled so the best one wins, not the first one over the bar
+            val pool = ArrayList<SearchResult>(searchResults)
+            var found = AnimeMatcher.pickBest(pool, anime)
+            var foundScore = found?.let { AnimeMatcher.score(it, anime, null) } ?: 0.0
+            if (foundScore < 0.92) {
                 for (term in AnimeMatcher.searchTerms(anime).filter { !it.equals(title, true) }) {
                     val more = try {
                         SearchLoadCache.getSearch(cacheKey, term)
@@ -2215,8 +2233,10 @@ object StremioServer {
                         kotlinx.coroutines.currentCoroutineContext().ensureActive()
                         emptyList()
                     }
-                    found = AnimeMatcher.pickBest(more, anime)
-                    if (found != null) break
+                    more.filter { m -> pool.none { it.url == m.url } }.forEach { pool += it }
+                    found = AnimeMatcher.pickBest(pool, anime)
+                    foundScore = found?.let { AnimeMatcher.score(it, anime, null) } ?: 0.0
+                    if (foundScore >= 0.92) break
                 }
             }
             found
@@ -2229,9 +2249,26 @@ object StremioServer {
             val seasonRx = Regex("^" + Regex.escape(wanted) + " (?:season 0*$requestedSeason|s0*$requestedSeason)(?: |$)")
             searchResults.find { r -> seasonRx.containsMatchIn(normalizeTitle(r.name)) }
                 ?: pickBestMatch(searchResults, title, year)
+                ?: AnimeMatcher.pickFuzzy(searchResults, title, year, requestedSeason)
         } else {
             pickBestMatch(searchResults, title, year)
-        }) ?: run {
+        } ?: AnimeMatcher.pickFuzzy(searchResults, title, year, requestedSeason)
+        ) ?: (if (anime == null) {
+            // Nothing close in the first answer: type the title another way (no subtitle, no "The") and try fuzzy again
+            var alt: SearchResult? = null
+            for (q in AnimeMatcher.altQueries(title)) {
+                val more = try {
+                    SearchLoadCache.getSearch(cacheKey, q)
+                        ?: api.search(q).also { SearchLoadCache.putSearch(cacheKey, q, it) }
+                } catch (e: Throwable) {
+                    kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                    emptyList()
+                }
+                alt = pickBestMatch(more, title, year) ?: AnimeMatcher.pickFuzzy(more, title, year, requestedSeason)
+                if (alt != null) break
+            }
+            alt
+        } else null) ?: run {
             ServerState.debug("[${api.name}] No result matches '$title'" + (year?.let { " ($it)" } ?: ""))
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "No result matches '$title'")
             return emptyList()

@@ -280,7 +280,7 @@ object StreamVariables {
         "stream.resolution", "stream.quality", "stream.specs", "stream.visualTags", "stream.encode",
         "stream.audioTags", "stream.audioChannels", "stream.streamType", "stream.size",
         "stream.languages", "stream.subtitles", "stream.seasonEpisode", "stream.season",
-        "stream.episode", "stream.source", "stream.label", "stream.filename", "stream.name", "stream.title",
+        "stream.episode", "stream.audioKind", "stream.subType", "stream.source", "stream.label", "stream.filename", "stream.name", "stream.title",
     )
 
     private fun rx(p: String) = Regex("(?<![A-Za-z0-9])(?:$p)(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
@@ -452,6 +452,31 @@ object StreamVariables {
     fun addonOf(stream: StremioStream): String? =
         stream.info?.addonName ?: stream.name?.substringAfterLast('\n')?.substringBefore(" - ")?.takeIf { it.isNotBlank() }
 
+    private val DUB_RX = Regex("(?<![A-Za-z0-9])dub(?:bed)?(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
+    private val SUB_RX = Regex("(?<![A-Za-z0-9])sub(?:bed|s)?(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
+    private val HARDSUB_RX = Regex("hard[ _-]?sub(?:bed|s)?|(?<![A-Za-z0-9])h-?sub(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
+    private val SOFTSUB_RX = Regex("soft[ _-]?sub(?:bed|s)?|(?<![A-Za-z0-9])s-?sub(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
+
+    /** "Dub" / "Sub" for anime links the extension labelled; null when it did not say. */
+    fun audioKindOf(stream: StremioStream): String? {
+        val t = listOfNotNull(stream.info?.linkName, stream.title, stream.name, stream.info?.source).joinToString(" ")
+        return when {
+            DUB_RX.containsMatchIn(t) -> "Dub"
+            SUB_RX.containsMatchIn(t) || HARDSUB_RX.containsMatchIn(t) || SOFTSUB_RX.containsMatchIn(t) -> "Sub"
+            else -> null
+        }
+    }
+
+    /** "Hardsub" (subtitles burned into the video) or "Softsub"; null when unknown. */
+    fun subTypeOf(stream: StremioStream): String? {
+        val t = listOfNotNull(stream.info?.linkName, stream.title, stream.name, stream.info?.source).joinToString(" ")
+        return when {
+            HARDSUB_RX.containsMatchIn(t) -> "Hardsub"
+            SOFTSUB_RX.containsMatchIn(t) -> "Softsub"
+            else -> null
+        }
+    }
+
     fun build(stream: StremioStream, ctx: StreamRequestContext): Map<String, Any?> {
         val info = stream.info
         val linkText = info?.linkName ?: stream.title
@@ -477,6 +502,7 @@ object StreamVariables {
         val episode = ctx.episode ?: sxe?.groupValues?.get(2)?.toIntOrNull()
         val seasonEpisode = if (season != null && episode != null)
             listOf("S" + season.toString().padStart(2, '0'), "E" + episode.toString().padStart(2, '0'))
+        else if (episode != null) listOf("E" + episode.toString().padStart(2, '0'))
         else emptyList()
 
         val addon = info?.addonName
@@ -501,6 +527,8 @@ object StreamVariables {
             "stream.seasonepisode" to seasonEpisode,
             "stream.season" to season?.toLong(),
             "stream.episode" to episode?.toLong(),
+            "stream.audiokind" to audioKindOf(stream),
+            "stream.subtype" to subTypeOf(stream),
             // Server/extractor the extension reports (e.g. "FslServer", "HubCloud");
             // empty when it just repeats the extension name, so templates can use ::exists
             "stream.source" to source,
@@ -593,6 +621,7 @@ object StreamFormatter {
             nameTemplate = "🌀 CNCVerse {stream.resolution::=2160p[\"❄️ 4K\"||\"{stream.resolution::=1080p[\"🧊 {stream.resolution::default('Auto')}\"||\"🎬 {stream.resolution::default('Auto')}\"]}\"]} • {addon.name}",
             descriptionTemplate = "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('CNCVerse stream')}\"]}\n" +
                 "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
+                "{stream.audiokind::exists[\"🗣️ {stream.audiokind}{stream.subtype::exists[\" • {stream.subtype}\"||\"\"]}\"||\"\"]}\n" +
                 "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::default('Auto')} • {stream.streamType::default('HLS')}\"]}\n" +
                 "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}\n" +
                 "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}\n" +
@@ -635,6 +664,7 @@ object StreamFormatter {
     const val PRESET_DESCRIPTION =
         "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('CNCVerse stream')}\"]}\n" +
         "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
+        "{stream.audiokind::exists[\"🗣️ {stream.audiokind}{stream.subtype::exists[\" • {stream.subtype}\"||\"\"]}\"||\"\"]}\n" +
         "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::default('Auto')} • {stream.streamType::default('HLS')}\"]}\n" +
         "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}\n" +
         "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}\n" +
@@ -654,7 +684,11 @@ object StreamFormatter {
         // Never configured: the formatter starts on, with the CNCVerse preset
         val loaded = runCatching { if (f.exists()) json.decodeFromString<StreamFormatterConfig>(f.readText()) else null }
             .onFailure { ServerState.warn("Stream formatter config unreadable: ${it.message}") }
-            .getOrNull() ?: StreamFormatterConfig(enabled = true, nameTemplate = PRESET_NAME, descriptionTemplate = PRESET_DESCRIPTION)
+            .getOrNull()?.let { c ->
+                // Saved copy of the previous built-in layout: move it to the new one (adds the Sub/Dub/Hardsub line)
+                val oldDesc = PRESET_DESCRIPTION.lines().filter { !it.contains("stream.audiokind") }.joinToString("\n")
+                if (c.descriptionTemplate.replace("\\n", "\n") == oldDesc || c.descriptionTemplate == oldDesc) c.copy(descriptionTemplate = PRESET_DESCRIPTION) else c
+            } ?: StreamFormatterConfig(enabled = true, nameTemplate = PRESET_NAME, descriptionTemplate = PRESET_DESCRIPTION)
         runCatching { install(loaded) }.onFailure {
             ServerState.warn("Stream formatter disabled — template error: ${it.message}")
             config = loaded.copy(enabled = false)
@@ -798,10 +832,10 @@ object StreamFormatter {
 
     /** Season/episode from a Stremio stream id like "tt0903747:1:3" or "tmdb:1396:1:3". */
     fun contextFromId(type: String, id: String): StreamRequestContext {
-        if (type != "series") return StreamRequestContext()
+        if (type != "series" && type != "anime") return StreamRequestContext()
         // Every id form (tt…, tmdb:, tvdb:, kitsu:ID:EP…) - "kitsu:7442:2" is episode 2, not season 7442
         val ext = com.cncverse.stremiobridge.server.ExternalIds.parse(id) ?: return StreamRequestContext()
-        return if (ext.season != null && ext.episode != null) StreamRequestContext(season = ext.season, episode = ext.episode) else StreamRequestContext()
+        return if (ext.episode != null) StreamRequestContext(season = ext.season, episode = ext.episode) else StreamRequestContext()
     }
 
     /** Sample streams for the admin preview. */

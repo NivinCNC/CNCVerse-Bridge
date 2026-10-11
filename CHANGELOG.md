@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.4.1
+
+- **Anime search (AnimePahe and others):** every known name of the show (romaji, English, synonyms from AniList / Kitsu / MyAnimeList) is searched, also without season words, without the subtitle and by its first words. The results of all spellings are pooled and the best fit wins, with the season checked against the name ("2nd Season", "S2", "II").
+- **Fuzzy search for movies and series:** when no result matches the exact title, a close spelling is accepted (same year, same season), and the title is retried without a subtitle / leading "The".
+- **Hardsub first (anime):** links with the subtitles burned in are listed on top; inside each group the best quality stays first.
+- **Formatter:** anime episodes (kitsu / MAL / AniList ids, any type) now fill the season/episode fields, new fields `{stream.audiokind}` (Sub / Dub) and `{stream.subtype}` (Hardsub / Softsub), and a "Sub / Dub / Hardsub" line in the default layout. A saved copy of the old default layout is upgraded automatically.
+- **Media server:** links that cannot seek are always downloaded completely instead of pausing the download. Headers (Referer, User-Agent, Cookie) from the extension are sent on every request of the media server - verified end to end. Sites whose Cloudflare check was solved are sent their saved cookie and the matching User-Agent.
+- **Cloudflare:** a solved check is saved on the device (6 hours) and reused for later requests instead of solving again; one solver per site at a time; longer wait for the check to finish.
+- **Free https link:** with no tunnel token set, Stremio Mode starts a free Cloudflare quick tunnel (random https://...trycloudflare.com link, no account). Your own token and domain still work as before.
+- Streams from Upstream add-ons now read their quality from the add-on's names, so they sort properly.
+
 ## 1.4.0
 
 - **Always the best resolution:** adaptive (auto-resolution) streams are now looked into and replaced by their highest-resolution rendition when the audio is inside the video, so they are labelled with the real maximum (e.g. 1080p) and play at it every time instead of starting low. Streams that keep audio in a separate track are left adaptive so sound is never lost. Through the media server, master playlists are narrowed to the best rendition too. Setting: Streams -> best HLS quality.

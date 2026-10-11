@@ -14,25 +14,52 @@ import java.util.concurrent.TimeUnit
 
 class CloudflareKiller : Interceptor {
     override fun intercept(chain: Interceptor.Chain): Response {
-        val request = chain.request()
+        var request = chain.request()
+        val host = request.url.host
+        appContext()?.let { com.cncverse.stremiobridge.network.CfCookieStore.initIfNeeded(it.cacheDir.path) }
+
+        // A site solved before: send its saved clearance straight away (no challenge, no WebView)
+        val saved = com.cncverse.stremiobridge.network.CfCookieStore.get(host)
+        if (saved != null && request.header("Cookie").isNullOrBlank()) {
+            request = request.newBuilder().header("Cookie", saved.cookie).header("User-Agent", saved.userAgent).build()
+        }
         var response = chain.proceed(request)
 
-        if (response.code == 503 || response.code == 403) {
-            val server = response.header("Server") ?: response.header("server")
-            if (server?.contains("cloudflare", ignoreCase = true) == true) {
-                ServerState.info("Cloudflare bypass needed for ${request.url}")
-                val result = bypassCloudflare(request.url.toString())
-                if (result != null) {
-                    val newRequest = request.newBuilder()
-                        .header("Cookie", result.cookie)
-                        .header("User-Agent", result.userAgent)
-                        .build()
-                    response.close()
-                    response = chain.proceed(newRequest)
-                }
+        val challenged = (response.code == 503 || response.code == 403 || response.code == 429) &&
+            (response.header("Server")?.let { it.contains("cloudflare", true) || it.contains("ddos-guard", true) } == true ||
+                response.header("cf-mitigated")?.contains("challenge", true) == true)
+        if (challenged) {
+            // The saved clearance did not work (expired / other UA): drop it and solve again, one solver per site at a time
+            if (saved != null) com.cncverse.stremiobridge.network.CfCookieStore.forget(host)
+            ServerState.info("Cloudflare challenge on ${request.url.host} - solving it")
+            val result = synchronized(lockFor(host)) {
+                // Another request may have solved it while this one waited
+                com.cncverse.stremiobridge.network.CfCookieStore.get(host)?.takeIf { it.cookie != saved?.cookie }?.let { CfResult(it.cookie, it.userAgent) }
+                    ?: bypassCloudflare(request.url.toString())
+            }
+            if (result != null) {
+                com.cncverse.stremiobridge.network.CfCookieStore.put(host, result.cookie, result.userAgent)
+                val newRequest = request.newBuilder()
+                    .header("Cookie", result.cookie)
+                    .header("User-Agent", result.userAgent)
+                    .build()
+                response.close()
+                response = chain.proceed(newRequest)
+            } else {
+                ServerState.warn("Cloudflare challenge on $host could not be solved in time")
             }
         }
         return response
+    }
+
+    private fun lockFor(host: String): Any = locks.getOrPut(host) { Any() }
+
+    private fun appContext(): Context? = try {
+        Class.forName("android.app.ActivityThread").getMethod("currentApplication").invoke(null) as? Context
+    } catch (e: Exception) { null }
+
+    private companion object {
+        val locks = java.util.concurrent.ConcurrentHashMap<String, Any>()
     }
 
     data class CfResult(val cookie: String, val userAgent: String)
@@ -57,7 +84,7 @@ class CloudflareKiller : Interceptor {
                 
                 webView.webViewClient = object : WebViewClient() {
                     var checkCount = 0
-                    val maxChecks = 15
+                    val maxChecks = 30
                     
                     override fun onPageFinished(view: WebView?, url: String?) {
                         checkCookies()
@@ -85,7 +112,7 @@ class CloudflareKiller : Interceptor {
                 latch.countDown()
             }
         }
-        latch.await(20, TimeUnit.SECONDS)
+        latch.await(40, TimeUnit.SECONDS)
         return result
     }
 }
