@@ -2,6 +2,7 @@
 
 ## 1.4.2
 
+- **AnimePahe:** its subbed links are recognised as hardsub (burned-in subtitles) and listed first. Episode lists without episode numbers (as in AnimePahe) are picked by position.
 - **Free https link now reachable:** "Enable Stremio Mode" on the Server screen no longer demands a tunnel token and domain first. Turn it on (the app downloads cloudflared once) and the free https link appears as the Stremio URL; add your own token in Settings -> Cloudflare Tunnel only for a fixed link.
 
 ## 1.4.1

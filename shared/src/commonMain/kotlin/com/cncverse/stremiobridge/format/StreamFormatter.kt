@@ -473,6 +473,8 @@ object StreamVariables {
         return when {
             HARDSUB_RX.containsMatchIn(t) -> "Hardsub"
             SOFTSUB_RX.containsMatchIn(t) -> "Softsub"
+            // AnimePahe (kwik) always burns the subtitles into its non-dub video
+            audioKindOf(stream) == "Sub" && (stream.info?.addonName ?: stream.info?.providerName).orEmpty().contains("animepahe", true) -> "Hardsub"
             else -> null
         }
     }
