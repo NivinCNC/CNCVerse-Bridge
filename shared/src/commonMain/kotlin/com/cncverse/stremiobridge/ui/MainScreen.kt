@@ -81,6 +81,7 @@ fun CNCVerseTheme(content: @Composable () -> Unit) {
 enum class NavDest(val label: String, val icon: ImageVector) {
     Server(     "Server",     Icons.Filled.PlayArrow),
     Extensions( "Extensions", Icons.Filled.Extension),
+    History(    "History",    Icons.Filled.History),
     Logs(       "Logs",       Icons.AutoMirrored.Filled.List),
     Settings(   "Settings",   Icons.Filled.Settings),
 }
@@ -338,6 +339,7 @@ private fun NavContent(
                 onRefreshRepos = onRefreshRepos,
                 onOpenSettings = onOpenSettings,
             )
+            NavDest.History -> HistoryScreen(onCopy = onCopyLogs)
             NavDest.Logs -> LogsScreen(
                 logs = logs,
                 onCopyLogs = onCopyLogs,

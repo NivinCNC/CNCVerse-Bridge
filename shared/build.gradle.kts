@@ -63,6 +63,7 @@ kotlin {
                 // Plugin runtime dependencies
                 implementation(libs.okhttp)
                 implementation(libs.jsoup)
+                implementation(libs.ksoup)
                 implementation(libs.jackson.module.kotlin)
                 // cloudstream-api.jar is built against kotlinx-datetime 0.7 (MainAPI.addDate uses the
                 // kotlin.time.Instant API). Without this, 0.6.0 came in transitively and every episode

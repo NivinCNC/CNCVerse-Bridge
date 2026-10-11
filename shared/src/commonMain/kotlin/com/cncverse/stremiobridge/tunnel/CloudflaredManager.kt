@@ -119,30 +119,38 @@ object CloudflaredManager {
                 // Each attempt: a command, the public link it should end up with (null = read it from cloudflared),
                 // and the metrics port whose /quicktunnel endpoint reports the link
                 class Attempt(val label: String, val cmd: List<String>, val url: String?, val metricsPort: Int = 0)
-                val attempts = ArrayList<Attempt>()
+                val attempts = ArrayList<() -> Attempt?>()
                 if (!quick && token != null) {
-                    attempts += Attempt("named", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--token", token)) }, publicUrl)
+                    attempts += { Attempt("named", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--token", token)) }, publicUrl) }
                 } else {
                     // 0) The quick tunnel of the last run: the link stays the same while Cloudflare still honours it
-                    savedQuickTunnel(workDir)?.let { q ->
-                        attempts += Attempt("quick (saved link)", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--cred-file", q.credsFile, q.id)) }, "https://${q.hostname}")
+                    attempts += {
+                        savedQuickTunnel(workDir)?.let { q ->
+                            Attempt("quick (saved link)", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--cred-file", q.credsFile, q.id)) }, "https://${q.hostname}")
+                        }
                     }
                     // 1) Create the quick tunnel ourselves (this app's DNS works on Android; cloudflared's own lookup does not), then run it
-                    createQuickTunnel(workDir)?.let { q ->
-                        attempts += Attempt("quick (api)", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--cred-file", q.credsFile, q.id)) }, "https://${q.hostname}")
+                    // (built lazily: it overwrites the saved credentials, so only when the saved link did not work)
+                    attempts += {
+                        createQuickTunnel(workDir)?.let { q ->
+                            Attempt("quick (api)", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--cred-file", q.credsFile, q.id)) }, "https://${q.hostname}")
+                        }
                     }
                     // 2) cloudflared's own quick tunnel, started the way pencarimovie-server does it: ingress config file,
                     //    metrics endpoint (its /quicktunnel answer is the live link), transport auto, many retries
                     val metrics = freePort()
                     val cfg = writeIngressConfig(workDir, localUrl)
-                    attempts += Attempt(
-                        "quick (cloudflared)",
-                        base("auto").also { it.addAll(listOf("--url", localUrl, "--config", cfg.absolutePath, "--metrics", "127.0.0.1:$metrics")) },
-                        null, metrics,
-                    )
+                    attempts += {
+                        Attempt(
+                            "quick (cloudflared)",
+                            base("auto").also { it.addAll(listOf("--url", localUrl, "--config", cfg.absolutePath, "--metrics", "127.0.0.1:$metrics")) },
+                            null, metrics,
+                        )
+                    }
                 }
 
-                for ((idx, at) in attempts.withIndex()) {
+                for ((idx, mk) in attempts.withIndex()) {
+                    val at = mk() ?: continue
                     val pb = ProcessBuilder(at.cmd)
                     pb.redirectErrorStream(true)
                     applyTunnelEnvironment(pb, workDir)

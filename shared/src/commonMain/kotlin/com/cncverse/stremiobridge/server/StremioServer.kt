@@ -38,6 +38,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
@@ -380,7 +381,7 @@ object StremioServer {
             com.cncverse.stremiobridge.format.StreamFormatter.init(cacheDir)
             com.cncverse.stremiobridge.cache.StreamCacheManager.init(cacheDir)
             MediaServer.init(cacheDir)
-            UpstreamAddons.init(cacheDir)
+            UpstreamAddons.init(cacheDir); com.cncverse.stremiobridge.state.StreamHistory.init(cacheDir)
             com.cncverse.stremiobridge.network.CfCookieStore.initIfNeeded(cacheDir)
             configLoadedFrom = cacheDir
         }
@@ -854,6 +855,7 @@ object StremioServer {
     private suspend fun ApplicationCall.respondStreams() {
         val type = parameters["type"] ?: return respond(HttpStatusCode.BadRequest)
         val id   = parameters["id"]   ?: return respond(HttpStatusCode.BadRequest)
+        val requestStart = System.currentTimeMillis()
 
         val streams = withContext(pluginDispatcher) { buildStreams(type, id) }
             // Archive downloads (".zip" season packs) can never play in any player
@@ -901,6 +903,24 @@ object StremioServer {
             }
             .map { s -> s.subtitles?.let { subs -> s.copy(subtitles = subs.map { it.copy(lang = com.cncverse.stremiobridge.format.SubtitleLangs.normalize(it.lang)) }) } ?: s }
         respond(StremioStreamResponse(out))
+        runCatching {
+            val parts = id.split(':')
+            val ep = if ((type == "series" || type == "anime") && parts.size >= 3) {
+                if (parts[0] == "kitsu" || parts[0] == "mal" || parts[0] == "anilist" || parts[0] == "anidb") "E${parts.last()}"
+                else "S${parts[parts.size - 2]} E${parts.last()}"
+            } else ""
+            com.cncverse.stremiobridge.state.StreamHistory.add(
+                com.cncverse.stremiobridge.state.HistoryEntry(
+                    time = System.currentTimeMillis(), type = type, id = id,
+                    title = com.cncverse.stremiobridge.state.StreamHistory.titleFor(id) ?: id.substringBefore(':'),
+                    episode = ep, found = streams.size, shown = out.size,
+                    tookMs = System.currentTimeMillis() - requestStart,
+                    providers = streams.groupingBy { it.info?.addonName ?: it.name ?: "?" }.eachCount()
+                        .entries.sortedByDescending { it.value }.map { "${it.key}: ${it.value}" },
+                    lines = out.map { st -> listOfNotNull(st.name, st.title).joinToString(" | ").replace("\n", " / ").replace("\r", "") },
+                )
+            )
+        }
         if (p.prefetchNext) prefetchNextEpisode(type, id)
     }
 
@@ -1927,6 +1947,8 @@ object StremioServer {
     private val STREAM_DEADLINE_MS = 45_000L
     /** Answer with what has loaded after this long; the rest load into the cache until STREAM_DEADLINE_MS. */
     private val STREAM_SOFT_DEADLINE_MS = 8_000L
+    /** Never keep a client waiting longer than this for the first answer. */
+    private val STREAM_ANSWER_CAP_MS = 26_000L
     private val PROVIDER_TIMEOUT_MS = 38_000L
     private val streamSearchScope = CoroutineScope(pluginDispatcher + SupervisorJob())
 
@@ -2096,6 +2118,7 @@ object StremioServer {
                     return@getOrFetchResult com.cncverse.stremiobridge.cache.StreamCacheManager.FetchResult(emptyList())
                 }
                 val (title, year) = resolved
+                com.cncverse.stremiobridge.state.StreamHistory.noteTitle(id, title)
                 ServerState.debug("Media resolve success: title='$title', year=$year")
                 // tt / tmdb / tvdb ids of anime: collect every alternative name (AniList, Kitsu, MyAnimeList) too
                 val animeNames = animeInfo ?: if ((type == "series" || type == "anime") && ext.scheme in setOf("imdb", "tmdb", "tvdb")) {
@@ -2120,6 +2143,13 @@ object StremioServer {
 
                 // Exclude live-TV-only extensions from generic TMDB VOD searches —
                 // they don't carry on-demand movie/series content.
+                // Plugins still loading (app just started): wait for them instead of answering "0 streams"
+                if (!com.cncverse.stremiobridge.plugin.GlobalPluginManager.isPluginsLoaded.value) {
+                    ServerState.info("[Streams] plugins still loading - waiting up to 20 s before searching")
+                    withTimeoutOrNull(20_000) {
+                        com.cncverse.stremiobridge.plugin.GlobalPluginManager.isPluginsLoaded.first { it }
+                    }
+                }
                 val activePlugins = loadedApis.filter { api ->
                     !isGloballyDisabled(api) &&
                     api.supportedTypes.any { it != "tv" }
@@ -2177,7 +2207,10 @@ object StremioServer {
                 val waitAll = streamPrefs.waitForAll
                 withTimeoutOrNull(STREAM_DEADLINE_MS) {
                     while (jobs.any { it.isActive }) {
-                        if (!waitAll && accumulated.isNotEmpty() && System.currentTimeMillis() - started >= STREAM_SOFT_DEADLINE_MS) break
+                        val t = System.currentTimeMillis() - started
+                        if (!waitAll && accumulated.isNotEmpty() && t >= STREAM_SOFT_DEADLINE_MS) break
+                        // Clients give up after ~30 s: answer before that even with nothing; the rest keeps filling the cache
+                        if (t >= STREAM_ANSWER_CAP_MS) break
                         delay(200)
                     }
                 }

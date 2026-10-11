@@ -9,6 +9,11 @@
 - **Better names:** `{stream.host}` (the site a link comes from) tells apart links that looked identical; the name line shows resolution, extension and Sub / Dub / Hardsub; the default layout was reworked (an old saved default is upgraded automatically). Links from Upstream add-ons keep their own names and are no longer reformatted.
 - **Free tunnel link:** the quick tunnel of the last run is reused on the next start, so the link stays the same for as long as Cloudflare keeps it alive. A new link is only made when the old one is gone. Cloudflare does not promise a fixed link for free tunnels without an account; for a link that never changes use your own tunnel token and domain (Settings -> Cloudflare Tunnel).
 
+- **History tab:** every answered request is listed (title, season / episode, how many links were found and shown, the count per extension, how long it took). Tap one to see the exact list the player received (name and description of each link); "Copy list" copies it.
+- **Results that did not show up:** a request that arrives while the extensions are still loading now waits for them (up to 20 s) instead of answering with 0 links, and the first answer is never held longer than 26 s (clients give up around 30 s); links that arrive later are still put into the cache for the next try.
+- **Free tunnel, second start:** the saved link's credentials were overwritten by a new tunnel request before the saved link had been tried, so the second start always failed. The new tunnel is now only requested if the saved one did not connect.
+- **AnimePahe and other extensions:** the ksoup HTML library (needed by AnimePahe, "NoClassDefFoundError ... Ksoup") is now included.
+
 ## 1.4.3
 
 - **Free Cloudflare tunnel:** cloudflared is now started the way pencarimovie-server starts it - transport auto (QUIC, falling back to HTTP/2), a writable HOME, the system CA store (`/system/etc/security/cacerts`) on Android, an ingress config file, loopback origin (`127.0.0.1`) and many retries. The free link is read from cloudflared's local metrics endpoint (`/quicktunnel`) instead of only scraping the log. The app-created quick tunnel is still tried first, the metrics-based start is the fallback; each attempt is given up after 40 s.
