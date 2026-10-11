@@ -862,9 +862,10 @@ object StremioServer {
         val sorted = sortStreamsByQuality(probed)
 
         val kept = filterStreamsByProfile(sorted, p)
-        val filtered = hardsubFirst(applyAnimeAudio(
+        // Whatever the settings above did, the list that goes out is sorted by resolution and has nothing below 720p
+        val filtered = enforceResolutionOrder(hardsubFirst(applyAnimeAudio(
             arrangeStreams(if (p.filterNonSeekable) SeekProbe.dropNonSeekable(kept) else kept, p), p
-        ))
+        )))
 
         // Drop results whose link is exactly the same as an earlier (better ranked) one; different links are never merged
         val unique = filtered.distinctBy<StremioStream, Any> { it.url ?: it.externalUrl ?: it.infoHash?.let { h -> "magnet:$h" } ?: it.ytId?.let { y -> "yt:$y" } ?: it }
@@ -1700,26 +1701,29 @@ object StremioServer {
 
     // ── Quality sorting ───────────────────────────────────────────────────────
 
-    /** Sort rank from the stream's own resolution (never the release/page title). */
-    private fun tierRank(res: String?): Int =
-        when (res) {
-            "2160p" -> 5
-            "1080p" -> 4
-            "720p" -> 3
-            "480p" -> 2
-            "360p" -> 1
-            else -> 0
-        }
+    /** Higher is listed earlier: the stream's real resolution height (unknown = 0, listed after every known one). */
+    private fun streamQualityRank(stream: StremioStream): Int = resolutionHeight(stream) ?: 0
+
+    /** Lowest resolution that is ever shown. Streams with a KNOWN lower resolution are always dropped. */
+    private const val MIN_RESOLUTION_HEIGHT = 720
+
+    /** The stream's resolution as a pixel height (2160, 1080, 720, 480, 360 ...), or null when it cannot be found. */
+    fun resolutionHeight(stream: StremioStream): Int? =
+        com.cncverse.stremiobridge.format.StreamVariables.resolutionOf(stream)
+            ?.filter { it.isDigit() }?.toIntOrNull()?.takeIf { it > 0 }
 
     /**
-     * Higher is listed earlier. With a resolution cap (Settings -> Streams) everything above the cap
-     * ranks below unknown quality, closest-to-the-cap first, so the first links always fit the device.
+     * Final, settings-independent pass over every list that is sent out: streams whose resolution is known
+     * and below 720p are removed, and the rest is ordered by resolution, highest first (unknown last).
+     * The sort is stable, so inside one resolution the order chosen by the other settings (provider order,
+     * size, hardsub first, anime audio) is kept.
      */
-    private fun streamQualityRank(stream: StremioStream): Int {
-        val tier = tierRank(detectStreamResolution(stream))
-        val cap = tierRank(streamPrefs.maxResolution.takeIf { it.isNotEmpty() })
-        return if (cap > 0 && tier > cap) -(tier - cap) else tier * 10
-    }
+    fun enforceResolutionOrder(streams: List<StremioStream>): List<StremioStream> =
+        streams
+            .map { it to resolutionHeight(it) }
+            .filter { (_, h) -> h == null || h >= MIN_RESOLUTION_HEIGHT }
+            .sortedByDescending { (_, h) -> h ?: 0 }
+            .map { it.first }
 
     /**
      * Best quality first. Ties are broken the same way on every load (provider, then name, then link) -

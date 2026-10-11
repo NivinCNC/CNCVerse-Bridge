@@ -24,6 +24,7 @@ object CloudflaredManager {
     var deviceIp: String = "127.0.0.1"
 
     private val QUICK_URL = Regex("https://(?!api\\.)[a-z0-9-]+\\.trycloudflare\\.com")
+    private val QUICK_HOST = Regex("(?<![a-z0-9-])(?!api\\.)[a-z0-9-]+\\.trycloudflare\\.com")
 
     private val httpClient by lazy {
         HttpClient(CIO)
@@ -77,7 +78,8 @@ object CloudflaredManager {
      * Runs the user's own Cloudflare Tunnel ([TunnelSettings]: token + public
      * hostname). The hostname's route (service `http://localhost:<port>`) is set
      * up in the Cloudflare dashboard; `--url` covers tunnels without one.
-     * Returns false (and logs why) when the tunnel isn't set up in Settings.
+     * Without a token a free "quick tunnel" (random https://....trycloudflare.com link) is started.
+     * Returns false (and logs why) only when nothing could be started.
      */
     fun startTunnel(port: Int): Boolean {
         if (tunnelProcess != null && tunnelProcess?.isAlive == true) {
@@ -94,6 +96,8 @@ object CloudflaredManager {
 
         val binaryPath = getCloudflaredBinaryPath()
         setFileExecutable(binaryPath)
+        val workDir = File(binaryPath).parentFile?.takeIf { it.canWrite() }
+            ?: File(System.getProperty("java.io.tmpdir") ?: ".")
 
         val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
         tunnelScope = scope
@@ -104,43 +108,69 @@ object CloudflaredManager {
 
                 // Get edge IPs (bypasses DNS issue on Android 10+)
                 val edgeIps = resolveCloudflareEdgeIps()
-                fun base(): MutableList<String> {
-                    val c = mutableListOf(binaryPath, "tunnel", "--url", "http://${deviceIp}:$port", "--edge-ip-version", "4", "--no-autoupdate")
+                // The bridge listens on 0.0.0.0, so the loopback address always reaches it
+                val localUrl = "http://127.0.0.1:$port"
+                fun base(ipVersion: String): MutableList<String> {
+                    val c = mutableListOf(binaryPath, "tunnel", "--edge-ip-version", ipVersion, "--grace-period", "15s", "--no-autoupdate", "--retries", "99")
                     for (ip in edgeIps.take(4)) c.addAll(listOf("--edge", ip))
                     return c
                 }
 
-                // Each attempt: a command, the public link it should end up with, and how long to wait for it
-                class Attempt(val label: String, val cmd: List<String>, val url: String?)
+                // Each attempt: a command, the public link it should end up with (null = read it from cloudflared),
+                // and the metrics port whose /quicktunnel endpoint reports the link
+                class Attempt(val label: String, val cmd: List<String>, val url: String?, val metricsPort: Int = 0)
                 val attempts = ArrayList<Attempt>()
                 if (!quick && token != null) {
-                    attempts += Attempt("named", base().also { it.addAll(listOf("run", "--token", token)) }, publicUrl)
+                    attempts += Attempt("named", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--token", token)) }, publicUrl)
                 } else {
                     // 1) Create the quick tunnel ourselves (this app's DNS works on Android; cloudflared's own lookup does not), then run it
-                    createQuickTunnel(File(binaryPath).parentFile ?: File("."))?.let { q ->
-                        attempts += Attempt("quick (api)", base().also { it.addAll(listOf("run", "--cred-file", q.credsFile, q.id)) }, "https://${q.hostname}")
+                    createQuickTunnel(workDir)?.let { q ->
+                        attempts += Attempt("quick (api)", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--cred-file", q.credsFile, q.id)) }, "https://${q.hostname}")
                     }
-                    // 2) cloudflared's own quick tunnel
-                    attempts += Attempt("quick (cloudflared)", base().filterIndexed { i, _ -> true }.let { it.toMutableList() }, null)
+                    // 2) cloudflared's own quick tunnel, started the way pencarimovie-server does it: ingress config file,
+                    //    metrics endpoint (its /quicktunnel answer is the live link), transport auto, many retries
+                    val metrics = freePort()
+                    val cfg = writeIngressConfig(workDir, localUrl)
+                    attempts += Attempt(
+                        "quick (cloudflared)",
+                        base("auto").also { it.addAll(listOf("--url", localUrl, "--config", cfg.absolutePath, "--metrics", "127.0.0.1:$metrics")) },
+                        null, metrics,
+                    )
                 }
 
                 for ((idx, at) in attempts.withIndex()) {
                     val pb = ProcessBuilder(at.cmd)
                     pb.redirectErrorStream(true)
+                    applyTunnelEnvironment(pb, workDir)
                     val process = pb.start()
                     tunnelProcess = process
                     val registered = java.util.concurrent.atomic.AtomicBoolean(false)
                     val last = idx == attempts.lastIndex
                     ServerState.info("Cloudflare tunnel attempt: ${at.label}")
 
-                    // An attempt that has not connected after 50 s is given up so the next one can try
+                    fun announce(url: String) {
+                        registered.set(true)
+                        if (ServerState.activeTunnelUrl.value != url) {
+                            ServerState.activeTunnelUrl.value = url
+                            ServerState.info("🚀 Cloudflare tunnel ready: $url  (Stremio add-on: $url/manifest.json)")
+                        }
+                    }
+
+                    // An attempt that has not connected after 40 s is given up so the next one can try
                     val watchdog = launch {
-                        delay(50_000)
+                        delay(40_000)
                         if (!registered.get() && !last) {
-                            ServerState.warn("Cloudflare tunnel (${at.label}) did not connect in 50 s - trying another way")
+                            ServerState.warn("Cloudflare tunnel (${at.label}) did not connect in 40 s - trying another way")
                             runCatching { process.destroyForcibly() }
                         }
                     }
+                    // pencarimovie-server reads the link from cloudflared's metrics endpoint instead of scraping the log
+                    val poller = if (at.metricsPort > 0 && at.url == null) launch {
+                        while (isActive && process.isAlive) {
+                            delay(500)
+                            readQuickTunnelUrl(at.metricsPort)?.let { announce(it); return@launch }
+                        }
+                    } else null
 
                     val reader = BufferedReader(InputStreamReader(process.inputStream))
                     var line: String?
@@ -151,23 +181,17 @@ object CloudflaredManager {
                         ServerState.info("[cloudflared] ${if (token != null) line.replace(token, "***") else line}")
                         val quickUrl = QUICK_URL.find(line)?.value
                         if (quickUrl != null && at.url == null) {
-                            registered.set(true)
-                            if (ServerState.activeTunnelUrl.value != quickUrl) {
-                                ServerState.activeTunnelUrl.value = quickUrl
-                                ServerState.info("🚀 Free Cloudflare tunnel ready: $quickUrl  (Stremio add-on: $quickUrl/manifest.json)")
-                            }
+                            announce(quickUrl)
                         } else if (line.contains("Registered tunnel connection") || (line.contains("Connection ") && line.contains("registered"))) {
                             registered.set(true)
                             val u = at.url
-                            if (u != null && ServerState.activeTunnelUrl.value != u) {
-                                ServerState.activeTunnelUrl.value = u
-                                ServerState.info("🚀 Cloudflare Tunnel connected: $u")
-                            }
+                            if (u != null) announce(u)
                         } else if (!quick && (line.contains("Unauthorized", ignoreCase = true) || line.contains("invalid token", ignoreCase = true))) {
                             ServerState.error("Cloudflare rejected the tunnel token — check it in Settings")
                         }
                     }
                     watchdog.cancel()
+                    poller?.cancel()
                     val exitCode = runCatching { process.waitFor() }.getOrDefault(-1)
                     ServerState.info("Cloudflared process exited with code $exitCode")
                     if (!isActive || registered.get()) break // stopped on purpose, or it ran and later ended
@@ -182,6 +206,55 @@ object CloudflaredManager {
             }
         }
         return true
+    }
+
+    private fun freePort(): Int = runCatching {
+        java.net.ServerSocket(0, 0, java.net.InetAddress.getByName("127.0.0.1")).use { it.localPort }
+    }.getOrDefault(20241)
+
+    /** Minimal ingress file for a quick tunnel (same settings pencarimovie-server writes). */
+    private fun writeIngressConfig(dir: File, localUrl: String): File {
+        val f = File(dir, "quick-ingress.yml")
+        f.writeText(
+            "ingress:\n" +
+                "  - service: $localUrl\n" +
+                "    originRequest:\n" +
+                "      connectTimeout: 10s\n" +
+                "      tcpKeepAlive: 30s\n" +
+                "      keepAliveTimeout: 90s\n" +
+                "      keepAliveConnections: 100\n" +
+                "      noTLSVerify: true\n" +
+                "      http2Origin: false\n"
+        )
+        return f
+    }
+
+    /**
+     * Environment cloudflared needs on Android, where there is no /etc/ssl and no HOME:
+     * transport auto (QUIC, falling back to HTTP/2), a writable HOME, and the system CA store.
+     */
+    private fun applyTunnelEnvironment(pb: ProcessBuilder, workDir: File) {
+        val env = pb.environment()
+        env["TUNNEL_TRANSPORT_PROTOCOL"] = "auto"
+        val home = env["HOME"]
+        if (home.isNullOrBlank() || !File(home).canWrite()) env["HOME"] = workDir.absolutePath
+        if (env["SSL_CERT_DIR"].isNullOrBlank()) {
+            listOf("/system/etc/security/cacerts", "/etc/ssl/certs").firstOrNull { File(it).isDirectory }?.let { env["SSL_CERT_DIR"] = it }
+        }
+        if (env["SSL_CERT_FILE"].isNullOrBlank()) {
+            listOf("/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem").firstOrNull { File(it).isFile }?.let { env["SSL_CERT_FILE"] = it }
+        }
+    }
+
+    /** The quick-tunnel link from cloudflared's local metrics server (`/quicktunnel` -> {"hostname":"x.trycloudflare.com"}). */
+    private fun readQuickTunnelUrl(metricsPort: Int): String? = try {
+        val conn = java.net.URL("http://127.0.0.1:$metricsPort/quicktunnel").openConnection() as java.net.HttpURLConnection
+        conn.connectTimeout = 1000
+        conn.readTimeout = 1000
+        val body = try { conn.inputStream.bufferedReader().use { it.readText() } } finally { conn.disconnect() }
+        QUICK_HOST.find(body)?.value?.let { "https://$it" }
+    } catch (_: Exception) {
+        null
     }
 
     private class QuickTunnel(val id: String, val hostname: String, val credsFile: String)

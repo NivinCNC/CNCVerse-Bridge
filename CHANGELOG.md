@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.4.3
+
+- **Free Cloudflare tunnel:** cloudflared is now started the way pencarimovie-server starts it - transport auto (QUIC, falling back to HTTP/2), a writable HOME, the system CA store (`/system/etc/security/cacerts`) on Android, an ingress config file, loopback origin (`127.0.0.1`) and many retries. The free link is read from cloudflared's local metrics endpoint (`/quicktunnel`) instead of only scraping the log. The app-created quick tunnel is still tried first, the metrics-based start is the fallback; each attempt is given up after 40 s.
+- **Sorting:** whatever the settings, the list sent to Stremio / Nuvio is now ordered by resolution (highest first) as the very last step, so grouping, provider order, hardsub-first and anime-audio no longer break it. Inside one resolution the order from those settings is kept. Links with a known resolution below 720p are never shown; links whose resolution cannot be found are listed after the known ones.
+
 ## 1.4.2
 
 - **Anime search no longer gives up:** when an extension's search errors on the first spelling of a title (AnimePahe breaks on some punctuation), the other names of the show are still tried.
