@@ -23,7 +23,7 @@ object CloudflaredManager {
 
     var deviceIp: String = "127.0.0.1"
 
-    private val QUICK_URL = Regex("https://[a-z0-9-]+\\.trycloudflare\\.com")
+    private val QUICK_URL = Regex("https://(?!api\\.)[a-z0-9-]+\\.trycloudflare\\.com")
 
     private val httpClient by lazy {
         HttpClient(CIO)
@@ -191,7 +191,10 @@ object CloudflaredManager {
      * credentials file. Done here because Android's cloudflared cannot resolve api.trycloudflare.com by itself.
      */
     private fun createQuickTunnel(dir: File): QuickTunnel? = try {
-        val client = okhttp3.OkHttpClient.Builder().callTimeout(20, java.util.concurrent.TimeUnit.SECONDS).build()
+        // The app's own resolver (system DNS, then DoH) - the one extensions use when the phone's DNS is flaky
+        val dns = runCatching { Class.forName("com.cncverse.stremiobridge.network.AdaptiveHostDns").getField("INSTANCE").get(null) as okhttp3.Dns }
+            .getOrDefault(okhttp3.Dns.SYSTEM)
+        val client = okhttp3.OkHttpClient.Builder().dns(dns).callTimeout(25, java.util.concurrent.TimeUnit.SECONDS).build()
         val req = okhttp3.Request.Builder().url("https://api.trycloudflare.com/tunnel")
             .header("User-Agent", "cloudflared/2024.1.0")
             .post("".toRequestBody("application/json".toMediaType())).build()
