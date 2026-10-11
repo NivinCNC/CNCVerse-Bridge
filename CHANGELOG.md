@@ -3,6 +3,7 @@
 ## 1.5.2
 
 - **Free tunnel:** no longer tries to keep the same link. Free quick tunnels cannot keep one, and reusing the old one made the second start fail. Every start now makes a fresh tunnel (retried once if Cloudflare is slow); the new link is shown in the app. For a fixed link use your own tunnel token and domain.
+- **Nuvio over Wi-Fi:** the first answer is now sent after at most 18 s (was 26 s) in case Nuvio gives up earlier; the late results are in the cache for the next try.
 - **Request log:** every manifest and stream request now shows in the log ("[Request] streams for series/tt...: from <address>" and "sent N link(s)") so it is clear whether the player's request reaches the bridge and what it got back.
 
 ## 1.5.1
@@ -20,7 +21,7 @@
 - **Free tunnel link:** the quick tunnel of the last run is reused on the next start, so the link stays the same for as long as Cloudflare keeps it alive. A new link is only made when the old one is gone. Cloudflare does not promise a fixed link for free tunnels without an account; for a link that never changes use your own tunnel token and domain (Settings -> Cloudflare Tunnel).
 
 - **History tab:** every answered request is listed (title, season / episode, how many links were found and shown, the count per extension, how long it took). Tap one to see the exact list the player received (name and description of each link); "Copy list" copies it.
-- **Results that did not show up:** a request that arrives while the extensions are still loading now waits for them (up to 20 s) instead of answering with 0 links, and the first answer is never held longer than 26 s (clients give up around 30 s); links that arrive later are still put into the cache for the next try.
+- **Results that did not show up:** a request that arrives while the extensions are still loading now waits for them (up to 20 s) instead of answering with 0 links, and the first answer is never held longer than 18 s (clients give up around 30 s); links that arrive later are still put into the cache for the next try.
 - **Free tunnel, second start:** the saved link's credentials were overwritten by a new tunnel request before the saved link had been tried, so the second start always failed. The new tunnel is now only requested if the saved one did not connect.
 - **AnimePahe and other extensions:** the ksoup HTML library (needed by AnimePahe, "NoClassDefFoundError ... Ksoup") is now included.
 

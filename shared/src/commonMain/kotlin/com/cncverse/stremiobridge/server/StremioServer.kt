@@ -1950,7 +1950,7 @@ object StremioServer {
     /** Answer with what has loaded after this long; the rest load into the cache until STREAM_DEADLINE_MS. */
     private val STREAM_SOFT_DEADLINE_MS = 8_000L
     /** Never keep a client waiting longer than this for the first answer. */
-    private val STREAM_ANSWER_CAP_MS = 26_000L
+    private val STREAM_ANSWER_CAP_MS = 18_000L
     private val PROVIDER_TIMEOUT_MS = 38_000L
     private val streamSearchScope = CoroutineScope(pluginDispatcher + SupervisorJob())
 
