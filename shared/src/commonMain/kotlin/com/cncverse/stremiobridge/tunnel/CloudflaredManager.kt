@@ -123,16 +123,11 @@ object CloudflaredManager {
                 if (!quick && token != null) {
                     attempts += { Attempt("named", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--token", token)) }, publicUrl) }
                 } else {
-                    // 0) The quick tunnel of the last run: the link stays the same while Cloudflare still honours it
-                    attempts += {
-                        savedQuickTunnel(workDir)?.let { q ->
-                            Attempt("quick (saved link)", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--cred-file", q.credsFile, q.id)) }, "https://${q.hostname}")
-                        }
-                    }
+                    // A free quick tunnel gets a new random link every time (Cloudflare does not keep them): nothing is reused
+                    runCatching { File(workDir, "quick-tunnel.json").delete() }
                     // 1) Create the quick tunnel ourselves (this app's DNS works on Android; cloudflared's own lookup does not), then run it
-                    // (built lazily: it overwrites the saved credentials, so only when the saved link did not work)
                     attempts += {
-                        createQuickTunnel(workDir)?.let { q ->
+                        (createQuickTunnel(workDir) ?: run { Thread.sleep(1500); createQuickTunnel(workDir) })?.let { q ->
                             Attempt("quick (api)", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--cred-file", q.credsFile, q.id)) }, "https://${q.hostname}")
                         }
                     }
@@ -268,17 +263,6 @@ object CloudflaredManager {
     } catch (_: Exception) {
         null
     }
-
-    /** The quick tunnel created on an earlier start (credentials file + its hostname), if any. */
-    private fun savedQuickTunnel(dir: File): QuickTunnel? = try {
-        val f = File(dir, "quick-tunnel.json")
-        if (!f.exists()) null else {
-            val j = kotlinx.serialization.json.Json.parseToJsonElement(f.readText()).jsonObject
-            val id = j["TunnelID"]?.jsonPrimitive?.contentOrNull
-            val host = j["Hostname"]?.jsonPrimitive?.contentOrNull
-            if (id == null || host == null) null else QuickTunnel(id, host, f.absolutePath)
-        }
-    } catch (e: Exception) { null }
 
     private class QuickTunnel(val id: String, val hostname: String, val credsFile: String)
 

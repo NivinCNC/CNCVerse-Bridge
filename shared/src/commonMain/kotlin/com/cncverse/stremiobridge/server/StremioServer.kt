@@ -721,7 +721,7 @@ object StremioServer {
             // ── Addon ────────────────────────────────────────────────────────
             // /u/{id}/… are older per-profile addon URLs; profiles are gone, so they
             // serve the same addon (installs made with them keep working).
-            get("/manifest.json") { call.respond(buildManifest()) }
+            get("/manifest.json") { ServerState.info("[Request] manifest"); call.respond(buildManifest()) }
             get("/u/{profileId}/manifest.json") { call.respond(buildManifest()) }
 
             get("/catalog/{path...}") { call.respondCatalog() }
@@ -856,6 +856,7 @@ object StremioServer {
         val type = parameters["type"] ?: return respond(HttpStatusCode.BadRequest)
         val id   = parameters["id"]   ?: return respond(HttpStatusCode.BadRequest)
         val requestStart = System.currentTimeMillis()
+        ServerState.info("[Request] streams for $type/$id from ${request.local.remoteHost.let { request.headers["X-Forwarded-For"] ?: it }}")
 
         val streams = withContext(pluginDispatcher) { buildStreams(type, id) }
             // Archive downloads (".zip" season packs) can never play in any player
@@ -903,6 +904,7 @@ object StremioServer {
             }
             .map { s -> s.subtitles?.let { subs -> s.copy(subtitles = subs.map { it.copy(lang = com.cncverse.stremiobridge.format.SubtitleLangs.normalize(it.lang)) }) } ?: s }
         respond(StremioStreamResponse(out))
+        ServerState.info("[Request] sent ${out.size} link(s) for $type/$id (${(System.currentTimeMillis() - requestStart) / 1000.0}s)")
         runCatching {
             val parts = id.split(':')
             val ep = if ((type == "series" || type == "anime") && parts.size >= 3) {

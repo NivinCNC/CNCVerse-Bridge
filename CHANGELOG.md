@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.2
+
+- **Free tunnel:** no longer tries to keep the same link. Free quick tunnels cannot keep one, and reusing the old one made the second start fail. Every start now makes a fresh tunnel (retried once if Cloudflare is slow); the new link is shown in the app. For a fixed link use your own tunnel token and domain.
+- **Request log:** every manifest and stream request now shows in the log ("[Request] streams for series/tt...: from <address>" and "sent N link(s)") so it is clear whether the player's request reaches the bridge and what it got back.
+
 ## 1.5.1
 
 - **Real DNS-over-HTTPS:** the "DoH fallback" only asked the phone's own DNS again. It now really asks Cloudflare (1.1.1.1 / 1.0.0.1), Google (8.8.8.8 / 8.8.4.4) and Quad9 over HTTPS by IP when the phone's DNS fails or answers 0.0.0.0 / 127.0.0.1 (DNS-blocked sites like desicinemas.to), IPv4 first. Applies to extensions, the media server and the tunnel.
