@@ -414,15 +414,14 @@ fun ServerScreen(
                             ) {
                                 Column(modifier = Modifier.weight(1f).padding(end = 12.dp)) {
                                     Text("Enable Stremio Mode", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                                    Text("Launches a Cloudflare Tunnel HTTPS proxy for Stremio Web compatibility.", color = TextMuted, fontSize = 11.sp, lineHeight = 14.sp)
+                                    Text("Gives the bridge a free https link (Cloudflare tunnel, no account needed). Add your own token in Settings for a fixed link.", color = TextMuted, fontSize = 11.sp, lineHeight = 14.sp)
                                 }
                                 Switch(
                                     checked = isStremioMode,
                                     onCheckedChange = { enable ->
                                         if (enable) {
-                                            if (!TunnelSettings.isConfigured) {
-                                                showTunnelSetupDialog = true
-                                            } else if (!CloudflaredManager.isInstalled()) {
+                                            // No token needed: without one the bridge starts a free quick tunnel
+                                            if (!CloudflaredManager.isInstalled()) {
                                                 showCloudflaredDialog = true
                                             } else {
                                                 ServerState.isStremioMode.value = true

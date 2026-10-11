@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.4.2
+
+- **Free https link now reachable:** "Enable Stremio Mode" on the Server screen no longer demands a tunnel token and domain first. Turn it on (the app downloads cloudflared once) and the free https link appears as the Stremio URL; add your own token in Settings -> Cloudflare Tunnel only for a fixed link.
+
 ## 1.4.1
 
 - **Anime search (AnimePahe and others):** every known name of the show (romaji, English, synonyms from AniList / Kitsu / MyAnimeList) is searched, also without season words, without the subtitle and by its first words. The results of all spellings are pooled and the best fit wins, with the season checked against the name ("2nd Season", "S2", "II").
