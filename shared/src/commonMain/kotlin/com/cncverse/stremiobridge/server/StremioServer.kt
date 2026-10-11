@@ -1470,6 +1470,35 @@ object StremioServer {
         } catch (e: Throwable) { null }
     }
 
+    private val tmdbAllCounts = java.util.concurrent.ConcurrentHashMap<String, Map<Int, Int>>()
+
+    /** Season number -> number of episodes TMDB lists, for the whole series behind [ext] (specials excluded). */
+    private suspend fun tmdbAllSeasonCounts(ext: ExternalId): Map<Int, Int>? {
+        val key = "${ext.scheme}:${ext.key}"
+        tmdbAllCounts[key]?.let { return it }
+        return try {
+            val tvId = when (ext.scheme) {
+                "tmdb" -> ext.key
+                "imdb", "tvdb" -> fetchTmdbJson("find/${ext.key}?external_source=" + (if (ext.scheme == "imdb") "imdb_id" else "tvdb_id"))
+                    ?.get("tv_results")?.let { (it as? kotlinx.serialization.json.JsonArray)?.firstOrNull() as? kotlinx.serialization.json.JsonObject }
+                    ?.get("id")?.jsonPrimitive?.contentOrNull
+                else -> null
+            } ?: return null
+            val seasons = fetchTmdbJson("tv/$tvId")?.get("seasons") as? kotlinx.serialization.json.JsonArray ?: return null
+            val m = HashMap<Int, Int>()
+            for (e in seasons) {
+                val o = e as? kotlinx.serialization.json.JsonObject ?: continue
+                val n = o["season_number"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: continue
+                val c = o["episode_count"]?.jsonPrimitive?.contentOrNull?.toIntOrNull() ?: continue
+                if (n > 0 && c > 0) m[n] = c
+            }
+            if (m.isNotEmpty()) tmdbAllCounts[key] = m
+            m.takeIf { it.isNotEmpty() }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) { null }
+    }
+
     /** Title + year for any supported id; null when the source has no such item. */
     private suspend fun resolveExternal(type: String, ext: ExternalId): Pair<String, Int?>? {
         if (ext.scheme == "imdb" || ext.scheme == "tmdb") return resolveGenericMedia(type, ext.key)
@@ -2082,6 +2111,13 @@ object StremioServer {
                     } else base
                 } else null
 
+                // TMDB (season, episode) -> the AniList entry and the episode number inside it
+                val animeTarget: AnimeTarget? = if (animeNames != null && ext.scheme in setOf("imdb", "tmdb", "tvdb") &&
+                    ext.season != null && ext.episode != null && animeNames.aniListId != null) {
+                    tmdbAllSeasonCounts(ext)?.let { counts -> AnimeResolver.mapEpisode(animeNames, ext.season, ext.episode, counts) }
+                } else null
+                val animeForSearch = animeTarget?.entry?.copy(titles = (animeTarget.entry.titles + (animeNames?.titles.orEmpty())).distinct()) ?: animeNames
+
                 // Exclude live-TV-only extensions from generic TMDB VOD searches —
                 // they don't carry on-demand movie/series content.
                 val activePlugins = loadedApis.filter { api ->
@@ -2104,7 +2140,7 @@ object StremioServer {
                         sem.withPermit {
                             val res = withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
                                 try {
-                                    val streams = buildGenericStreamsForApi(api, type, id, title, year, animeNames)
+                                    val streams = buildGenericStreamsForApi(api, type, id, title, year, animeForSearch, animeTarget)
                                     accumulated.addAll(streams)
                                 } catch (e: Throwable) {
                                     // Cancelled by the bridge (request gone / 45 s stop): not the provider's failure
@@ -2193,13 +2229,14 @@ object StremioServer {
         title: String,
         year: Int?,
         anime: AnimeInfo? = null,
+        target: AnimeTarget? = null,
     ): List<StremioStream> {
         if (id.startsWith("probe_")) {
-            return doBuildGenericStreamsForApi(api, type, id, title, year, anime)
+            return doBuildGenericStreamsForApi(api, type, id, title, year, anime, target)
         }
         val providerCacheKey = "stream:provider:${api.internalName}:$type:$id"
         return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetch(providerCacheKey, api.internalName) {
-            doBuildGenericStreamsForApi(api, type, id, title, year, anime)
+            doBuildGenericStreamsForApi(api, type, id, title, year, anime, target)
         }
     }
 
@@ -2251,6 +2288,7 @@ object StremioServer {
         title: String,
         year: Int?,
         anime: AnimeInfo? = null,
+        target: AnimeTarget? = null,
     ): List<StremioStream> {
         ServerState.debug("[${api.name}] Searching for '$title'")
         val cacheKey = api.internalName
@@ -2274,7 +2312,8 @@ object StremioServer {
 
         // tt / tmdb / tvdb ids carry the real season; kitsu / MAL / AniList ids name one season entry already
         val parsedId = ExternalIds.parse(id)
-        val animeSeason = if (anime != null && parsedId != null && parsedId.scheme !in ExternalIds.ANIME_SCHEMES) parsedId.season else null
+        val animeSeason = if (target != null) target.index + 1
+            else if (anime != null && parsedId != null && parsedId.scheme !in ExternalIds.ANIME_SCHEMES) parsedId.season else null
         val pool = ArrayList<SearchResult>(searchResults)
 
         var bestMatch = (if (anime != null) {
@@ -2354,10 +2393,18 @@ object StremioServer {
             return emptyList()
         }
 
+        var mergedList = false
         // Season check by episode count: the entry must have about as many episodes as the season we want
         if (anime != null && parsedId != null) {
             val expected = ArrayList<Int>()
-            if (parsedId.scheme in ExternalIds.ANIME_SCHEMES) {
+            // Running-number lists: a site that merges seasons lists as many episodes as the franchise has so far
+            val expectedMerged = ArrayList<Int>()
+            if (target != null) {
+                // the entry is exact (own AniList id): its own episode count, or the running total when a site merges seasons
+                anime.episodeCount?.let { expected += it }
+                var cum = 0
+                for (i in 0..target.index) { cum += target.counts.getOrNull(i) ?: break; if (i >= 1) expectedMerged += cum }
+            } else if (parsedId.scheme in ExternalIds.ANIME_SCHEMES) {
                 anime.episodeCount?.let { expected += it }
             } else {
                 animeSeason?.let { sn -> tmdbSeasonEpisodeCount(parsedId, sn)?.let { expected += it } }
@@ -2375,7 +2422,9 @@ object StremioServer {
                 val eps = mi.episodes.orEmpty()
                 if (eps.isEmpty() || eps.any { (it.season ?: 1) > 1 }) return true
                 val n = eps.mapNotNull { it.episode }.distinct().size.takeIf { it > 0 } ?: eps.size
-                return AnimeMatcher.countFits(n, expected, running, parsedId.episode)
+                if (AnimeMatcher.countFits(n, expected, running, parsedId.episode)) return true
+                if (expectedMerged.any { m -> n == m }) { mergedList = true; return true }
+                return false
             }
             if ((expected.isNotEmpty() || idVerdict(mediaInfo) != null) && !fits(mediaInfo)) {
                 ServerState.debug("[${api.name}] '${bestMatch.name}' has ${mediaInfo.episodes?.size} episodes, wanted about $expected - trying other entries")
@@ -2398,12 +2447,19 @@ object StremioServer {
         var dataUrlToLoad = mediaInfo.dataUrl
         if (anime != null) {
             val parsed = ExternalIds.parse(id)
-            val epNo = parsed?.episode
+            // TMDB numbering was translated to the AniList entry: its own episode number, or the running number on a site that merges seasons
+            val epNo = target?.let { if (mergedList) it.absolute else it.local } ?: parsed?.episode
             val epList = mediaInfo.episodes
             if (!epList.isNullOrEmpty()) {
                 // A later-season entry (kitsu "Season 2") numbers its own episodes from 1; a franchise page lists seasons
-                val wantSeason = anime.seasonHint?.takeIf { it > 1 } ?: parsed?.season
-                val ep = if (epNo != null) AnimeEpisodes.pick(epList, wantSeason, epNo) else epList.first()
+                val wantSeason = if (target != null) (if (mergedList) 1 else target.index + 1)
+                    else anime.seasonHint?.takeIf { it > 1 } ?: parsed?.season
+                var ep = if (epNo != null) AnimeEpisodes.pick(epList, wantSeason, epNo) else epList.first()
+                if (ep == null && target != null) {
+                    // Last resorts, so a correct entry still gives results: TMDB's own numbers, then the running number
+                    ep = parsed?.season?.let { sn -> parsed.episode?.let { en -> AnimeEpisodes.pick(epList, sn, en) } }
+                        ?: AnimeEpisodes.pick(epList, 1, target.absolute)
+                }
                 if (ep == null) {
                     ServerState.debug("[STREAM_EMPTY] [${api.name}] Episode $epNo not found")
                     StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Episode $epNo not found")

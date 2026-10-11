@@ -32,6 +32,19 @@ data class AnimeInfo(
     val isMovie: Boolean get() = format.equals("MOVIE", true) || format.equals("movie", true)
 }
 
+/**
+ * Where a TMDB (season, episode) lands on AniList: the franchise entry that holds it, and the episode number
+ * inside that entry ([local]); [absolute] is the running number over the whole franchise, [index] the 0-based
+ * position of the entry among the franchise's TV entries, [counts] their episode counts (null = still airing).
+ */
+data class AnimeTarget(
+    val entry: AnimeInfo,
+    val local: Int,
+    val absolute: Int,
+    val index: Int,
+    val counts: List<Int?>,
+)
+
 /** Looks an anime id up on AniList / Kitsu and collects every title it is known by. */
 object AnimeResolver {
     private val json = Json { ignoreUnknownKeys = true }
@@ -92,6 +105,119 @@ object AnimeResolver {
         val d = get("https://api.jikan.moe/v4/anime/$mal")?.get("data") as? JsonObject ?: return emptyList()
         val listed = (d["titles"] as? JsonArray)?.mapNotNull { (it as? JsonObject)?.str("title") }.orEmpty()
         return (listOfNotNull(d.str("title_english"), d.str("title")) + listed + d.strList("title_synonyms")).distinct()
+    }
+
+    private class Node(val hit: Hit, val prequel: Int?, val sequel: Int?)
+
+    private val chainCache = ConcurrentHashMap<Int, List<Hit>>()
+    private val TV_FORMATS = setOf("TV", "TV_SHORT", "ONA")
+
+    /** One AniList entry with its prequel / sequel (TV entries only). */
+    private fun aniListNode(id: Int): Node? {
+        val query = "query(\$v:Int){Media(id:\$v,type:ANIME){id idMal title{english romaji native}synonyms seasonYear startDate{year}episodes format " +
+            "relations{edges{relationType node{id format type}}}}}"
+        val body = JsonObject(mapOf("query" to JsonPrimitive(query), "variables" to JsonObject(mapOf("v" to JsonPrimitive(id))))).toString()
+        val text = runCatching {
+            client.newCall(
+                okhttp3.Request.Builder().url("https://graphql.anilist.co").header("Accept", "application/json")
+                    .post(okhttp3.RequestBody.create("application/json".toMediaTypeOrNull(), body)).build()
+            ).execute().use { r -> if (r.code == 200) r.body?.string() else null }
+        }.getOrNull() ?: return null
+        val media = (json.parseToJsonElement(text).jsonObject["data"] as? JsonObject)?.get("Media") as? JsonObject ?: return null
+        val t = media["title"] as? JsonObject
+        val titles = listOfNotNull(t?.str("english"), t?.str("romaji")) + media.strList("synonyms").take(6) + listOfNotNull(t?.str("native"))
+        if (titles.isEmpty()) return null
+        val year = (media["seasonYear"] as? JsonPrimitive)?.intOrNull
+            ?: ((media["startDate"] as? JsonObject)?.get("year") as? JsonPrimitive)?.intOrNull
+        val alId = (media["id"] as? JsonPrimitive)?.intOrNull
+        val mal = (media["idMal"] as? JsonPrimitive)?.intOrNull
+        val info = AnimeInfo(
+            titles = titles.distinct(), year = year,
+            episodeCount = (media["episodes"] as? JsonPrimitive)?.intOrNull,
+            format = media.str("format"),
+            seasonHint = AnimeMatcher.seasonNumber(AnimeMatcher.normalize(titles.first())),
+            aniListId = alId, malId = mal,
+        )
+        var prequel: Int? = null
+        var sequel: Int? = null
+        ((media["relations"] as? JsonObject)?.get("edges") as? JsonArray)?.forEach { e ->
+            val edge = e as? JsonObject ?: return@forEach
+            val node = edge["node"] as? JsonObject ?: return@forEach
+            if (node.str("format") !in TV_FORMATS) return@forEach
+            val nid = (node["id"] as? JsonPrimitive)?.intOrNull ?: return@forEach
+            when (edge.str("relationType")) { "PREQUEL" -> prequel = nid; "SEQUEL" -> sequel = nid }
+        }
+        return Node(Hit(info, alId, mal), prequel, sequel)
+    }
+
+    /** The TV entries of the franchise [anilistId] belongs to, first season first (prequels back to the start, sequels forward). */
+    private fun franchise(anilistId: Int): List<Hit> {
+        chainCache[anilistId]?.let { return it }
+        val start = aniListNode(anilistId) ?: return emptyList()
+        val back = ArrayList<Hit>()
+        val seen = HashSet<Int>().apply { add(anilistId) }
+        var p = start.prequel
+        while (p != null && back.size < 10 && seen.add(p)) {
+            val n = aniListNode(p) ?: break
+            back.add(n.hit)
+            p = n.prequel
+        }
+        val fwd = ArrayList<Hit>()
+        var q = start.sequel
+        while (q != null && fwd.size < 10 && seen.add(q)) {
+            val n = aniListNode(q) ?: break
+            fwd.add(n.hit)
+            q = n.sequel
+        }
+        val chain = back.reversed() + start.hit + fwd
+        chainCache[anilistId] = chain
+        for (h in chain) h.anilistId?.let { chainCache[it] = chain }
+        return chain
+    }
+
+    /**
+     * TMDB numbers a series by seasons, AniList by entries (a TMDB season may be two AniList cours, a TMDB
+     * season 1 may stop where AniList's first entry does not). Maps TMDB (season, episode) onto the AniList entry and
+     * the episode number inside it: straight when both split the show the same way, else by the running episode number.
+     * [tmdbCounts] = season number -> episodes TMDB lists. Null when the franchise cannot be read.
+     */
+    suspend fun mapEpisode(base: AnimeInfo, season: Int, episode: Int, tmdbCounts: Map<Int, Int>): AnimeTarget? {
+        val id = base.aniListId ?: return null
+        return withContext(Dispatchers.IO) {
+            try {
+                val chain = franchise(id)
+                if (chain.isEmpty()) return@withContext null
+                val counts = chain.map { it.info.episodeCount }
+                val prior = (1 until season).sumOf { tmdbCounts[it] ?: return@withContext null }
+                val absolute = prior + episode
+                // Both split the show the same way: season N is entry N
+                val aligned = chain.size >= season && (0 until season).all { i ->
+                    val c = counts[i]; val t = tmdbCounts[i + 1]
+                    c == null || t == null || c == t
+                }
+                val idx: Int
+                val local: Int
+                if (aligned) { idx = season - 1; local = episode }
+                else {
+                    var cum = 0
+                    var found = -1
+                    for ((i, c) in counts.withIndex()) {
+                        val n = c ?: Int.MAX_VALUE / 2
+                        if (absolute <= cum + n) { found = i; break }
+                        cum += n
+                    }
+                    if (found < 0) return@withContext null
+                    idx = found; local = absolute - cum
+                }
+                val hit = chain[idx]
+                val entry = enrich(hit).copy(seasonHint = idx + 1)
+                ServerState.debug("Anime S${season}E${episode} (TMDB) -> AniList ${hit.anilistId} entry ${idx + 1}/${chain.size}, episode $local (absolute $absolute, " + (if (aligned) "same split" else "by running number") + ")")
+                AnimeTarget(entry, local, absolute, idx, counts)
+            } catch (e: Exception) {
+                ServerState.warn("Anime episode mapping failed: ${e.message?.take(80)}")
+                null
+            }
+        }
     }
 
     /** AniList hit + Kitsu + MyAnimeList: every name any of them knows the show by. */
