@@ -2,6 +2,8 @@
 
 ## 1.4.2
 
+- **Anime search no longer gives up:** when an extension's search errors on the first spelling of a title (AnimePahe breaks on some punctuation), the other names of the show are still tried.
+- **Free tunnel on Android:** the quick tunnel is now created by the app itself (cloudflared cannot look up Cloudflare's address on Android), then run with those credentials; if that does not connect in 50 s, cloudflared's own quick tunnel is tried. The log shows each step.
 - **AnimePahe:** its subbed links are recognised as hardsub (burned-in subtitles) and listed first. Episode lists without episode numbers (as in AnimePahe) are picked by position.
 - **Free https link now reachable:** "Enable Stremio Mode" on the Server screen no longer demands a tunnel token and domain first. Turn it on (the app downloads cloudflared once) and the free https link appears as the Stremio URL; add your own token in Settings -> Cloudflare Tunnel only for a fixed link.
 

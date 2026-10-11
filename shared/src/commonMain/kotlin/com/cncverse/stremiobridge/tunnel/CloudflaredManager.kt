@@ -9,6 +9,11 @@ import io.ktor.client.statement.*
 import kotlinx.coroutines.*
 import java.io.BufferedReader
 import java.io.File
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.InputStreamReader
 
 object CloudflaredManager {
@@ -99,56 +104,75 @@ object CloudflaredManager {
 
                 // Get edge IPs (bypasses DNS issue on Android 10+)
                 val edgeIps = resolveCloudflareEdgeIps()
-                val cmd = mutableListOf(
-                    binaryPath, "tunnel",
-                    "--url", "http://${deviceIp}:$port",
-                    "--edge-ip-version", "4",
-                    "--no-autoupdate"
-                )
-
-                // Add up to 4 edge IPs
-                for (ip in edgeIps.take(4)) {
-                    cmd.addAll(listOf("--edge", ip))
+                fun base(): MutableList<String> {
+                    val c = mutableListOf(binaryPath, "tunnel", "--url", "http://${deviceIp}:$port", "--edge-ip-version", "4", "--no-autoupdate")
+                    for (ip in edgeIps.take(4)) c.addAll(listOf("--edge", ip))
+                    return c
                 }
 
-                if (!quick && token != null) cmd.addAll(listOf("run", "--token", token))
+                // Each attempt: a command, the public link it should end up with, and how long to wait for it
+                class Attempt(val label: String, val cmd: List<String>, val url: String?)
+                val attempts = ArrayList<Attempt>()
+                if (!quick && token != null) {
+                    attempts += Attempt("named", base().also { it.addAll(listOf("run", "--token", token)) }, publicUrl)
+                } else {
+                    // 1) Create the quick tunnel ourselves (this app's DNS works on Android; cloudflared's own lookup does not), then run it
+                    createQuickTunnel(File(binaryPath).parentFile ?: File("."))?.let { q ->
+                        attempts += Attempt("quick (api)", base().also { it.addAll(listOf("run", "--cred-file", q.credsFile, q.id)) }, "https://${q.hostname}")
+                    }
+                    // 2) cloudflared's own quick tunnel
+                    attempts += Attempt("quick (cloudflared)", base().filterIndexed { i, _ -> true }.let { it.toMutableList() }, null)
+                }
 
-                val pb = ProcessBuilder(cmd)
-                pb.redirectErrorStream(true)
+                for ((idx, at) in attempts.withIndex()) {
+                    val pb = ProcessBuilder(at.cmd)
+                    pb.redirectErrorStream(true)
+                    val process = pb.start()
+                    tunnelProcess = process
+                    val registered = java.util.concurrent.atomic.AtomicBoolean(false)
+                    val last = idx == attempts.lastIndex
+                    ServerState.info("Cloudflare tunnel attempt: ${at.label}")
 
-                val process = pb.start()
-                tunnelProcess = process
+                    // An attempt that has not connected after 50 s is given up so the next one can try
+                    val watchdog = launch {
+                        delay(50_000)
+                        if (!registered.get() && !last) {
+                            ServerState.warn("Cloudflare tunnel (${at.label}) did not connect in 50 s - trying another way")
+                            runCatching { process.destroyForcibly() }
+                        }
+                    }
 
-                val reader = BufferedReader(InputStreamReader(process.inputStream))
-                var line: String?
-
-                while (isActive && process.isAlive) {
-                    line = reader.readLine() ?: break
-                    if (line.isNotBlank()) {
+                    val reader = BufferedReader(InputStreamReader(process.inputStream))
+                    var line: String?
+                    while (isActive && process.isAlive) {
+                        line = reader.readLine() ?: break
+                        if (line.isBlank()) continue
                         // The token is never echoed by cloudflared, but keep it out of the log regardless
                         ServerState.info("[cloudflared] ${if (token != null) line.replace(token, "***") else line}")
-                        if (quick) {
-                            QUICK_URL.find(line)?.value?.let { u ->
-                                if (ServerState.activeTunnelUrl.value != u) {
-                                    ServerState.activeTunnelUrl.value = u
-                                    ServerState.info("🚀 Free Cloudflare tunnel ready: $u  (Stremio add-on: $u/manifest.json)")
-                                }
+                        val quickUrl = QUICK_URL.find(line)?.value
+                        if (quickUrl != null && at.url == null) {
+                            registered.set(true)
+                            if (ServerState.activeTunnelUrl.value != quickUrl) {
+                                ServerState.activeTunnelUrl.value = quickUrl
+                                ServerState.info("🚀 Free Cloudflare tunnel ready: $quickUrl  (Stremio add-on: $quickUrl/manifest.json)")
                             }
-                        }
-
-                        if (!quick && line.contains("Registered tunnel connection") || (line.contains("Connection ") && line.contains("registered"))) {
-                            if (ServerState.activeTunnelUrl.value != publicUrl) {
-                                ServerState.activeTunnelUrl.value = publicUrl
-                                ServerState.info("🚀 Cloudflare Tunnel connected: $publicUrl")
+                        } else if (line.contains("Registered tunnel connection") || (line.contains("Connection ") && line.contains("registered"))) {
+                            registered.set(true)
+                            val u = at.url
+                            if (u != null && ServerState.activeTunnelUrl.value != u) {
+                                ServerState.activeTunnelUrl.value = u
+                                ServerState.info("🚀 Cloudflare Tunnel connected: $u")
                             }
-                        } else if (!quick && line.contains("Unauthorized", ignoreCase = true) || line.contains("invalid token", ignoreCase = true)) {
+                        } else if (!quick && (line.contains("Unauthorized", ignoreCase = true) || line.contains("invalid token", ignoreCase = true))) {
                             ServerState.error("Cloudflare rejected the tunnel token — check it in Settings")
                         }
                     }
+                    watchdog.cancel()
+                    val exitCode = runCatching { process.waitFor() }.getOrDefault(-1)
+                    ServerState.info("Cloudflared process exited with code $exitCode")
+                    if (!isActive || registered.get()) break // stopped on purpose, or it ran and later ended
+                    ServerState.activeTunnelUrl.value = null
                 }
-
-                val exitCode = process.waitFor()
-                ServerState.info("Cloudflared process exited with code $exitCode")
             } catch (e: CancellationException) {
                 // Expected when tunnel is stopped
             } catch (e: Exception) {
@@ -158,6 +182,37 @@ object CloudflaredManager {
             }
         }
         return true
+    }
+
+    private class QuickTunnel(val id: String, val hostname: String, val credsFile: String)
+
+    /**
+     * Asks Cloudflare for a free quick tunnel (the same call `cloudflared tunnel --url` makes) and writes its
+     * credentials file. Done here because Android's cloudflared cannot resolve api.trycloudflare.com by itself.
+     */
+    private fun createQuickTunnel(dir: File): QuickTunnel? = try {
+        val client = okhttp3.OkHttpClient.Builder().callTimeout(20, java.util.concurrent.TimeUnit.SECONDS).build()
+        val req = okhttp3.Request.Builder().url("https://api.trycloudflare.com/tunnel")
+            .header("User-Agent", "cloudflared/2024.1.0")
+            .post("".toRequestBody("application/json".toMediaType())).build()
+        client.newCall(req).execute().use { r ->
+            val body = r.body?.string().orEmpty()
+            if (!r.isSuccessful) { ServerState.warn("Quick tunnel request failed: HTTP ${r.code}"); null }
+            else {
+                val res = kotlinx.serialization.json.Json.parseToJsonElement(body).jsonObject["result"]?.jsonObject
+                fun f(k: String) = res?.get(k)?.jsonPrimitive?.contentOrNull
+                val id = f("id"); val host = f("hostname"); val tag = f("account_tag"); val secret = f("secret")
+                if (id == null || host == null || tag == null || secret == null) { ServerState.warn("Quick tunnel answer incomplete"); null }
+                else {
+                    val creds = File(dir, "quick-tunnel.json")
+                    creds.writeText("{\"AccountTag\":\"$tag\",\"TunnelSecret\":\"$secret\",\"TunnelID\":\"$id\"}")
+                    QuickTunnel(id, host, creds.absolutePath)
+                }
+            }
+        }
+    } catch (e: Exception) {
+        ServerState.warn("Quick tunnel request error: ${e.message}")
+        null
     }
 
     fun stopTunnel() {

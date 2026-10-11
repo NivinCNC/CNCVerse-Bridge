@@ -2211,8 +2211,12 @@ object StremioServer {
             // Cancelled by the bridge (request gone / 45 s stop): not the provider's failure
             kotlinx.coroutines.currentCoroutineContext().ensureActive()
             ServerState.warn("[STREAM_ERROR] [${api.name}] Search failed: ${e.message}")
-            StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Search error: ${e.message}")
-            return emptyList()
+            if (anime == null) {
+                StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "Search error: ${e.message}")
+                return emptyList()
+            }
+            // Anime: one spelling can break a site's search (punctuation, long names) - the other names are still tried
+            emptyList<SearchResult>()
         }
         ServerState.debug("[${api.name}] Found ${searchResults.size} results")
 
