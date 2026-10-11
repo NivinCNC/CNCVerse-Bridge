@@ -64,55 +64,112 @@ class CloudflareKiller : Interceptor {
 
     data class CfResult(val cookie: String, val userAgent: String)
 
+    private val lastAsked = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /**
+     * Solves the challenge in a real WebView (like Raghav's extensions do). First invisibly for ~15 s (JS
+     * challenges pass by themselves); if the site wants a tap (Turnstile), the same WebView is shown in a
+     * dialog over the app so the user can finish it. The cookies are returned with this WebView's User-Agent.
+     */
     private fun bypassCloudflare(url: String): CfResult? {
-        val appCtx = try {
-            val atClass = Class.forName("android.app.ActivityThread")
-            atClass.getMethod("currentApplication").invoke(null) as Context
-        } catch (e: Exception) {
-            null
-        } ?: return null
-
+        val appCtx = appContext() ?: return null
+        val host = try { java.net.URI(url).host ?: url } catch (_: Exception) { url }
         val latch = CountDownLatch(1)
-        var result: CfResult? = null
+        val resultRef = java.util.concurrent.atomic.AtomicReference<CfResult?>(null)
+        val main = Handler(Looper.getMainLooper())
+        val started = System.currentTimeMillis()
+        val maxMs = 110_000L
+        val headlessMs = 15_000L
 
-        Handler(Looper.getMainLooper()).post {
+        main.post {
+            var dialog: android.app.Dialog? = null
+            var webView: WebView? = null
+            fun finish() {
+                runCatching { dialog?.dismiss() }
+                runCatching { webView?.stopLoading(); webView?.destroy() }
+                webView = null
+                latch.countDown()
+            }
             try {
-                val webView = WebView(appCtx)
-                webView.settings.javaScriptEnabled = true
-                webView.settings.domStorageEnabled = true
-                val userAgent = webView.settings.userAgentString
-                
-                webView.webViewClient = object : WebViewClient() {
-                    var checkCount = 0
-                    val maxChecks = 30
-                    
-                    override fun onPageFinished(view: WebView?, url: String?) {
-                        checkCookies()
-                    }
-                    
-                    private fun checkCookies() {
-                        val cookies = CookieManager.getInstance().getCookie(url)
-                        if (cookies != null && cookies.contains("cf_clearance")) {
-                            result = CfResult(cookies, userAgent)
-                            latch.countDown()
-                            webView.destroy()
-                        } else {
-                            if (checkCount++ < maxChecks) {
-                                Handler(Looper.getMainLooper()).postDelayed({ checkCookies() }, 1000)
-                            } else {
-                                latch.countDown()
-                                webView.destroy()
+                val wv = WebView(appCtx)
+                webView = wv
+                wv.settings.javaScriptEnabled = true
+                wv.settings.domStorageEnabled = true
+                @Suppress("DEPRECATION") wv.settings.databaseEnabled = true
+                wv.settings.javaScriptCanOpenWindowsAutomatically = true
+                wv.settings.setSupportMultipleWindows(false)
+                val userAgent = wv.settings.userAgentString
+                CookieManager.getInstance().setAcceptCookie(true)
+                CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
+                wv.webViewClient = WebViewClient()
+
+                fun cleared(): String? {
+                    CookieManager.getInstance().flush()
+                    val c = CookieManager.getInstance().getCookie(url)
+                    return c?.takeIf { it.contains("cf_clearance") }
+                }
+
+                fun showDialog() {
+                    val act = com.lagradost.cloudstream3.CommonActivity.activity
+                    if (act == null || act.isFinishing || act.isDestroyed) return
+                    // Do not nag: one prompt per site every 5 minutes
+                    val now = System.currentTimeMillis()
+                    if (now - (lastAsked[host] ?: 0L) < 5 * 60_000L) return
+                    lastAsked[host] = now
+                    runCatching {
+                        (wv.parent as? android.view.ViewGroup)?.removeView(wv)
+                        val dp = act.resources.displayMetrics.density
+                        val box = android.widget.LinearLayout(act).apply {
+                            orientation = android.widget.LinearLayout.VERTICAL
+                            setBackgroundColor(android.graphics.Color.parseColor("#111111"))
+                            val title = android.widget.TextView(act).apply {
+                                text = "Complete the check for $host - tap the box if one appears"
+                                setTextColor(android.graphics.Color.WHITE)
+                                textSize = 14f
+                                setPadding((16 * dp).toInt(), (12 * dp).toInt(), (16 * dp).toInt(), (12 * dp).toInt())
                             }
+                            addView(title)
+                            addView(wv, android.widget.LinearLayout.LayoutParams(-1, 0, 1f))
+                            val cancel = android.widget.Button(act).apply {
+                                text = "Cancel"
+                                setOnClickListener { finish() }
+                            }
+                            addView(cancel)
+                        }
+                        dialog = android.app.Dialog(act, android.R.style.Theme_DeviceDefault_NoActionBar).apply {
+                            setContentView(box)
+                            setCancelable(true)
+                            setOnCancelListener { finish() }
+                            show()
+                        }
+                        ServerState.info("Cloudflare: showing the check for $host so it can be completed")
+                    }.onFailure { ServerState.warn("Cloudflare dialog failed: ${it.message}") }
+                }
+
+                var shown = false
+                fun poll() {
+                    if (webView == null) return
+                    val c = cleared()
+                    when {
+                        c != null -> { resultRef.set(CfResult(c, userAgent)); finish() }
+                        System.currentTimeMillis() - started > maxMs -> finish()
+                        else -> {
+                            if (!shown && System.currentTimeMillis() - started > headlessMs) {
+                                shown = true
+                                showDialog()
+                            }
+                            main.postDelayed({ poll() }, 1000)
                         }
                     }
                 }
-                webView.loadUrl(url)
+                wv.loadUrl(url)
+                main.postDelayed({ poll() }, 1500)
             } catch (e: Exception) {
                 ServerState.warn("WebView failed: ${e.message}")
-                latch.countDown()
+                finish()
             }
         }
-        latch.await(40, TimeUnit.SECONDS)
-        return result
+        latch.await(maxMs + 5_000, TimeUnit.MILLISECONDS)
+        return resultRef.get()
     }
 }

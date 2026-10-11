@@ -1,6 +1,7 @@
 package com.cncverse.stremiobridge.network
 
 import okhttp3.Dns
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import com.cncverse.stremiobridge.state.ServerState
 import java.net.Inet4Address
 import java.net.Inet6Address
@@ -44,9 +45,11 @@ object AdaptiveHostDns : Dns {
      * Resolves host via parallel interleaved race, falling back to DoH chain if direct DNS fails.
      */
     private fun resolveFresh(hostname: String): List<InetAddress> {
+        if (hostname.equals("localhost", true)) return Dns.SYSTEM.lookup(hostname)
         // 2. Perform Direct Parallel Interleaved Lookup (System)
         val directAddresses = try {
-            Dns.SYSTEM.lookup(hostname)
+            // A blocking DNS often answers 0.0.0.0 / 127.0.0.1 instead of failing: that counts as failed too
+            Dns.SYSTEM.lookup(hostname).filter { !it.isAnyLocalAddress && !it.isLoopbackAddress }
         } catch (e: Exception) {
             emptyList()
         }
@@ -73,30 +76,68 @@ object AdaptiveHostDns : Dns {
             return result
         }
 
-        // 3. DoH Fallback Chain if Direct DNS fails / timed out
-        ServerState.warn("Direct DNS failed for $hostname — initiating DoH fallback chain...")
-        val dohProviders = listOf(
-            "Cloudflare" to "1.1.1.1",
-            "Google" to "8.8.8.8",
-            "Quad9" to "9.9.9.9",
-            "AdGuard" to "94.140.14.14"
-        )
-
-        for ((providerName, ip) in dohProviders) {
-            try {
-                val resolved = Dns.SYSTEM.lookup(hostname)
-                if (resolved.isNotEmpty()) {
-                    ServerState.info("DoH ($providerName) successfully resolved $hostname -> ${resolved.firstOrNull()?.hostAddress}")
-                    hostCache[hostname] = CachedHostProtocol(resolved)
-                    return resolved
-                }
-            } catch (_: Exception) {
-                // Try next DoH provider
+        // 3. Real DNS-over-HTTPS (the phone's DNS is blocked or broken): ask public resolvers over HTTPS by IP
+        ServerState.warn("Direct DNS failed for $hostname - asking DNS-over-HTTPS resolvers...")
+        for ((providerName, endpoint) in DOH_ENDPOINTS) {
+            val resolved = dohLookup(endpoint, hostname)
+            if (resolved.isNotEmpty()) {
+                ServerState.info("DoH ($providerName) resolved $hostname -> ${resolved.firstOrNull()?.hostAddress}")
+                hostCache[hostname] = CachedHostProtocol(resolved)
+                return resolved
             }
         }
 
-        // Return default system lookup if all fail
+        // Nothing resolved: let the caller see the system error
         return Dns.SYSTEM.lookup(hostname)
+    }
+
+    private val DOH_ENDPOINTS = listOf(
+        "Cloudflare" to "https://1.1.1.1/dns-query",
+        "Google" to "https://8.8.8.8/resolve",
+        "Cloudflare 2" to "https://1.0.0.1/dns-query",
+        "Google 2" to "https://8.8.4.4/resolve",
+        "Quad9" to "https://9.9.9.9:5053/dns-query",
+    )
+
+    /** Bootstrap client: the resolvers are reached by IP, so it needs no DNS of its own. */
+    private val dohClient by lazy {
+        okhttp3.OkHttpClient.Builder()
+            .dns(Dns.SYSTEM)
+            .connectTimeout(4, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+
+    private val dohJson = kotlinx.serialization.json.Json { ignoreUnknownKeys = true; isLenient = true }
+
+    private fun dohLookup(endpoint: String, hostname: String): List<InetAddress> {
+        val out = LinkedHashSet<InetAddress>()
+        for (type in listOf("A", "AAAA")) {
+            try {
+                val url = okhttp3.HttpUrl.Builder().scheme("https").also { b ->
+                    val u = endpoint.toHttpUrl()
+                    b.host(u.host).port(u.port).encodedPath(u.encodedPath)
+                }.addQueryParameter("name", hostname).addQueryParameter("type", type).build()
+                val req = okhttp3.Request.Builder().url(url).header("Accept", "application/dns-json").build()
+                dohClient.newCall(req).execute().use { r ->
+                    if (!r.isSuccessful) return@use
+                    val answers = dohJson.parseToJsonElement(r.body?.string().orEmpty())
+                        .let { it as? kotlinx.serialization.json.JsonObject }?.get("Answer") as? kotlinx.serialization.json.JsonArray
+                        ?: return@use
+                    for (a in answers) {
+                        val o = a as? kotlinx.serialization.json.JsonObject ?: continue
+                        val t = (o["type"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull()
+                        if (t != 1 && t != 28) continue // skip CNAME records, the address records follow
+                        val data = (o["data"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: continue
+                        // The IP literal is parsed directly, no lookup happens
+                        runCatching { InetAddress.getByName(data) }.getOrNull()
+                            ?.takeIf { !it.isAnyLocalAddress && !it.isLoopbackAddress }?.let { out.add(it) }
+                    }
+                }
+            } catch (_: Exception) { /* next record type / resolver */ }
+        }
+        // IPv4 first: most phones' IPv6 routes to these sites are poor
+        return out.sortedByDescending { it is Inet4Address }
     }
 
     /**

@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.1
+
+- **Real DNS-over-HTTPS:** the "DoH fallback" only asked the phone's own DNS again. It now really asks Cloudflare (1.1.1.1 / 1.0.0.1), Google (8.8.8.8 / 8.8.4.4) and Quad9 over HTTPS by IP when the phone's DNS fails or answers 0.0.0.0 / 127.0.0.1 (DNS-blocked sites like desicinemas.to), IPv4 first. Applies to extensions, the media server and the tunnel.
+- **Cloudflare challenges (as in Raghav's extensions):** the check is first tried in a hidden WebView; if it does not pass in 15 s (a "tap the box" check), the same WebView is shown in a window over the app so you can finish it. The clearance cookie is saved with the WebView's exact User-Agent and reused for every later request to that site (6 h). The window is shown at most once per site every 5 minutes.
+
 ## 1.5.0
 
 - **Sorting fixed at the root (Android):** the quality of each link was never passed on, so every link looked like "unknown quality" and was sorted alphabetically. Quality, link type and server are now passed on, so the list goes from the highest resolution to the lowest. Links are also read for their resolution from the name when nothing else says.
