@@ -24,6 +24,17 @@ private fun Any.rating10(): Double? {
     return if (legacy > 0) legacy / 1000.0 else null
 }
 
+/** AniList / MyAnimeList ids an anime extension put on its LoadResponse (syncData), 0 when absent. */
+private fun Any.syncId(vararg keys: String): Int? {
+    val map = get("getSyncData") as? Map<*, *> ?: return null
+    for ((k, v) in map) {
+        val key = k?.toString()?.lowercase() ?: continue
+        if (keys.any { key == it || key.contains(it) }) (v as? String)?.trim()?.toIntOrNull()?.let { return it }
+        if (keys.any { key == it || key.contains(it) }) (v as? Number)?.toInt()?.let { return it }
+    }
+    return null
+}
+
 fun MediaInfo.withExtras(resp: Any): MediaInfo {
     val genres = (resp.get("getTags") as? List<*>)?.mapNotNull { (it as? String)?.trim()?.takeIf { s -> s.isNotEmpty() } }
         ?.distinct()?.take(30)?.takeIf { it.isNotEmpty() }
@@ -42,6 +53,8 @@ fun MediaInfo.withExtras(resp: Any): MediaInfo {
         cast = cast,
         runtimeMinutes = resp.int("getDuration")?.takeIf { it > 0 },
         contentRating = resp.str("getContentRating"),
+        aniListId = resp.syncId("anilist"),
+        malId = resp.syncId("myanimelist", "mal"),
     )
 }
 

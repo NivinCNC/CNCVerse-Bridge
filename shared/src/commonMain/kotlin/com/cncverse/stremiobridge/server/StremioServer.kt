@@ -218,6 +218,8 @@ object StremioServer {
          * (a TV or phone that cannot decode 4K gets playable links first). "" = no cap.
          */
         val maxResolution: String = "",
+        /** Streams with a KNOWN resolution below this are hidden ("720p" by default; "" = show everything). */
+        val minResolution: String = "720p",
         /** Read adaptive HLS playlists to find their real resolution instead of listing them as "Auto". */
         val probeHls: Boolean = true,
         /** Show the results once, when every extension has answered (up to 45 s) instead of after a few seconds. */
@@ -259,6 +261,7 @@ object StremioServer {
             maxSizeGb = max,
             maxStreamsPerResolution = p.maxStreamsPerResolution.coerceIn(0, 100),
             maxResolution = p.maxResolution.takeIf { it in SELECTABLE_RESOLUTIONS } ?: "",
+            minResolution = p.minResolution.takeIf { it in SELECTABLE_RESOLUTIONS } ?: "",
             animeAudio = p.animeAudio.takeIf { it in setOf("all", "sub", "dub") } ?: "all",
             providerOrder = p.providerOrder.map { it.trim() }.filter { it.isNotEmpty() }.distinct(),
         )
@@ -870,11 +873,22 @@ object StremioServer {
         // Drop results whose link is exactly the same as an earlier (better ranked) one; different links are never merged
         val unique = filtered.distinctBy<StremioStream, Any> { it.url ?: it.externalUrl ?: it.infoHash?.let { h -> "magnet:$h" } ?: it.ytId?.let { y -> "yt:$y" } ?: it }
 
-        val formatted = com.cncverse.stremiobridge.format.StreamFormatter.applyFor(
-            unique,
+        // Streams of upstream add-ons already carry their add-on's own name and description: keep those
+        // (marked with the add-on's name) and format only this bridge's own streams
+        val (fromUpstream, own) = unique.partition { it.info?.linkType == "UPSTREAM" }
+        val ownFormatted = com.cncverse.stremiobridge.format.StreamFormatter.applyFor(
+            own,
             com.cncverse.stremiobridge.format.StreamFormatter.contextFromId(type, id),
             null,
-        )
+        ).associateBy { it.url ?: it.infoHash ?: it.hashCode().toString() }
+        val upstreamTagged = fromUpstream.associateBy({ it.url ?: it.infoHash ?: it.hashCode().toString() }) { u ->
+            val addon = u.info?.addonName.orEmpty()
+            u.copy(name = listOf(addon.ifBlank { "Upstream" }, u.name?.takeIf { n -> n != addon }).filterNotNull().joinToString(" • "))
+        }
+        val formatted = unique.map { st ->
+            val k = st.url ?: st.infoHash ?: st.hashCode().toString()
+            ownFormatted[k] ?: upstreamTagged[k] ?: st
+        }
         // "Hide subtitles": no subtitle tracks go out (after formatting, so the description stays truthful)
         val out = (if (p.hideSubtitles) formatted.map { it.copy(subtitles = null) } else formatted)
             .map { withStreamBase(it) }
@@ -1434,6 +1448,28 @@ object StremioServer {
         }
     }
 
+    private val tmdbSeasonCounts = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    /** Number of episodes TMDB lists for season [season] of the series behind [ext]; null when unknown. */
+    private suspend fun tmdbSeasonEpisodeCount(ext: ExternalId, season: Int): Int? {
+        val key = "${ext.scheme}:${ext.key}:$season"
+        tmdbSeasonCounts[key]?.let { return it }
+        return try {
+            val tvId = when (ext.scheme) {
+                "tmdb" -> ext.key
+                "imdb", "tvdb" -> fetchTmdbJson("find/${ext.key}?external_source=" + (if (ext.scheme == "imdb") "imdb_id" else "tvdb_id"))
+                    ?.get("tv_results")?.let { (it as? kotlinx.serialization.json.JsonArray)?.firstOrNull() as? kotlinx.serialization.json.JsonObject }
+                    ?.get("id")?.jsonPrimitive?.contentOrNull
+                else -> null
+            } ?: return null
+            val n = (fetchTmdbJson("tv/$tvId/season/$season")?.get("episodes") as? kotlinx.serialization.json.JsonArray)?.size
+            if (n != null && n > 0) tmdbSeasonCounts[key] = n
+            n?.takeIf { it > 0 }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Throwable) { null }
+    }
+
     /** Title + year for any supported id; null when the source has no such item. */
     private suspend fun resolveExternal(type: String, ext: ExternalId): Pair<String, Int?>? {
         if (ext.scheme == "imdb" || ext.scheme == "tmdb") return resolveGenericMedia(type, ext.key)
@@ -1752,7 +1788,7 @@ object StremioServer {
             "1440p", "1080p" -> "1080p"
             "720p" -> "720p"
             "576p", "480p" -> "480p"
-            "360p" -> "360p"
+            "360p", "240p", "144p", "180p" -> "360p"
             else -> "other"
         }
 
@@ -1804,6 +1840,14 @@ object StremioServer {
         // 1. Exclude CAM / Screener rips
         if (profile.excludeCam) {
             result = result.filter { !isCamStream(it) }
+        }
+
+        // 1a. Below the minimum resolution (only when the resolution is known - unknown quality stays, listed last)
+        val minTier = tierRank(profile.minResolution.takeIf { it.isNotEmpty() })
+        if (minTier > 0) {
+            val kept = result.filter { val t = tierRank(detectStreamResolution(it)); t == 0 || t >= minTier }
+            // never leave the list empty because of this filter
+            if (kept.isNotEmpty()) result = kept
         }
 
         // 1b. Streams whose resolution cannot be found at all
@@ -2033,7 +2077,16 @@ object StremioServer {
                 ServerState.debug("Media resolve success: title='$title', year=$year")
                 // tt / tmdb / tvdb ids of anime: collect every alternative name (AniList, Kitsu, MyAnimeList) too
                 val animeNames = animeInfo ?: if ((type == "series" || type == "anime") && ext.scheme in setOf("imdb", "tmdb", "tvdb")) {
-                    AnimeResolver.fromTitle(title, year)
+                    val base = AnimeResolver.fromTitle(title, year)
+                    val sn = ext.season
+                    if (base != null && sn != null && sn > 1) {
+                        // Later season: AniList lists it as its own entry (own names, own episode count)
+                        val s2 = AnimeResolver.fromTitle("$title Season $sn", null)
+                            ?: AnimeResolver.fromTitle("$title ${mapOf(2 to "2nd", 3 to "3rd").getOrDefault(sn, "${sn}th")} Season", null)
+                        if (s2 != null && AnimeMatcher.seasonNumber(AnimeMatcher.normalize(s2.titles.first())) == sn)
+                            s2.copy(titles = (s2.titles + base.titles).distinct(), seasonHint = sn)
+                        else base.copy(seasonHint = sn, episodeCount = null, aniListId = null, malId = null)
+                    } else base
                 } else null
 
                 // Exclude live-TV-only extensions from generic TMDB VOD searches —
@@ -2226,14 +2279,18 @@ object StremioServer {
 
         val requestedSeason = if (type == "series" && id.contains(":")) ExternalIds.parse(id)?.season else null
 
-        val bestMatch = (if (anime != null) {
+        // tt / tmdb / tvdb ids carry the real season; kitsu / MAL / AniList ids name one season entry already
+        val parsedId = ExternalIds.parse(id)
+        val animeSeason = if (anime != null && parsedId != null && parsedId.scheme !in ExternalIds.ANIME_SCHEMES) parsedId.season else null
+        val pool = ArrayList<SearchResult>(searchResults)
+
+        var bestMatch = (if (anime != null) {
             // Anime: fuzzy match against every known title (romaji, English, synonyms) and the season;
             // results of all spellings are pooled so the best one wins, not the first one over the bar
-            val pool = ArrayList<SearchResult>(searchResults)
-            var found = AnimeMatcher.pickBest(pool, anime)
-            var foundScore = found?.let { AnimeMatcher.score(it, anime, null) } ?: 0.0
+            var found = AnimeMatcher.pickBest(pool, anime, animeSeason)
+            var foundScore = found?.let { AnimeMatcher.score(it, anime, animeSeason) } ?: 0.0
             if (foundScore < 0.92) {
-                for (term in AnimeMatcher.searchTerms(anime).filter { !it.equals(title, true) }) {
+                for (term in AnimeMatcher.searchTerms(anime, animeSeason).filter { !it.equals(title, true) }) {
                     val more = try {
                         SearchLoadCache.getSearch(cacheKey, term)
                             ?: api.search(term).also { SearchLoadCache.putSearch(cacheKey, term, it) }
@@ -2242,8 +2299,8 @@ object StremioServer {
                         emptyList()
                     }
                     more.filter { m -> pool.none { it.url == m.url } }.forEach { pool += it }
-                    found = AnimeMatcher.pickBest(pool, anime)
-                    foundScore = found?.let { AnimeMatcher.score(it, anime, null) } ?: 0.0
+                    found = AnimeMatcher.pickBest(pool, anime, animeSeason)
+                    foundScore = found?.let { AnimeMatcher.score(it, anime, animeSeason) } ?: 0.0
                     if (foundScore >= 0.92) break
                 }
             }
@@ -2284,7 +2341,7 @@ object StremioServer {
 
         ServerState.debug("[${api.name}] Best match: '${bestMatch.name}' (url: ${bestMatch.url})")
         val cachedLoad = SearchLoadCache.getLoad(cacheKey, bestMatch.url)
-        val mediaInfo = try {
+        var mediaInfo = try {
             if (cachedLoad != null) {
                 cachedLoad.info
             } else {
@@ -2302,6 +2359,47 @@ object StremioServer {
             ServerState.debug("[STREAM_EMPTY] [${api.name}] MediaInfo load returned null for ${bestMatch.url}")
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "MediaInfo null for match")
             return emptyList()
+        }
+
+        // Season check by episode count: the entry must have about as many episodes as the season we want
+        if (anime != null && parsedId != null) {
+            val expected = ArrayList<Int>()
+            if (parsedId.scheme in ExternalIds.ANIME_SCHEMES) {
+                anime.episodeCount?.let { expected += it }
+            } else {
+                animeSeason?.let { sn -> tmdbSeasonEpisodeCount(parsedId, sn)?.let { expected += it } }
+                if (animeSeason == null || anime.seasonHint == animeSeason) anime.episodeCount?.let { expected += it }
+            }
+            val running = anime.year?.let { it >= java.time.Year.now().value - 1 } ?: true
+            // The entry's own AniList / MyAnimeList id, when the extension reports it: the exact season entry
+            fun idVerdict(mi: MediaInfo): Boolean? {
+                if (anime.aniListId != null && mi.aniListId != null) return anime.aniListId == mi.aniListId
+                if (anime.malId != null && mi.malId != null) return anime.malId == mi.malId
+                return null
+            }
+            fun fits(mi: MediaInfo): Boolean {
+                idVerdict(mi)?.let { return it }
+                val eps = mi.episodes.orEmpty()
+                if (eps.isEmpty() || eps.any { (it.season ?: 1) > 1 }) return true
+                val n = eps.mapNotNull { it.episode }.distinct().size.takeIf { it > 0 } ?: eps.size
+                return AnimeMatcher.countFits(n, expected, running, parsedId.episode)
+            }
+            if ((expected.isNotEmpty() || idVerdict(mediaInfo) != null) && !fits(mediaInfo)) {
+                ServerState.debug("[${api.name}] '${bestMatch.name}' has ${mediaInfo.episodes?.size} episodes, wanted about $expected - trying other entries")
+                var replaced = false
+                for (c in AnimeMatcher.rank(pool, anime, animeSeason).filter { it.url != bestMatch.url }) {
+                    val mi = try {
+                        SearchLoadCache.getLoad(cacheKey, c.url)?.info
+                            ?: api.load(c.url)?.also { SearchLoadCache.putLoad(cacheKey, c.url, it) }
+                    } catch (e: Throwable) { kotlinx.coroutines.currentCoroutineContext().ensureActive(); null }
+                    if (mi != null && fits(mi)) { bestMatch = c; mediaInfo = mi; replaced = true; break }
+                }
+                if (!replaced) {
+                    ServerState.debug("[STREAM_EMPTY] [${api.name}] no entry has the episode count of the wanted season ($expected)")
+                    StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "No entry with the wanted season's episode count")
+                    return emptyList()
+                }
+            }
         }
 
         var dataUrlToLoad = mediaInfo.dataUrl
@@ -2537,6 +2635,9 @@ data class MediaInfo(
     val castPeople: List<CastPerson>? = null,
     val runtimeMinutes: Int? = null,
     val contentRating: String? = null,
+    /** AniList / MyAnimeList ids the extension reports for this entry (anime), null when it does not. */
+    val aniListId: Int? = null,
+    val malId: Int? = null,
 )
 
 fun SearchResult.toStremiMeta(pluginInternalName: String, stremioType: String): StremioMeta {

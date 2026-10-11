@@ -342,6 +342,22 @@ fun StreamsCard() {
                 )
             }
         }
+        Spacer(Modifier.height(6.dp))
+        Text("Hide links below", color = TextSecondary, fontSize = 11.sp)
+        Text("Links whose resolution is known to be lower are hidden (links of unknown quality stay, listed last)", color = TextMuted, fontSize = 10.sp)
+        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            listOf("" to "Show all", "480p" to "480p", "720p" to "720p", "1080p" to "1080p").forEach { (value, label) ->
+                FilterChip(
+                    selected = p.minResolution == value,
+                    onClick = { update(p.copy(minResolution = value)) },
+                    label = { Text(label, fontSize = 11.sp) },
+                    colors = FilterChipDefaults.filterChipColors(
+                        selectedContainerColor = Violet600, selectedLabelColor = TextPrimary,
+                        containerColor = AmoledCard2, labelColor = TextSecondary,
+                    ),
+                )
+            }
+        }
         SwitchRow("Show results once, after all extensions answered", "Waits for every extension (up to 45 s) and shows the full list at once instead of an early partial list", p.waitForAll) {
             update(p.copy(waitForAll = it))
         }

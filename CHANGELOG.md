@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.5.0
+
+- **Sorting fixed at the root (Android):** the quality of each link was never passed on, so every link looked like "unknown quality" and was sorted alphabetically. Quality, link type and server are now passed on, so the list goes from the highest resolution to the lowest. Links are also read for their resolution from the name when nothing else says.
+- **Minimum resolution:** links known to be below 720p are hidden by default (Settings -> Streams -> "Hide links below": show all / 480p / 720p / 1080p). Links of unknown quality stay and are listed after the known ones. The list is never emptied by this filter.
+- **Season checks (anime):** for a later season, the names tried include "Title Season 2", "Title 2nd Season", "Title II" and "Title 2", and the season is checked against the name. The entry found on a site must also have the right number of episodes (from TMDB for the season, or from the AniList / Kitsu entry) and, when the extension reports it, the same AniList / MyAnimeList id. A wrong-season entry is skipped and the next best entry is tried; if none fits, that extension shows nothing rather than the wrong season.
+- **Better names:** `{stream.host}` (the site a link comes from) tells apart links that looked identical; the name line shows resolution, extension and Sub / Dub / Hardsub; the default layout was reworked (an old saved default is upgraded automatically). Links from Upstream add-ons keep their own names and are no longer reformatted.
+- **Free tunnel link:** the quick tunnel of the last run is reused on the next start, so the link stays the same for as long as Cloudflare keeps it alive. A new link is only made when the old one is gone. Cloudflare does not promise a fixed link for free tunnels without an account; for a link that never changes use your own tunnel token and domain (Settings -> Cloudflare Tunnel).
+
 ## 1.4.3
 
 - **Free Cloudflare tunnel:** cloudflared is now started the way pencarimovie-server starts it - transport auto (QUIC, falling back to HTTP/2), a writable HOME, the system CA store (`/system/etc/security/cacerts`) on Android, an ingress config file, loopback origin (`127.0.0.1`) and many retries. The free link is read from cloudflared's local metrics endpoint (`/quicktunnel`) instead of only scraping the log. The app-created quick tunnel is still tried first, the metrics-based start is the fallback; each attempt is given up after 40 s.

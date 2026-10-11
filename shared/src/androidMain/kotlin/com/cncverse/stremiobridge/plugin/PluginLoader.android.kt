@@ -760,10 +760,22 @@ private fun Any.reflectToStreams(pluginName: String, api: Any? = null): List<Str
         // If we rewrote the URL (e.g. for MPD), our own proxy handles the headers, so don't ask Stremio to proxy it again.
         val passProxyHeaders = finalHeaders.isNotEmpty() && url == finalUrl
         
+        // What the extension said about the link: the formatter, the quality sort, the HLS probe and the
+        // media server all read it (without it quality was only readable from the "Plugin - 720p" name)
+        val linkType = runCatching { cls.getMethod("getType").invoke(this)?.toString() }.getOrNull()
+        val source = runCatching { cls.getMethod("getSource").invoke(this) as? String }.getOrNull()
+
         listOf(StremioStream(
             name = streamName, title = n, url = finalUrl,
             behaviorHints = if (passProxyHeaders) StreamBehaviorHints(proxyHeaders = ProxyHeaders(finalHeaders)) else null,
-            clearkey = clearkeyHex
+            clearkey = clearkeyHex,
+            info = com.cncverse.stremiobridge.model.StreamInfo(
+                addonName = pluginName,
+                quality = q?.toIntOrNull()?.takeIf { it > 0 },
+                linkType = linkType,
+                linkName = n,
+                source = source,
+            ),
         ))
     } catch (e: Exception) {
         ServerState.warn("reflectToStreams exception plugin=$pluginName class=${this.javaClass.name}: ${e.message}")

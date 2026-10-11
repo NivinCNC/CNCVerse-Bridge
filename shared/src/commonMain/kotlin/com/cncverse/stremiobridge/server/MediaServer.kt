@@ -237,7 +237,7 @@ object MediaServer {
         val p = prefs
         if (!p.enabled || root == null) return s
         val url = s.url ?: return s
-        if (s.info?.source == "upstream") return s
+        if (s.info?.linkType == "UPSTREAM") return s
         if (s.externalUrl != null || s.infoHash != null || s.ytId != null || s.clearkey != null) return s
         if (!url.startsWith("http", true) || OWN_PATH.containsMatchIn(url)) return s
         val host = runCatching { java.net.URI(url).host?.lowercase() }.getOrNull() ?: return s

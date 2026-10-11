@@ -280,7 +280,7 @@ object StreamVariables {
         "stream.resolution", "stream.quality", "stream.specs", "stream.visualTags", "stream.encode",
         "stream.audioTags", "stream.audioChannels", "stream.streamType", "stream.size",
         "stream.languages", "stream.subtitles", "stream.seasonEpisode", "stream.season",
-        "stream.episode", "stream.audioKind", "stream.subType", "stream.source", "stream.label", "stream.filename", "stream.name", "stream.title",
+        "stream.episode", "stream.audioKind", "stream.subType", "stream.host", "stream.source", "stream.label", "stream.filename", "stream.name", "stream.title",
     )
 
     private fun rx(p: String) = Regex("(?<![A-Za-z0-9])(?:$p)(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
@@ -435,8 +435,12 @@ object StreamVariables {
      * Never the matched release/page title — single source of truth for the
      * formatter, the profile quality filter and stream sorting.
      */
+    private val NAME_RES_RX = Regex("\\s-\\s(\\d{3,4})p\\s*$")
+
     fun resolutionOf(stream: StremioStream): String? =
         resolutionFrom(stream.info?.quality, stream.info?.linkName ?: stream.title)
+            // the bridge itself writes "<extension> - 720p" as the last line of the name: reliable when nothing else says
+            ?: stream.name?.substringAfterLast('\n')?.let { NAME_RES_RX.find(it)?.groupValues?.get(1)?.let { r -> r + "p" } }
 
     /**
      * File size in bytes when the link's own name says so, else null - never guessed from a
@@ -456,6 +460,14 @@ object StreamVariables {
     private val SUB_RX = Regex("(?<![A-Za-z0-9])sub(?:bed|s)?(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
     private val HARDSUB_RX = Regex("hard[ _-]?sub(?:bed|s)?|(?<![A-Za-z0-9])h-?sub(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
     private val SOFTSUB_RX = Regex("soft[ _-]?sub(?:bed|s)?|(?<![A-Za-z0-9])s-?sub(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
+
+    /** The site a link points at ("kwik.cx"); null for this bridge's own relay links and magnets. */
+    fun hostOf(stream: StremioStream): String? {
+        val u = stream.url ?: return null
+        val h = runCatching { java.net.URI(u).host }.getOrNull()?.lowercase()?.removePrefix("www.") ?: return null
+        if (h == "127.0.0.1" || h == "localhost" || h in com.cncverse.stremiobridge.state.ServerState.ownHosts) return null
+        return h
+    }
 
     /** "Dub" / "Sub" for anime links the extension labelled; null when it did not say. */
     fun audioKindOf(stream: StremioStream): String? {
@@ -529,6 +541,7 @@ object StreamVariables {
             "stream.seasonepisode" to seasonEpisode,
             "stream.season" to season?.toLong(),
             "stream.episode" to episode?.toLong(),
+            "stream.host" to hostOf(stream),
             "stream.audiokind" to audioKindOf(stream),
             "stream.subtype" to subTypeOf(stream),
             // Server/extractor the extension reports (e.g. "FslServer", "HubCloud");
@@ -620,15 +633,8 @@ object StreamFormatter {
             id = "cncverse",
             title = "🌀 CNCVerse Modern",
             description = "Balanced with resolution badges, specs, source, and compact audio/subs.",
-            nameTemplate = "🌀 CNCVerse {stream.resolution::=2160p[\"❄️ 4K\"||\"{stream.resolution::=1080p[\"🧊 {stream.resolution::default('Auto')}\"||\"🎬 {stream.resolution::default('Auto')}\"]}\"]} • {addon.name}",
-            descriptionTemplate = "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('CNCVerse stream')}\"]}\n" +
-                "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
-                "{stream.audiokind::exists[\"🗣️ {stream.audiokind}{stream.subtype::exists[\" • {stream.subtype}\"||\"\"]}\"||\"\"]}\n" +
-                "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::default('Auto')} • {stream.streamType::default('HLS')}\"]}\n" +
-                "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}\n" +
-                "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}\n" +
-                "{stream.languages::exists[\"🎧 Audio: {stream.languages::join(', ')}\"||\"\"]}\n" +
-                "{stream.subtitles::exists[\"💬 Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
+            nameTemplate = PRESET_NAME,
+            descriptionTemplate = PRESET_DESCRIPTION
         ),
         FormatterPreset(
             id = "torrentio",
@@ -662,16 +668,28 @@ object StreamFormatter {
     )
 
     const val PRESET_NAME =
-        "🌀 CNCVerse {stream.resolution::=2160p[\"❄️ 4K\"||\"{stream.resolution::=1080p[\"🧊 {stream.resolution::default('Auto')}\"||\"🎬 {stream.resolution::default('Auto')}\"]}\"]} • {addon.name}"
+        "🌀 CNCVerse {stream.resolution::=2160p[\"❄️ 4K\"||\"{stream.resolution::=1080p[\"🧊 {stream.resolution::default('Auto')}\"||\"🎬 {stream.resolution::default('Auto')}\"]}\"]} • {addon.name}" +
+            "{stream.subtype::exists[\" • {stream.subtype}\"||\"{stream.audiokind::exists[\" • {stream.audiokind}\"||\"\"]}\"]}"
     const val PRESET_DESCRIPTION =
         "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('CNCVerse stream')}\"]}\n" +
         "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
         "{stream.audiokind::exists[\"🗣️ {stream.audiokind}{stream.subtype::exists[\" • {stream.subtype}\"||\"\"]}\"||\"\"]}\n" +
         "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::default('Auto')} • {stream.streamType::default('HLS')}\"]}\n" +
-        "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}\n" +
+        "🛰️ {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}{stream.host::exists[\" • {stream.host}\"||\"\"]}\n" +
         "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}\n" +
         "{stream.languages::exists[\"🎧 Audio: {stream.languages::join(', ')}\"||\"\"]}\n" +
         "{stream.subtitles::exists[\"💬 Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
+
+    /** Built-in layouts of earlier versions: a saved copy of one of them is moved to the current layout. */
+    private val OLD_PRESET_DESCRIPTIONS: List<String> = run {
+        val v2 = PRESET_DESCRIPTION.lines().filter { !it.contains("stream.host") }.joinToString("\n") +
+            "\n" // placeholder to keep the list non-empty on odd inputs
+        val srcLine = "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}"
+        val v2full = PRESET_DESCRIPTION.lines().joinToString("\n") { if (it.contains("stream.host")) srcLine else it }
+        val v1 = v2full.lines().filter { !it.contains("stream.audiokind") }.joinToString("\n")
+        listOf(v2full, v1, v2.trimEnd())
+    }
+    private val OLD_PRESET_NAME = "🌀 CNCVerse {stream.resolution::=2160p[\"❄️ 4K\"||\"{stream.resolution::=1080p[\"🧊 {stream.resolution::default('Auto')}\"||\"🎬 {stream.resolution::default('Auto')}\"]}\"]} • {addon.name}"
 
     private var file: File? = null
 
@@ -687,9 +705,9 @@ object StreamFormatter {
         val loaded = runCatching { if (f.exists()) json.decodeFromString<StreamFormatterConfig>(f.readText()) else null }
             .onFailure { ServerState.warn("Stream formatter config unreadable: ${it.message}") }
             .getOrNull()?.let { c ->
-                // Saved copy of the previous built-in layout: move it to the new one (adds the Sub/Dub/Hardsub line)
-                val oldDesc = PRESET_DESCRIPTION.lines().filter { !it.contains("stream.audiokind") }.joinToString("\n")
-                if (c.descriptionTemplate.replace("\\n", "\n") == oldDesc || c.descriptionTemplate == oldDesc) c.copy(descriptionTemplate = PRESET_DESCRIPTION) else c
+                // Saved copy of an earlier built-in layout: move it to the current one
+                if (c.nameTemplate == OLD_PRESET_NAME && c.descriptionTemplate in OLD_PRESET_DESCRIPTIONS)
+                    c.copy(nameTemplate = PRESET_NAME, descriptionTemplate = PRESET_DESCRIPTION) else c
             } ?: StreamFormatterConfig(enabled = true, nameTemplate = PRESET_NAME, descriptionTemplate = PRESET_DESCRIPTION)
         runCatching { install(loaded) }.onFailure {
             ServerState.warn("Stream formatter disabled — template error: ${it.message}")

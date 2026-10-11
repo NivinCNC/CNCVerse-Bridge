@@ -106,7 +106,7 @@ object UpstreamAddons {
                     info = StreamInfo(
                         addonName = addon.name,
                         linkName = listOfNotNull(s.name, s.title).joinToString(" ").ifBlank { label },
-                        source = "upstream",
+                        linkType = "UPSTREAM",
                         providerName = addon.name,
                     ),
                 )

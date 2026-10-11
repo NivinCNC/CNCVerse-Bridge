@@ -123,6 +123,10 @@ object CloudflaredManager {
                 if (!quick && token != null) {
                     attempts += Attempt("named", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--token", token)) }, publicUrl)
                 } else {
+                    // 0) The quick tunnel of the last run: the link stays the same while Cloudflare still honours it
+                    savedQuickTunnel(workDir)?.let { q ->
+                        attempts += Attempt("quick (saved link)", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--cred-file", q.credsFile, q.id)) }, "https://${q.hostname}")
+                    }
                     // 1) Create the quick tunnel ourselves (this app's DNS works on Android; cloudflared's own lookup does not), then run it
                     createQuickTunnel(workDir)?.let { q ->
                         attempts += Attempt("quick (api)", base("4").also { it.addAll(listOf("--url", localUrl, "run", "--cred-file", q.credsFile, q.id)) }, "https://${q.hostname}")
@@ -158,9 +162,9 @@ object CloudflaredManager {
 
                     // An attempt that has not connected after 40 s is given up so the next one can try
                     val watchdog = launch {
-                        delay(40_000)
+                        delay(if (at.label.contains("saved")) 25_000 else 40_000)
                         if (!registered.get() && !last) {
-                            ServerState.warn("Cloudflare tunnel (${at.label}) did not connect in 40 s - trying another way")
+                            ServerState.warn("Cloudflare tunnel (${at.label}) did not connect in time - trying another way")
                             runCatching { process.destroyForcibly() }
                         }
                     }
@@ -257,6 +261,17 @@ object CloudflaredManager {
         null
     }
 
+    /** The quick tunnel created on an earlier start (credentials file + its hostname), if any. */
+    private fun savedQuickTunnel(dir: File): QuickTunnel? = try {
+        val f = File(dir, "quick-tunnel.json")
+        if (!f.exists()) null else {
+            val j = kotlinx.serialization.json.Json.parseToJsonElement(f.readText()).jsonObject
+            val id = j["TunnelID"]?.jsonPrimitive?.contentOrNull
+            val host = j["Hostname"]?.jsonPrimitive?.contentOrNull
+            if (id == null || host == null) null else QuickTunnel(id, host, f.absolutePath)
+        }
+    } catch (e: Exception) { null }
+
     private class QuickTunnel(val id: String, val hostname: String, val credsFile: String)
 
     /**
@@ -281,7 +296,7 @@ object CloudflaredManager {
                 if (id == null || host == null || tag == null || secret == null) { ServerState.warn("Quick tunnel answer incomplete"); null }
                 else {
                     val creds = File(dir, "quick-tunnel.json")
-                    creds.writeText("{\"AccountTag\":\"$tag\",\"TunnelSecret\":\"$secret\",\"TunnelID\":\"$id\"}")
+                    creds.writeText("{\"AccountTag\":\"$tag\",\"TunnelSecret\":\"$secret\",\"TunnelID\":\"$id\",\"Hostname\":\"$host\"}")
                     QuickTunnel(id, host, creds.absolutePath)
                 }
             }

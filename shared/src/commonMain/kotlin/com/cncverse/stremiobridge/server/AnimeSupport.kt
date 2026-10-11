@@ -25,6 +25,9 @@ data class AnimeInfo(
     val episodeCount: Int?,
     val format: String?,
     val seasonHint: Int?,
+    /** The AniList / MyAnimeList ids of this exact entry (used to confirm an extension's entry), when known. */
+    val aniListId: Int? = null,
+    val malId: Int? = null,
 ) {
     val isMovie: Boolean get() = format.equals("MOVIE", true) || format.equals("movie", true)
 }
@@ -73,7 +76,9 @@ object AnimeResolver {
             format = media.str("format"),
             seasonHint = AnimeMatcher.seasonNumber(AnimeMatcher.normalize(titles.first())),
         )
-        return Hit(info, (media["id"] as? JsonPrimitive)?.intOrNull, (media["idMal"] as? JsonPrimitive)?.intOrNull)
+        val alId = (media["id"] as? JsonPrimitive)?.intOrNull
+        val mal = (media["idMal"] as? JsonPrimitive)?.intOrNull
+        return Hit(info.copy(aniListId = alId, malId = mal), alId, mal)
     }
 
     private fun aniListById(field: String, id: Int): Hit? = aniListHit("Int", "$field:\$v", JsonPrimitive(id))
@@ -170,7 +175,7 @@ object AnimeResolver {
                         when {
                             fromKitsu == null -> al
                             al == null -> fromKitsu
-                            else -> fromKitsu.copy(titles = (fromKitsu.titles + al.titles).distinct(), year = fromKitsu.year ?: al.year)
+                            else -> fromKitsu.copy(titles = (fromKitsu.titles + al.titles).distinct(), year = fromKitsu.year ?: al.year, aniListId = al.aniListId, malId = al.malId)
                         }
                     }
                     "anidb" -> mapToAniList("anidb", ext.key)?.let { aniListById("id", it) }?.let { enrich(it) }
@@ -292,7 +297,7 @@ object AnimeMatcher {
     }
 
     /** Search terms to try, most promising first (an extension's search can be picky about the spelling). */
-    fun searchTerms(info: AnimeInfo, max: Int = 9): List<String> {
+    fun searchTerms(info: AnimeInfo, season: Int? = null, max: Int = 12): List<String> {
         val out = ArrayList<String>()
         fun add(t: String?) {
             val c = t?.trim().orEmpty()
@@ -312,7 +317,46 @@ object AnimeMatcher {
             val w = base(normalize(t)).split(' ').filter { it.isNotBlank() }
             if (w.size > 4) add(w.take(3).joinToString(" "))
         }
-        return out.take(max)
+        // 5. later seasons: sites name them "Title Season 2", "Title 2nd Season", "Title II" or "Title 2"
+        val n = season ?: info.seasonHint
+        if (n != null && n > 1) {
+            val roman = mapOf(2 to "II", 3 to "III", 4 to "IV", 5 to "V")[n]
+            val ord = when (n) { 2 -> "2nd"; 3 -> "3rd"; else -> "${n}th" }
+            val seasonless = info.titles.take(3).map { base(normalize(it)) }.filter { it.isNotBlank() }.distinct()
+            val extra = ArrayList<String>()
+            for (t in seasonless) {
+                extra += "$t Season $n"; extra += "$t $ord Season"; if (roman != null) extra += "$t $roman"; extra += "$t $n"
+            }
+            // the season-specific names go first: they find the right entry directly
+            out.addAll(0, extra.filter { e -> out.none { it.equals(e, true) } }.take(6))
+        }
+        return out.distinct().take(max)
+    }
+
+    /** Search results that fit [info], best first (score at least [minScore]). */
+    fun rank(results: List<SearchResult>, info: AnimeInfo, wantedSeason: Int? = null, limit: Int = 4, minScore: Double = 0.62): List<SearchResult> =
+        results.map { it to score(it, info, wantedSeason) }
+            .filter { it.second >= minScore }
+            .sortedByDescending { it.second }
+            .map { it.first }
+            .distinctBy { it.url }
+            .take(limit)
+
+    /**
+     * Does an extension's entry (with [count] episodes) fit the season whose expected episode counts are
+     * [expected]? Entries that list several seasons (a franchise page) always pass: the episode pick handles them.
+     * A count equal to (or within a few episodes of) an expected one fits; fewer only for a running show.
+     */
+    fun countFits(count: Int, expected: List<Int>, running: Boolean, wantedEpisode: Int?): Boolean {
+        if (expected.isEmpty() || count <= 0) return true
+        return expected.any { e ->
+            val tol = maxOf(2, e / 4)
+            when {
+                count > e + tol -> false
+                count >= e - tol -> true
+                else -> running && (wantedEpisode == null || wantedEpisode <= count)
+            }
+        }
     }
 
     /** Fuzzy pick for movies and series: close spelling, same year (or none), same season. */
