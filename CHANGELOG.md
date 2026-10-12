@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.11
 
 - **Each link shows its file name:** next to the matched extension entry, the link description now has the name of the video file the link plays ("📄 File: Clevatess.S02E08.1080p.WEB-DL.mkv"), so you can check that it is the right file. It is read from the end of the link, from a `file=` / `filename=` part of the link, or from the link's own name when that is a file name; adaptive streams (HLS) and links without a file name get no file line. Built into all four layouts, and a new formatter variable `{stream.file}` for your own layouts. A saved copy of the 1.5.10 built-in layout is moved to the new one; custom layouts are left as they are.
 
