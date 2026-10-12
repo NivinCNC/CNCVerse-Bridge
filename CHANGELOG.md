@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- **Media server: many more links now seek instead of being downloaded whole:** when a link answers the open-ended range with the whole file, the media server now also tries (in order) the file its redirects end at (a CDN node with its own address), and a range in the middle of the file (some servers only ignore ranges starting at 0). Where the server honours closed ranges only, downloads and seeks ask for "bytes=N-(size-1)" instead. Only if none of this works is the link downloaded in order, and the log now says `NOT SEEKABLE` with the full link.
+
 - **"Hide non-seekable / non-playable files" no longer hides links that do seek:** the check ran on the address the extension gave, *before* Pixeldrain links were switched to the fast mirror. A `pixeldrain.com/u/ID` address is a web page, so it was judged "not a file" and hidden, although the mirror it becomes (`cdn.pixeldrain.eu.cc/ID`, which redirects to a changing `cdnNN.pixeldrain.eu.cc/api/file/ID`) is a seekable file. The mirror is now applied first and the check follows the redirect to the file it leads to. Also, a server that answers the one-byte test with the whole file but says `Accept-Ranges: bytes` is kept (the media server checks again when it plays); only a server that gives no sign of seeking is hidden.
 
 ## 1.5.12
