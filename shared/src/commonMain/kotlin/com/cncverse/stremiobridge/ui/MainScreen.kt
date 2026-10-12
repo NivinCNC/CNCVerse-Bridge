@@ -114,11 +114,8 @@ fun MainScreen(
         val isRefreshing by RepoState.isRefreshing.collectAsState()
 
         var selectedDest by remember { mutableStateOf(NavDest.Server) }
+        // A newer release of this fork, offered once per start (null: up to date, skipped, or offline)
         var otaRelease by remember { mutableStateOf<GithubRelease?>(null) }
-        var downloadProgress by remember { mutableStateOf<Float?>(null) }
-        var isDownloading by remember { mutableStateOf(false) }
-        val coroutineScope = rememberCoroutineScope()
-        val uriHandler = LocalUriHandler.current
 
         LaunchedEffect(Unit) {
             otaRelease = OtaUpdater.checkForUpdate()
@@ -131,88 +128,8 @@ fun MainScreen(
                 .fillMaxSize()
                 .background(AmoledBlack)
         ) {
-            if (otaRelease != null) {
-                AlertDialog(
-                    onDismissRequest = { },
-                    containerColor = AmoledCard,
-                    titleContentColor = TextPrimary,
-                    textContentColor = TextSecondary,
-                    shape = RoundedCornerShape(16.dp),
-                    title = { 
-                        Text("Update Available", fontWeight = FontWeight.Bold, fontSize = 20.sp) 
-                    },
-                    text = { 
-                        Column {
-                            Text("Version ${otaRelease!!.tagName} is available. Please download the latest release.", fontSize = 15.sp)
-                            
-                            if (otaRelease!!.body.isNotBlank()) {
-                                Spacer(modifier = Modifier.height(12.dp))
-                                Text("Release Notes:", fontWeight = FontWeight.SemiBold, fontSize = 14.sp, color = TextPrimary)
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .heightIn(max = 120.dp)
-                                        .background(AmoledSurface, RoundedCornerShape(8.dp))
-                                        .padding(8.dp)
-                                ) {
-                                    androidx.compose.foundation.rememberScrollState().let { scrollState ->
-                                        Text(
-                                            text = otaRelease!!.body,
-                                            fontSize = 12.sp,
-                                            color = TextSecondary,
-                                            modifier = Modifier.verticalScroll(scrollState)
-                                        )
-                                    }
-                                }
-                            }
-                            if (downloadProgress != null) {
-                                Spacer(modifier = Modifier.height(20.dp))
-                                LinearProgressIndicator(
-                                    progress = { downloadProgress ?: 0f },
-                                    modifier = Modifier.fillMaxWidth().height(8.dp).clip(CircleShape),
-                                    color = Violet500,
-                                    trackColor = AmoledSurface,
-                                    strokeCap = StrokeCap.Round
-                                )
-                            }
-                        }
-                    },
-                    confirmButton = {
-                        Button(
-                            enabled = !isDownloading,
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = Violet500,
-                                contentColor = TextPrimary,
-                                disabledContainerColor = AmoledCard2,
-                                disabledContentColor = TextMuted
-                            ),
-                            shape = CircleShape,
-                            onClick = { 
-                                val apkAsset = otaRelease!!.assets.firstOrNull { it.name.endsWith(".apk") }
-                                if (apkAsset != null) {
-                                    isDownloading = true
-                                    coroutineScope.launch {
-                                        val path = OtaUpdater.downloadUpdate(apkAsset.downloadUrl, apkAsset.name) {
-                                            downloadProgress = it
-                                        }
-                                        if (path != null) {
-                                            com.cncverse.stremiobridge.update.installOtaUpdate(path)
-                                        } else {
-                                            uriHandler.openUri(otaRelease!!.htmlUrl)
-                                        }
-                                        isDownloading = false
-                                    }
-                                } else {
-                                    uriHandler.openUri(otaRelease!!.htmlUrl)
-                                }
-                            }
-                        ) {
-                            Text(if (isDownloading) "Downloading..." else "Download Now")
-                        }
-                    },
-                    properties = DialogProperties(dismissOnBackPress = false, dismissOnClickOutside = false)
-                )
+            otaRelease?.let { release ->
+                UpdateDialog(release = release, onClose = { otaRelease = null })
             }
 
             if (isCompact) {

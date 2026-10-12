@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- **Update dialog (follows the khalsatorrent-droid fork):** when a newer release of the fork is published, the app (Android and desktop) now shows "Update available" with the release notes and three choices: **Update** (downloads the installer for your platform and starts it), **Later** (asks again at the next start) and **Skip this version** (never asks for that version again; a newer one is still offered). Only real version releases count - the rolling "latest" build can no longer hide them. The app now knows its real version (it was stuck at 1.1.0 in the code); it is generated from `version.properties`.
+- **Every release gets a new version:** the *Release* workflow (Actions -> Release -> Run workflow) raises the version by one patch step (1.5.9 -> 1.5.10, versionCode +1; or minor / major), commits it, tags it and publishes the APK, MSI/EXE and DEB. The release notes are this changelog's section of the version plus the commit list. `scripts/bump-version.sh` does the bump, `scripts/release-notes.sh` the notes.
+- **Check workflow:** pull requests now compile both apps and run the unit tests.
+
 - **"0 links" although the extensions found links - cause found:** the anime name / episode lookups (AniList, Kitsu, MyAnimeList, TMDB) that run before the extensions are started had no time limit. When one was slow (32 s in the log that showed this) it used up the whole 32 s answer time, so the extensions had no waiting time left and the request was answered with 0 links at once, while the 235 links they found a moment later only reached the cache. Now: (1) these lookups get 8 s, after that the search goes on with the plain title (the lookup keeps running in the background and is cached for the next try); (2) the extensions are always given at least 12 s before the answer cap can end the wait, and the wait ends 2 s before the 38 s hard limit so a late answer is still sent.
 
 ## 1.5.9

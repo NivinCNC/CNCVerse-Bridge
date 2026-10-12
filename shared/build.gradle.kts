@@ -1,9 +1,37 @@
+import java.util.Properties
+
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.kotlin.serialization)
     alias(libs.plugins.compose.multiplatform)
     alias(libs.plugins.compose.compiler)
     alias(libs.plugins.android.library)
+}
+
+// The running app's own version (used by the update check) is generated from version.properties,
+// the single place the release versions live, so it can never drift from the real build.
+val generateBuildVersion by tasks.registering {
+    val propsFile = rootProject.file("version.properties")
+    val outDir = layout.buildDirectory.dir("generated/buildVersion/kotlin")
+    inputs.file(propsFile)
+    outputs.dir(outDir)
+    doLast {
+        val props = Properties().apply { propsFile.inputStream().use { load(it) } }
+        val android = props.getProperty("android.versionName", "0.0.0").trim()
+        val desktop = props.getProperty("desktop.versionName", android).trim()
+        val dir = outDir.get().asFile.resolve("com/cncverse/stremiobridge").apply { mkdirs() }
+        dir.resolve("BuildVersion.kt").writeText(
+            """
+            package com.cncverse.stremiobridge
+
+            /** Generated from version.properties by :shared:generateBuildVersion - do not edit. */
+            object BuildVersion {
+                const val ANDROID = "$android"
+                const val DESKTOP = "$desktop"
+            }
+            """.trimIndent() + "\n"
+        )
+    }
 }
 
 kotlin {
@@ -25,6 +53,7 @@ kotlin {
 
     sourceSets {
         val commonMain by getting {
+            kotlin.srcDir(generateBuildVersion)
             dependencies {
                 implementation(compose.runtime)
                 implementation(compose.foundation)
