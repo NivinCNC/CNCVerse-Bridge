@@ -1954,14 +1954,14 @@ object StremioServer {
      * cancelled and whatever has accumulated is returned — ensuring Stremio always
      * gets a response well within its 60-second addon timeout.
      */
-    private val STREAM_DEADLINE_MS = 45_000L
+    private val STREAM_DEADLINE_MS = 90_000L
     /** Answer with what has loaded after this long; the rest load into the cache until STREAM_DEADLINE_MS. */
     private val STREAM_SOFT_DEADLINE_MS = 8_000L
     /** Never keep a client waiting longer than this for the first answer. */
     private val STREAM_ANSWER_CAP_MS = 18_000L
     /** Hard limit for the whole search part of a stream request. */
     private val RESPONSE_CAP_MS = 24_000L
-    private val PROVIDER_TIMEOUT_MS = 38_000L
+    private val PROVIDER_TIMEOUT_MS = 80_000L
     private val streamSearchScope = CoroutineScope(pluginDispatcher + SupervisorJob())
 
     /**

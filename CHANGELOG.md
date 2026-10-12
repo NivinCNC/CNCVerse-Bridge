@@ -3,6 +3,7 @@
 ## 1.5.3
 
 - **Slow / missing answers in Nuvio (LAN):** the stream search now runs on its own, so a player that gives up (or the new 24 s limit) no longer cancels it - it finishes into the cache and the next try is instant. A request is never held longer than 24 s. The quality check of HLS links is limited to 4 s. The log shows where the time went for each request ("search ..s, quality probe ..s, seek check ..s").
+- **Maximum results:** the first answer still goes out early (as soon as something is found, at most 18 s), but slow extensions keep working in the background for up to 90 s (was 45 s) and add their links to the cache as they finish. Reloading the title in the player shows the longer list at once.
 
 ## 1.5.2
 

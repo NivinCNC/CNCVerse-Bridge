@@ -376,7 +376,7 @@ object StreamCacheManager {
     private val inFlight = ConcurrentHashMap<String, Flight>()
 
     /** Hard cap for one shared fetch; it is also cancelled once no request is waiting for it. */
-    private const val MAX_FETCH_MS = 60_000L
+    private const val MAX_FETCH_MS = 120_000L
 
     private val isDirty = AtomicBoolean(false)
     @Volatile private var cacheDirFile: File? = null
