@@ -10,14 +10,9 @@ import com.cncverse.stremiobridge.repo.RepoManager
 import com.cncverse.stremiobridge.server.BridgeRuntime
 import com.cncverse.stremiobridge.server.PlatformPaths
 import com.cncverse.stremiobridge.state.*
-import com.cncverse.stremiobridge.update.GithubRelease
-import com.cncverse.stremiobridge.update.OtaUpdater
-import com.cncverse.stremiobridge.update.installOtaUpdate
-import com.cncverse.stremiobridge.update.otaAssetExtension
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Text
-import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -54,8 +49,6 @@ fun main() = application {
     val windowState = rememberWindowState(width = 1000.dp, height = 780.dp)
     var settingsPluginId by remember { mutableStateOf<String?>(null) }
 
-    var updateRelease by remember { mutableStateOf<GithubRelease?>(null) }
-    var otaDownloadProgress by remember { mutableStateOf<Float?>(null) }
 
     // Register the loader globally before anything else runs
     GlobalPluginManager.loader = pluginLoader
@@ -145,18 +138,6 @@ fun main() = application {
                     stopServer()
                     exitApplication()
                 }
-            }
-        }
-
-        // OTA Update check
-        appScope.launch {
-            try {
-                val release = OtaUpdater.checkForUpdate()
-                if (release != null) {
-                    updateRelease = release
-                }
-            } catch (e: Exception) {
-                ServerState.warn("Failed to check for updates: ${e.message}")
             }
         }
     }
@@ -260,58 +241,6 @@ fun main() = application {
                     GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
                 }
             }
-        }
-
-        // OTA Update Dialog
-        updateRelease?.let { release ->
-            AlertDialog(
-                onDismissRequest = {
-                    if (otaDownloadProgress == null) updateRelease = null
-                },
-                title = { Text("Update Available") },
-                text = {
-                    Column {
-                        Text("A new version of CNCVerse Bridge is available: ${release.tagName}")
-                        if (otaDownloadProgress != null) {
-                            Spacer(Modifier.height(16.dp))
-                            LinearProgressIndicator(progress = { otaDownloadProgress ?: 0f })
-                            Text("Downloading: ${(otaDownloadProgress!! * 100).toInt()}%")
-                        }
-                    }
-                },
-                confirmButton = {
-                    Button(
-                        enabled = otaDownloadProgress == null,
-                        onClick = {
-                            val asset = release.assets.find { it.name.endsWith(otaAssetExtension, ignoreCase = true) }
-                            if (asset != null) {
-                                otaDownloadProgress = 0f
-                                appScope.launch {
-                                    val filePath = OtaUpdater.downloadUpdate(asset.downloadUrl, asset.name) { progress ->
-                                        otaDownloadProgress = progress
-                                    }
-                                    if (filePath != null) {
-                                        installOtaUpdate(filePath)
-                                    } else {
-                                        ServerState.warn("Update download failed")
-                                        updateRelease = null
-                                        otaDownloadProgress = null
-                                    }
-                                }
-                            }
-                        }
-                    ) {
-                        Text(if (otaDownloadProgress != null) "Downloading..." else "Install & Restart")
-                    }
-                },
-                dismissButton = {
-                    if (otaDownloadProgress == null) {
-                        Button(onClick = { updateRelease = null }) {
-                            Text("Later")
-                        }
-                    }
-                }
-            )
         }
     }
 }

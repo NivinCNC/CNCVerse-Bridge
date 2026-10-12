@@ -103,13 +103,18 @@ Upload the project to a GitHub repository (branch `main`). The *Build APK* workf
 
 ### Releases
 
-Pushing a version tag builds and publishes everything through GitHub Actions (`.github/workflows/release.yml`):
+Every release gets a new version number. Start **Actions -> Release -> Run workflow**: it raises the version by one patch step (`1.5.9` -> `1.5.10`, the Android `versionCode` +1; choose *minor* or *major* for a bigger step), turns `## Unreleased` in `CHANGELOG.md` into `## 1.5.10`, commits that, tags `v1.5.10`, builds everything with GitHub Actions (`.github/workflows/release.yml`) and publishes it. The release notes are the changelog section plus the commit list, so **write what changed under `## Unreleased` in `CHANGELOG.md` before releasing**.
+
+You can also bump by hand and push the tag yourself - the tag must match `version.properties`:
 
 ```bash
-git tag v1.0.0 && git push origin v1.0.0
+scripts/bump-version.sh           # patch step; or: minor / major
+git commit -am "Release v1.5.10" && git tag v1.5.10 && git push origin main v1.5.10
 ```
 
-The Android signing key comes from the repository secrets `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD`.
+### Updates inside the app
+
+On start the app looks at the releases of this repository. If a newer version with a file for your platform exists, a dialog shows its release notes and offers **Update**, **Later** or **Skip this version**. The rolling *latest* build is not a version and is never offered.
 
 ---
 
