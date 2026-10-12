@@ -2412,14 +2412,11 @@ object StremioServer {
 
     /** Lower-cases and strips punctuation/extra spaces so "Spider-Man: No Way Home" == "spider man no way home". */
     private fun normalizeTitle(s: String): String = s.lowercase()
-        .replace("&amp;", " and ").replace("&#038;", " and ").replace("&#038", " and ")
-        .replace(HTML_ENTITY, " ")
         .replace("&", " and ")
         .replace(TITLE_PUNCT, " ")
         .replace(MULTI_SPACE, " ")
         .trim()
 
-    private val HTML_ENTITY = Regex("&#?[a-z0-9]{2,8};")
     private val IMDB_ID = Regex("tt[0-9]+")
     private val TITLE_PUNCT = Regex("[^\\p{L}\\p{N}]+")
     private val MULTI_SPACE = Regex("\\s+")
@@ -2444,100 +2441,14 @@ object StremioServer {
         // matches "Dune Part Two", but "Up" never matches "Upgrade" and a
         // shorter "Dune" never stands in for "Dune Part Two".
         val partial = candidates.filter { (_, n) ->
-            n != wanted && " $n ".contains(" $wanted ") && !isSequelOf(n, wanted)
+            n != wanted && " $n ".contains(" $wanted ")
         }.map { it.first }
 
         if (year == null) return exact.firstOrNull() ?: partial.firstOrNull()
-        // a result without a year field may still carry one in its name ("Dune (1984)")
-        fun nameYearOk(r: SearchResult): Boolean {
-            val ny = Regex("(?<![0-9])((?:19|20)\\d{2})(?![0-9])").find(r.name)?.groupValues?.get(1)?.toIntOrNull()
-            return ny == null || kotlin.math.abs(ny - year) <= 1
-        }
         return exact.firstOrNull { it.year == year }
-            ?: exact.firstOrNull { it.year == null && nameYearOk(it) }
+            ?: exact.firstOrNull { it.year == null }
             ?: partial.firstOrNull { it.year == year }
-            ?: partial.firstOrNull { it.year == null && nameYearOk(it) }
-    }
-
-
-    // ── Smarter title matching: sites name entries in many ways ("Download Locke & Key (2020) Season 1 Hindi",
-    //    "Netflix Locke &amp; Key (Season 2)", "Son of Sardaar 2 (2025)") ──────────────────────────────────
-    private val NOISE_WORDS = setOf(
-        "download", "watch", "netflix", "original", "originals", "hindi", "english", "dual", "audio", "web", "series", "full",
-        "movie", "movies", "film", "bluray", "blu", "ray", "webrip", "dl", "hdrip", "hd", "esub", "esubs", "sub", "subs",
-        "480p", "720p", "1080p", "2160p", "4k", "complete", "all", "seasons", "season", "episodes", "episode", "hdtc", "hdcam",
-        "cam", "amzn", "hotstar", "jiocinema", "zee5", "sonyliv", "prime", "video", "in", "with", "uncut", "extended",
-        "dubbed", "tamil", "telugu", "malayalam", "kannada", "bengali", "punjabi", "x264", "x265", "hevc", "10bit", "mkv",
-        "mp4", "free", "online", "to", "and", "org", "multi", "rip", "dvdrip", "remastered", "unrated",
-    )
-    private val SEQUEL_WORDS = setOf("part", "chapter", "vol", "volume", "ii", "iii", "iv", "vi", "vii", "viii", "ix", "returns", "reloaded", "begins", "reborn")
-    private val YEAR_TOKEN = Regex("(19|20)\\d{2}")
-    private val SEASON_TOKEN = Regex("s0*(\\d{1,2})")
-
-    /** True when [name] (normalized) continues the wanted title with a sequel marker: "son of sardaar 2" for "son of sardaar". */
-    private fun isSequelOf(name: String, wanted: String): Boolean {
-        val toks = name.split(' ').filter { it.isNotEmpty() }
-        val w = wanted.split(' ').filter { it.isNotEmpty() }
-        if (w.isEmpty()) return false
-        for (i in 0..(toks.size - w.size)) {
-            if (toks.subList(i, i + w.size) != w) continue
-            val next = toks.getOrNull(i + w.size) ?: return false
-            if (YEAR_TOKEN.matches(next)) return false
-            return (next.all { it.isDigit() } && next.length <= 3 && next !in setOf("480", "720")) || next in SEQUEL_WORDS
-        }
-        return false
-    }
-
-    private class TitleCand(val r: SearchResult, val unknown: Int, val year: Int?, val seasons: Set<Int>)
-
-    private fun analyseTitle(r: SearchResult, wanted: List<String>): TitleCand? {
-        val toks = normalizeTitle(r.name).split(' ').filter { it.isNotEmpty() }
-        var at = -1
-        for (i in 0..(toks.size - wanted.size)) if (toks.subList(i, i + wanted.size) == wanted) { at = i; break }
-        if (at < 0) return null
-        if (toks.subList(0, at).any { it !in NOISE_WORDS && it != "the" }) return null
-        val after = toks.subList(at + wanted.size, toks.size)
-        val first = after.firstOrNull()
-        if (first != null && !YEAR_TOKEN.matches(first) &&
-            ((first.all { it.isDigit() } && first.length <= 3 && first !in setOf("480", "720")) || first in SEQUEL_WORDS)) return null
-        val year = r.year ?: after.firstOrNull { YEAR_TOKEN.matches(it) }?.toIntOrNull()
-        val seasons = HashSet<Int>()
-        var i = 0
-        while (i < after.size) {
-            val t = after[i]
-            if ((t == "season" || t == "seasons") ) {
-                var j = i + 1
-                while (j < after.size && (after[j].all { it.isDigit() } && after[j].length <= 2 || after[j] == "to")) {
-                    after[j].toIntOrNull()?.let { seasons += it }
-                    j++
-                }
-                if (seasons.size >= 2) { val lo = seasons.min(); val hi = seasons.max(); for (k in lo..hi) seasons += k }
-            } else SEASON_TOKEN.matchEntire(t)?.let { seasons += it.groupValues[1].toInt() }
-            i++
-        }
-        val unknown = after.count { it !in NOISE_WORDS && !it.all { c -> c.isDigit() } && !SEASON_TOKEN.matches(it) }
-        return TitleCand(r, unknown, year, seasons)
-    }
-
-    /**
-     * Finds the entry for [title] among differently named results: noise words around the title ("Download", "Netflix",
-     * "Hindi 1080p") are ignored, sequels ("... 2") are not accepted for the first film, and for a series season the
-     * entry that names that season wins ("Season 2" / "S02" / "Season 1-3"); entries that name another season never match.
-     */
-    private fun smartPick(results: List<SearchResult>, title: String, year: Int?, season: Int?): SearchResult? {
-        val wanted = normalizeTitle(title).split(' ').filter { it.isNotEmpty() }
-        if (wanted.isEmpty()) return null
-        val cands = results.mapNotNull { analyseTitle(it, wanted) }.filter { c ->
-            val yearOk = year == null || c.year == null || kotlin.math.abs(c.year - year) <= 1
-            val seasonOk = season == null || c.seasons.isEmpty() || season in c.seasons
-            yearOk && seasonOk
-        }
-        if (cands.isEmpty()) return null
-        return cands.sortedWith(
-            compareByDescending<TitleCand> { if (season != null && season in it.seasons) 2 else if (season == 1 && it.seasons.isEmpty()) 1 else 0 }
-                .thenByDescending { if (year != null && it.year == year) 2 else if (it.year == null) 1 else 0 }
-                .thenBy { it.unknown }
-        ).first().r
+            ?: partial.firstOrNull { it.year == null }
     }
 
     private suspend fun doBuildGenericStreamsForApi(
@@ -2604,11 +2515,10 @@ object StremioServer {
             val wanted = normalizeTitle(title)
             val seasonRx = Regex("^" + Regex.escape(wanted) + " (?:season 0*$requestedSeason|s0*$requestedSeason)(?: |$)")
             searchResults.find { r -> seasonRx.containsMatchIn(normalizeTitle(r.name)) }
-                ?: smartPick(searchResults, title, year, requestedSeason)
                 ?: pickBestMatch(searchResults, title, year)
                 ?: AnimeMatcher.pickFuzzy(searchResults, title, year, requestedSeason)
         } else {
-            pickBestMatch(searchResults, title, year) ?: smartPick(searchResults, title, year, null)
+            pickBestMatch(searchResults, title, year)
         } ?: AnimeMatcher.pickFuzzy(searchResults, title, year, requestedSeason)
         ) ?: (if (anime == null) {
             // Nothing close in the first answer: type the title another way (no subtitle, no "The") and try fuzzy again
@@ -2621,7 +2531,7 @@ object StremioServer {
                     kotlinx.coroutines.currentCoroutineContext().ensureActive()
                     emptyList()
                 }
-                alt = pickBestMatch(more, title, year) ?: smartPick(more, title, year, requestedSeason) ?: AnimeMatcher.pickFuzzy(more, title, year, requestedSeason)
+                alt = pickBestMatch(more, title, year) ?: AnimeMatcher.pickFuzzy(more, title, year, requestedSeason)
                 if (alt != null) break
             }
             alt
@@ -2705,11 +2615,6 @@ object StremioServer {
         }
 
         var dataUrlToLoad = mediaInfo.dataUrl
-        var matchedEpisode: String? = null
-        fun episodeLabel(ep: MediaInfoEpisode): String? {
-            val nums = listOfNotNull(ep.season?.let { "S$it" }, ep.episode?.let { "E$it" }).joinToString("")
-            return listOfNotNull(nums.takeIf { it.isNotEmpty() }, ep.name?.trim()?.takeIf { it.isNotEmpty() }).joinToString(" · ").takeIf { it.isNotEmpty() }
-        }
         if (anime != null) {
             val parsed = ExternalIds.parse(id)
             // TMDB numbering was translated to the AniList entry: its own episode number, or the running number on a site that merges seasons
@@ -2731,7 +2636,6 @@ object StremioServer {
                     return emptyList()
                 }
                 dataUrlToLoad = ep.dataUrl
-                matchedEpisode = episodeLabel(ep)
                 ServerState.debug("[${api.name}] Anime episode $epNo -> '${ep.name}'")
             }
         } else if (type == "series" && id.contains(":")) {
@@ -2740,13 +2644,9 @@ object StremioServer {
             val episode = parsed?.episode
             if (season != null && episode != null) {
                 // Anime extensions often leave the season empty: that is season 1
-                // A site that lists each season as its own entry numbers the episodes from 1 with no season: AnimeEpisodes.pick covers that
                 val ep = mediaInfo.episodes?.find { (it.season ?: 1) == season && it.episode == episode }
-                    ?: (if (season == 1 || Regex("(?i)(season\\s*0*$season(?!\\d)|(?<![a-z])s0*$season(?!\\d))").containsMatchIn(bestMatch.name))
-                        AnimeEpisodes.pick(mediaInfo.episodes, season, episode) else null)
                 if (ep != null) {
                     dataUrlToLoad = ep.dataUrl
-                    matchedEpisode = episodeLabel(ep)
                     ServerState.debug("[${api.name}] Found episode S${season}E${episode}")
                 } else {
                     ServerState.debug("[STREAM_EMPTY] [${api.name}] Episode S${season}E${episode} not found")
@@ -2767,7 +2667,7 @@ object StremioServer {
             return links.map { stream ->
                 val newName = bestMatch.name + (if (!stream.name.isNullOrBlank()) "\n${stream.name}" else "")
                 val info = (stream.info ?: com.cncverse.stremiobridge.model.StreamInfo(addonName = api.name))
-                    .copy(metadataTitle = title, metadataYear = year, matchedName = bestMatch.name, matchedEpisode = matchedEpisode)
+                    .copy(metadataTitle = title, metadataYear = year, matchedName = bestMatch.name)
                 stream.copy(name = newName, info = info)
             }
         } catch (e: Throwable) {

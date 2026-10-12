@@ -71,10 +71,7 @@ data class MediaServerPrefs(
 )
 
 @Serializable
-private class MediaSource(url: String, val headers: Map<String, String> = emptyMap()) {
-    /** The address downloads use; moved to an alternate when the first one cannot seek. */
-    @Volatile var url: String = url
-}
+private class MediaSource(val url: String, val headers: Map<String, String> = emptyMap())
 
 @Serializable
 private class FileMeta(
@@ -237,27 +234,6 @@ object MediaServer {
 
     private val OWN_PATH = Regex("^https?://[^/]+/(proxy/|decrypt|init_decrypt|media/)", RegexOption.IGNORE_CASE)
 
-    /**
-     * Other addresses of the same file, tried when the given one cannot seek (answers a range request with the whole
-     * file): the fast Pixeldrain mirror has the original Pixeldrain API address behind it, which can.
-     */
-    private fun alternatesOf(url: String): List<String> {
-        val m = Regex("^https?://cdn\\.pixeldrain\\.eu\\.cc/([A-Za-z0-9_-]+)(?:[/?#].*)?$").find(url) ?: return emptyList()
-        val id = m.groupValues[1]
-        return listOf("pixeldrain.com", "pixeldrain.dev", "pixeldrain.net").map { "https://$it/api/file/$id" }
-    }
-
-    /** First address (the current one included) that answers a range request with 206, or null. */
-    private fun findSeekable(e: FileEntry, client: okhttp3.OkHttpClient): String? {
-        for (u in alternatesOf(e.src.url)) {
-            val ok = runCatching {
-                client.newCall(requestFor(e.src, u, "bytes=0-1")).execute().use { it.code == 206 }
-            }.getOrDefault(false)
-            if (ok) return u
-        }
-        return null
-    }
-
     private fun looksLikeHls(url: String, linkType: String?): Boolean =
         linkType.equals("M3U8", true) || url.substringBefore('?').endsWith(".m3u8", true) || url.contains(".m3u8", true)
 
@@ -286,8 +262,6 @@ object MediaServer {
             behaviorHints = s.behaviorHints?.copy(proxyHeaders = null),
         )
     }
-
-    private fun hostOf(url: String): String = runCatching { java.net.URI(url).host }.getOrNull() ?: url
 
     private fun fileName(url: String): String {
         val last = runCatching { java.net.URI(url).path.orEmpty() }.getOrDefault("").substringAfterLast('/')
@@ -660,7 +634,6 @@ object MediaServer {
             raf = e.store.rw(true)
             var cursor = 0L
             var sinceSave = 0L
-            var triedAlternates = false
             while (!e.stop) {
                 val want = e.focus
                 if (want >= 0) e.focus = -1
@@ -677,23 +650,12 @@ object MediaServer {
                 client.newCall(requestFor(e.src, e.src.url, range)).execute().use { r ->
                     if (r.code != 200 && r.code != 206) throw IOException("HTTP ${r.code} from the source")
                     if (!e.ready) {
-                        if (r.code == 200 && !triedAlternates) {
-                            // The source ignored the range request: look for another address that can seek
-                            triedAlternates = true
-                            val alt = findSeekable(e, client)
-                            if (alt != null) {
-                                ServerState.info("[MediaServer] ${hostOf(e.src.url)} cannot seek - using ${hostOf(alt)} instead")
-                                e.src.url = alt
-                                return@use
-                            }
-                        }
                         if (r.code == 206) {
                             e.ranges = true
                             e.total = parseTotal(r.header("Content-Range")) ?: -1L
                         } else {
                             e.ranges = false
                             e.total = r.body?.contentLength() ?: -1L
-                            ServerState.warn("[MediaServer] ${hostOf(e.src.url)} cannot seek: the file is downloaded in order, so jumping ahead waits for the download")
                         }
                         r.header("Content-Type")?.substringBefore(';')?.trim()?.takeIf { it.isNotEmpty() }?.let { e.mime = it }
                         // The link is really an HLS playlist: hand over to the playlist route
