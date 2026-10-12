@@ -411,9 +411,9 @@ object MediaServer {
     /** Pieces kept behind the playing position before they are deleted. */
     private const val KEEP_BEHIND = 128L * 1024 * 1024
 
-    /** A downloaded file is stored as 8 MB pieces (chunks/0, chunks/1, ...) so pieces already watched can be deleted. */
+    /** A downloaded file is stored as 128 MB pieces (chunks/0, chunks/1, ...) so pieces already watched can be deleted. */
     private class ChunkStore(val dir: File) {
-        companion object { const val CHUNK = 8L * 1024 * 1024 }
+        companion object { const val CHUNK = 128L * 1024 * 1024 }
         fun exists(): Boolean = dir.isDirectory
         fun file(i: Long) = File(dir, i.toString())
         fun deleteBefore(chunkIndex: Long) {
@@ -462,6 +462,9 @@ object MediaServer {
         val store = ChunkStore(File(dir, "chunks"))
         /** Bytes before this offset were watched and deleted (never counted as missing). */
         @Volatile var floor = 0L
+        /** Parallel download threads running for this file, and the 16 MB segments they are busy with. */
+        val boosters = java.util.concurrent.atomic.AtomicInteger(0)
+        val claimed: MutableSet<Long> = ConcurrentHashMap.newKeySet()
         val metaFile = File(dir, "meta.json")
         @Volatile var total = -1L
         @Volatile var ranges = false
@@ -507,14 +510,101 @@ object MediaServer {
     private fun ensureWorker(e: FileEntry) {
         if (e.passthrough || e.error != null && e.ready && e.total < 0) return
         synchronized(e.lock) {
-            if (e.worker != null || e.complete) return
+            if (e.worker != null || e.complete) {
+                if (!e.complete) startBoosters(e)
+                return
+            }
             e.stop = false
             e.error = null
             val t = Thread({ runWorker(e) }, "media-dl-" + e.id.take(6))
             t.isDaemon = true
             e.worker = t
             t.start()
+            startBoosters(e)
         }
+    }
+
+    /** Segment size and number of extra connections that download ahead of the player in parallel. */
+    private const val SEG = 16L * 1024 * 1024
+    private const val BOOSTERS = 3
+
+    private fun startBoosters(e: FileEntry) {
+        if (!e.boosters.compareAndSet(0, BOOSTERS)) return
+        repeat(BOOSTERS) { n ->
+            val t = Thread({ boost(e) }, "media-dl-b$n-" + e.id.take(6))
+            t.isDaemon = true
+            t.start()
+        }
+    }
+
+    /**
+     * An extra download connection: takes the next missing 16 MB segment inside the read-ahead window
+     * (from the playing position on) that no other connection is busy with. With the main connection that
+     * makes four downloads at once for a source that can seek.
+     */
+    private fun boost(e: FileEntry) {
+        var wr: ChunkStore.Rw? = null
+        var idleSince = System.currentTimeMillis()
+        try {
+            val client = clientFor(e.id, e.src)
+            val buf = ByteArray(128 * 1024)
+            while (!e.stop && !e.passthrough) {
+                val now = System.currentTimeMillis()
+                if (!e.ready) {
+                    if (now - idleSince > 60_000) break
+                    Thread.sleep(200); continue
+                }
+                if (!e.ranges || e.total <= 0 || e.isPlaylist) break
+                val ahead = prefs.readAheadMb * 1024L * 1024L
+                val from = maxOf(e.lastRead, e.floor)
+                val to = if (ahead > 0) minOf(e.total, from + ahead) else e.total
+                var did = false
+                var i = from / SEG
+                while (i * SEG < to && !e.stop) {
+                    val s0 = i * SEG
+                    val s1 = minOf(e.total, s0 + SEG)
+                    if (e.have.contiguousEnd(s0) < s1 && e.claimed.add(i)) {
+                        did = true
+                        try {
+                            val w = wr ?: e.store.rw(true).also { wr = it }
+                            downloadSegment(e, client, s0, s1, buf, w)
+                        } finally { e.claimed.remove(i) }
+                        idleSince = System.currentTimeMillis()
+                        break
+                    }
+                    i++
+                }
+                if (!did) {
+                    if (System.currentTimeMillis() - idleSince > 180_000) break
+                    Thread.sleep(300)
+                }
+            }
+        } catch (_: Throwable) {
+            // an extra connection never fails the playback; the main download and the player report real errors
+        } finally {
+            runCatching { wr?.close() }
+            e.boosters.decrementAndGet()
+        }
+    }
+
+    private fun downloadSegment(e: FileEntry, client: okhttp3.OkHttpClient, s0: Long, s1: Long, buf: ByteArray, wr: ChunkStore.Rw) {
+        val pos = e.have.firstGapFrom(s0)
+        if (pos >= s1) return
+        client.newCall(requestFor(e.src, e.src.url, "bytes=$pos-${s1 - 1}")).execute().use { r ->
+            if (r.code != 206) return@use // ranges not honoured: the main connection copes
+            val input = r.body?.byteStream() ?: return@use
+            var off = parseStart(r.header("Content-Range")) ?: pos
+            while (!e.stop && off < s1) {
+                val n = input.read(buf, 0, minOf(buf.size.toLong(), s1 - off).toInt())
+                if (n < 0) break
+                wr.write(off, buf, n)
+                e.have.add(off, off + n)
+                off += n
+            }
+        }
+        trimBehind(e)
+        synchronized(e.metaFile) { saveMeta(e) }
+        if (!makeRoom(0, e.id)) { e.error = "the media cache is full (limit ${prefs.maxCacheMb} MB)"; e.stop = true }
     }
 
     private fun parseTotal(contentRange: String?): Long? =

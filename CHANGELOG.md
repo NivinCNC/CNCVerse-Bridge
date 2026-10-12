@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.9
+
+- **Faster media downloads:** a file now downloads over four connections at once (the main one and three extra ones, each taking the next missing 16 MB part inside the read-ahead window, starting at the playing position). Pieces on disk are 128 MB each, and pieces more than 128 MB behind the position are deleted. Only for sources that can seek; others still use one connection.
+
 ## 1.5.8
 
 - **Media server keeps only what is needed:** a downloaded video is now stored in 8 MB pieces. Only a window around the playing position stays on disk: pieces more than 128 MB behind the position are deleted while you watch, and the download runs only as far ahead as "Read-ahead MB" (default now 256 MB, was 1 GB). A file bigger than the whole cache no longer has to fit - it plays from the moving window (only a source that cannot seek still needs the full file to fit). Seeking back into a deleted part simply fetches it again.
