@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.5.12
+## Unreleased
 
 - **File line starts with the extension's episode:** the line is now "📄 File: S2E2 · <episode name from the extension> • <video file name>", so you can check both the series name (🔎 Matched) and that the episode number is the right one. New formatter variables `{stream.matchEpisode}` and `{stream.fileLine}` (episode and file together). A saved copy of the 1.5.11 built-in layout is moved to the new one; custom layouts are left as they are.
 - **Titles that sites write differently are matched:** "Download Locke & Key (2020) Season 1 Hindi", "Netflix Locke &amp; Key (Season 2)", "Locke & Key - Netflix Original" now match "Locke & Key". Words around the title (download, netflix, hindi, 1080p, ...) and HTML codes (&amp;) are ignored; a site that lists every season as its own entry is matched by the season it names ("Season 2", "S02", "Season 1-3"), entries naming another season never match, and their episodes (numbered from 1 with no season) are found. A sequel is no longer taken for the first film ("Son of Sardaar 2" for "Son of Sardaar"), and a year written in the name ("(2012)") is checked against the wanted year.
