@@ -877,7 +877,9 @@ object StremioServer {
         val tProbed = System.currentTimeMillis()
         val sorted = sortStreamsByQuality(probed)
 
-        val kept = filterStreamsByProfile(sorted, p)
+        // Pixeldrain first, so the seek check below judges the link that is really played: a pixeldrain.com/u/ID address is
+        // a web page (it used to be hidden as "not a file") while the fast mirror it becomes is a seekable file
+        val kept = filterStreamsByProfile(sorted, p).map { pixeldrainBypass(it, p) }
         // Whatever the settings above did, the list that goes out is sorted by resolution and has nothing below 720p
         val seekable = if (p.filterNonSeekable) SeekProbe.dropNonSeekable(kept) else kept
         val tSeek = System.currentTimeMillis()
@@ -910,7 +912,7 @@ object StremioServer {
                 .map { st ->
                     try {
                         // Media server: links that need a Referer / Cookie are fetched by this bridge and cached here
-                        MediaServer.rewrite(LocalRelay.rewriteStream(withStreamBase(pixeldrainBypass(st, p))), mediaBase())
+                        MediaServer.rewrite(LocalRelay.rewriteStream(withStreamBase(st)), mediaBase())
                     } catch (e: Throwable) {
                         ServerState.warn("[Request] could not prepare a link (${st.info?.addonName}): ${e.javaClass.simpleName}: ${e.message}")
                         st

@@ -50,6 +50,28 @@ class SeekProbeTest {
             ex.responseHeaders.add("Content-Type", "video/x-matroska")
             ex.sendResponseHeaders(206, 1); ex.responseBody.use { it.write(0x1a) }
         }
+        // A redirecting address (the Pixeldrain mirror cdn.pixeldrain.eu.cc/ID -> cdnNN.pixeldrain.eu.cc/api/file/ID): the
+        // file behind it honours ranges, the redirect itself says nothing
+        server.createContext("/mirror") { ex ->
+            ex.responseHeaders.add("Location", "/cdn33/api/file/" + ex.requestURI.path.substringAfterLast('/'))
+            ex.sendResponseHeaders(302, -1); ex.close()
+        }
+        server.createContext("/cdn33/api/file/") { ex ->
+            val ranged = ex.requestHeaders.getFirst("Range") != null
+            ex.responseHeaders.add("Content-Type", "video/mp4")
+            ex.responseHeaders.add("Content-Range", "bytes 0-0/1000")
+            ex.sendResponseHeaders(if (ranged) 206 else 200, 1); ex.responseBody.use { it.write(1) }
+        }
+        // Answers a one-byte range with the whole file but advertises ranges: kept
+        server.createContext("/advertises.mkv") { ex ->
+            ex.responseHeaders.add("Accept-Ranges", "bytes")
+            ex.sendResponseHeaders(200, 3); ex.responseBody.use { it.write(byteArrayOf(1, 2, 3)) }
+        }
+        // Says outright that it cannot seek: hidden
+        server.createContext("/none.mkv") { ex ->
+            ex.responseHeaders.add("Accept-Ranges", "none")
+            ex.sendResponseHeaders(200, 3); ex.responseBody.use { it.write(byteArrayOf(1, 2, 3)) }
+        }
         server.start()
         port = server.address.port
     }
@@ -97,6 +119,21 @@ class SeekProbeTest {
         SeekProbe.resetForTest()
         val zip = file("http://127.0.0.1:$port/vz/abc?k=1")
         assertEquals(emptyList(), SeekProbe.dropNonSeekable(listOf(zip)))
+    }
+
+    @Test
+    fun `a redirecting address is judged by the file it leads to`() = runBlocking {
+        SeekProbe.resetForTest()
+        val mirror = file("http://127.0.0.1:$port/mirror/ruzespzm")
+        assertEquals(listOf(mirror), SeekProbe.dropNonSeekable(listOf(mirror)))
+    }
+
+    @Test
+    fun `a server that advertises ranges is kept, one that says none is hidden`() = runBlocking {
+        SeekProbe.resetForTest()
+        val advertises = file("http://127.0.0.1:$port/advertises.mkv")
+        val none = file("http://localhost:$port/none.mkv")
+        assertEquals(listOf(advertises), SeekProbe.dropNonSeekable(listOf(advertises, none)))
     }
 
     @Test

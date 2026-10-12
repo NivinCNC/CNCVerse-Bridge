@@ -16,7 +16,8 @@ import java.util.concurrent.TimeUnit
 /**
  * "Hide non-seekable files": a direct-download file can be scrubbed only when its server
  * answers byte-range requests. Each direct-file host is asked for byte 0 once:
- * 206 = seekable, 200 with the whole file = not seekable. Results are kept per host.
+ * 206 = seekable, 200 with the whole file = not seekable (unless the server advertises "Accept-Ranges: bytes").
+ * Redirects are followed, so the file the link finally leads to is judged. Results are kept per host.
  *
  * Never judged (always kept): HLS/DASH playlists, torrents, the bridge's own relay links
  * (/proxy/…, /decrypt, local relay) and anything the check could not decide in time.
@@ -118,6 +119,10 @@ object SeekProbe {
                         // Google Drive downloads ignore ranges
                         finalHost == "video-downloads.googleusercontent.com" -> false
                         r.code == 206 -> true
+                        // 200 but the server says it seeks ("Accept-Ranges: bytes"): some servers and CDNs answer a one-byte
+                        // range with the whole file yet honour real ranges. Hiding a good link costs more than showing a doubtful
+                        // one (the media server checks again when it is played), so it is kept.
+                        r.code == 200 && r.header("Accept-Ranges").orEmpty().contains("bytes", ignoreCase = true) -> true
                         else -> false // 200: ignored the range, sends the whole file
                     }
                 }

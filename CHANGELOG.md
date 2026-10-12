@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **"Hide non-seekable / non-playable files" no longer hides links that do seek:** the check ran on the address the extension gave, *before* Pixeldrain links were switched to the fast mirror. A `pixeldrain.com/u/ID` address is a web page, so it was judged "not a file" and hidden, although the mirror it becomes (`cdn.pixeldrain.eu.cc/ID`, which redirects to a changing `cdnNN.pixeldrain.eu.cc/api/file/ID`) is a seekable file. The mirror is now applied first and the check follows the redirect to the file it leads to. Also, a server that answers the one-byte test with the whole file but says `Accept-Ranges: bytes` is kept (the media server checks again when it plays); only a server that gives no sign of seeking is hidden.
+
 ## 1.5.12
 
 - **Episode shown with the file name:** the "File" line of every result now starts with the episode the extension used for that link - its number and name as the extension lists it, e.g. `Ep S2E8 · The Demon King • File: Clevatess.S02E08.1080p.mkv` - so you can see at a glance whether the right episode was picked. All four built-in layouts carry it; a saved copy of the previous default layout moves to the new one automatically. New variables for your own layouts: `{stream.fileline}` (episode and file) and `{stream.matchepisode}` (the episode alone).
