@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.5
+
+- **Cloudflare blocks (themoviesflix.forum and similar):** many of these have no check box at all - the site just refuses requests that do not look like a browser, and a "cf_clearance" cookie never appears. Now: (1) the request is first repeated with the full header set of a Chrome page load (as Raghav's TheMoviesFlix does); (2) if that is still refused, a WebView loads the page and the check counts as solved as soon as the page is a real page (not just when a cookie shows up); (3) if the site only lets the WebView in, the extension gets the page the WebView loaded. The tap-the-box window still appears after 15 s for real checks.
+
 ## 1.5.4
 
 - **Empty answers fixed:** 1.5.3 gave up after 24 s counted from the request, but looking up the title took the first seconds and the extensions were slow (Cloudflare checks), so the player got 0 links although 176 were found a little later. Now: the answer goes out as soon as the first links are found (waiting 4 s more so quick ones join), and otherwise keeps waiting up to 32 s from the request (hard limit 38 s) instead of answering empty. Anything found later is added to the cache; reloading shows the full list.

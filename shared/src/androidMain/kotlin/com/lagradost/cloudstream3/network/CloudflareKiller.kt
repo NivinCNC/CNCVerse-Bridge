@@ -9,6 +9,8 @@ import android.webkit.WebViewClient
 import com.cncverse.stremiobridge.state.ServerState
 import okhttp3.Interceptor
 import okhttp3.Response
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.ResponseBody.Companion.toResponseBody
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
@@ -31,25 +33,76 @@ class CloudflareKiller : Interceptor {
         if (challenged) {
             // The saved clearance did not work (expired / other UA): drop it and solve again, one solver per site at a time
             if (saved != null) com.cncverse.stremiobridge.network.CfCookieStore.forget(host)
-            ServerState.info("Cloudflare challenge on ${request.url.host} - solving it")
+
+            // Step 1: many "challenges" are only a block of requests that do not look like a browser. Same request
+            // with the full header set of a Chrome page load (what Raghav's TheMoviesFlix does) often passes at once.
+            if (!triedBrowserHeaders(request)) {
+                val browserReq = browserLike(request)
+                response.close()
+                response = chain.proceed(browserReq)
+                if (!isChallenged(response)) return response
+                request = browserReq
+            }
+
+            ServerState.info("Cloudflare challenge on $host - solving it in a browser")
             val result = synchronized(lockFor(host)) {
                 // Another request may have solved it while this one waited
-                com.cncverse.stremiobridge.network.CfCookieStore.get(host)?.takeIf { it.cookie != saved?.cookie }?.let { CfResult(it.cookie, it.userAgent) }
+                com.cncverse.stremiobridge.network.CfCookieStore.get(host)?.takeIf { it.cookie != saved?.cookie }?.let { CfResult(it.cookie, it.userAgent, null) }
                     ?: bypassCloudflare(request.url.toString())
             }
             if (result != null) {
-                com.cncverse.stremiobridge.network.CfCookieStore.put(host, result.cookie, result.userAgent)
-                val newRequest = request.newBuilder()
-                    .header("Cookie", result.cookie)
-                    .header("User-Agent", result.userAgent)
-                    .build()
-                response.close()
-                response = chain.proceed(newRequest)
-            } else {
-                ServerState.warn("Cloudflare challenge on $host could not be solved in time")
+                if (result.cookie.isNotBlank()) {
+                    com.cncverse.stremiobridge.network.CfCookieStore.put(host, result.cookie, result.userAgent)
+                    val newRequest = request.newBuilder()
+                        .header("Cookie", result.cookie)
+                        .header("User-Agent", result.userAgent)
+                        .build()
+                    response.close()
+                    response = chain.proceed(newRequest)
+                    if (!isChallenged(response)) return response
+                }
+                // The site lets a real browser in but not this app's HTTP client (it checks the TLS handshake, not a
+                // cookie): hand back the page the browser itself loaded
+                val html = result.html
+                if (html != null && request.method == "GET") {
+                    ServerState.info("Cloudflare: $host answered the browser only - using the page the browser loaded")
+                    response.close()
+                    return Response.Builder()
+                        .request(request).protocol(okhttp3.Protocol.HTTP_1_1).code(200).message("OK")
+                        .header("Content-Type", "text/html; charset=utf-8")
+                        .body(html.toResponseBody("text/html; charset=utf-8".toMediaType()))
+                        .build()
+                }
             }
+            ServerState.warn("Cloudflare challenge on $host could not be solved in time")
         }
         return response
+    }
+
+    private fun isChallenged(r: Response): Boolean =
+        (r.code == 503 || r.code == 403 || r.code == 429) &&
+            (r.header("Server")?.let { it.contains("cloudflare", true) || it.contains("ddos-guard", true) } == true ||
+                r.header("cf-mitigated")?.contains("challenge", true) == true)
+
+    private fun triedBrowserHeaders(r: okhttp3.Request) = r.header("Sec-Fetch-Mode") != null && r.header("sec-ch-ua") != null
+
+    private fun browserLike(r: okhttp3.Request): okhttp3.Request {
+        val b = r.newBuilder()
+        val ua = r.header("User-Agent")?.takeIf { it.contains("Mozilla") && !it.contains("okhttp", true) }
+            ?: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        b.header("User-Agent", ua)
+        fun set(k: String, v: String) { if (r.header(k) == null) b.header(k, v) }
+        set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+        set("Accept-Language", "en-US,en;q=0.9")
+        b.header("sec-ch-ua", "\"Chromium\";v=\"131\", \"Not_A Brand\";v=\"24\"")
+        b.header("sec-ch-ua-mobile", "?0")
+        b.header("sec-ch-ua-platform", "\"Windows\"")
+        set("Sec-Fetch-Dest", "document")
+        set("Sec-Fetch-Mode", "navigate")
+        set("Sec-Fetch-Site", if (r.header("Referer") != null) "same-origin" else "none")
+        set("Sec-Fetch-User", "?1")
+        set("Upgrade-Insecure-Requests", "1")
+        return b.build()
     }
 
     private fun lockFor(host: String): Any = locks.getOrPut(host) { Any() }
@@ -62,7 +115,7 @@ class CloudflareKiller : Interceptor {
         val locks = java.util.concurrent.ConcurrentHashMap<String, Any>()
     }
 
-    data class CfResult(val cookie: String, val userAgent: String)
+    data class CfResult(val cookie: String, val userAgent: String, val html: String?)
 
     private val lastAsked = java.util.concurrent.ConcurrentHashMap<String, Long>()
 
@@ -101,7 +154,11 @@ class CloudflareKiller : Interceptor {
                 val userAgent = wv.settings.userAgentString
                 CookieManager.getInstance().setAcceptCookie(true)
                 CookieManager.getInstance().setAcceptThirdPartyCookies(wv, true)
-                wv.webViewClient = WebViewClient()
+                var pageFinished = false
+                wv.webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, u: String?) { pageFinished = true }
+                    override fun onPageStarted(view: WebView?, u: String?, f: android.graphics.Bitmap?) { pageFinished = false }
+                }
 
                 fun cleared(): String? {
                     CookieManager.getInstance().flush()
@@ -147,19 +204,35 @@ class CloudflareKiller : Interceptor {
                 }
 
                 var shown = false
+                var okPolls = 0
                 fun poll() {
                     if (webView == null) return
-                    val c = cleared()
-                    when {
-                        c != null -> { resultRef.set(CfResult(c, userAgent)); finish() }
-                        System.currentTimeMillis() - started > maxMs -> finish()
-                        else -> {
-                            if (!shown && System.currentTimeMillis() - started > headlessMs) {
-                                shown = true
-                                showDialog()
+                    val cookie = cleared()
+                    if (cookie != null) { resultRef.set(CfResult(cookie, userAgent, null)); finish(); return }
+                    if (System.currentTimeMillis() - started > maxMs) { finish(); return }
+                    // No clearance cookie needed: a page that is no longer a challenge page means the browser got in
+                    wv.evaluateJavascript("(function(){return document.title+'\\u0001'+document.documentElement.outerHTML})()") { raw ->
+                        if (webView == null) return@evaluateJavascript
+                        val text = try { org.json.JSONTokener(raw ?: "null").nextValue() as? String } catch (_: Exception) { null } ?: ""
+                        val title = text.substringBefore('\u0001').lowercase()
+                        val html = text.substringAfter('\u0001', "")
+                        val challengeTitle = listOf("just a moment", "attention required", "checking your browser", "verify you are human",
+                            "ddos-guard", "security check", "one more step", "access denied").any { title.contains(it) } || title.isBlank()
+                        val challengeBody = html.length < 30_000 && (html.contains("challenge-platform") || html.contains("cf-turnstile") || html.contains("challenge-form"))
+                        if (pageFinished && !challengeTitle && !challengeBody && html.length > 800) {
+                            okPolls++
+                            if (okPolls >= 2) {
+                                CookieManager.getInstance().flush()
+                                resultRef.set(CfResult(CookieManager.getInstance().getCookie(url).orEmpty(), userAgent, html))
+                                finish()
+                                return@evaluateJavascript
                             }
-                            main.postDelayed({ poll() }, 1000)
+                        } else okPolls = 0
+                        if (!shown && System.currentTimeMillis() - started > headlessMs) {
+                            shown = true
+                            showDialog()
                         }
+                        main.postDelayed({ poll() }, 1000)
                     }
                 }
                 wv.loadUrl(url)
