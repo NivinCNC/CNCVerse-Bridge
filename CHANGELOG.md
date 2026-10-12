@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.6
+
+- **Movies showed no results:** the list was found (hundreds of links) but never sent. Preparing and sending the list is now fail-safe: a link that cannot be prepared goes out as it is, a failed send is retried without subtitles, and any error is written to the log with its cause ("[Request] ... failed").
+- **Pixeldrain:** `pixeldrain.com / .dev / .net` file links (`/u/ID`, `/api/file/ID?download`) are sent as `https://cdn.pixeldrain.eu.cc/ID` (Settings -> Streams -> "Pixeldrain fast mirror", on by default).
+
 ## 1.5.5
 
 - **Cloudflare blocks (themoviesflix.forum and similar):** many of these have no check box at all - the site just refuses requests that do not look like a browser, and a "cf_clearance" cookie never appears. Now: (1) the request is first repeated with the full header set of a Chrome page load (as Raghav's TheMoviesFlix does); (2) if that is still refused, a WebView loads the page and the check counts as solved as soon as the page is a real page (not just when a cookie shows up); (3) if the site only lets the WebView in, the extension gets the page the WebView loaded. The tap-the-box window still appears after 15 s for real checks.

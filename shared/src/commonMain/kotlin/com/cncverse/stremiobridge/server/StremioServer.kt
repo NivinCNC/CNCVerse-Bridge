@@ -212,6 +212,8 @@ object StremioServer {
         val providerOrder: List<String> = emptyList(),
         /** Show the "support the project" entry on top of stream lists. */
         val showSupport: Boolean = true,
+        /** Pixeldrain links (file ids) are sent through the fast mirror cdn.pixeldrain.eu.cc. */
+        val pixeldrainBypass: Boolean = true,
         /** Hide direct-download files whose server cannot seek (no byte ranges). Relay/proxy links are never hidden. */
         val filterNonSeekable: Boolean = false,
         /**
@@ -882,37 +884,57 @@ object StremioServer {
         val filtered = enforceResolutionOrder(hardsubFirst(applyAnimeAudio(arrangeStreams(seekable, p), p)))
         ServerState.info("[Request] $type/$id timing: search ${(tBuilt - requestStart) / 1000.0}s, quality probe ${(tProbed - tBuilt) / 1000.0}s, seek check ${(tSeek - tProbed) / 1000.0}s")
 
-        // Drop results whose link is exactly the same as an earlier (better ranked) one; different links are never merged
-        val unique = filtered.distinctBy<StremioStream, Any> { it.url ?: it.externalUrl ?: it.infoHash?.let { h -> "magnet:$h" } ?: it.ytId?.let { y -> "yt:$y" } ?: it }
+        val out: List<StremioStream> = try {
+            // Drop results whose link is exactly the same as an earlier (better ranked) one; different links are never merged
+            val unique = filtered.distinctBy<StremioStream, Any> { it.url ?: it.externalUrl ?: it.infoHash?.let { h -> "magnet:$h" } ?: it.ytId?.let { y -> "yt:$y" } ?: it }
 
-        // Streams of upstream add-ons already carry their add-on's own name and description: keep those
-        // (marked with the add-on's name) and format only this bridge's own streams
-        val (fromUpstream, own) = unique.partition { it.info?.linkType == "UPSTREAM" }
-        val ownFormatted = com.cncverse.stremiobridge.format.StreamFormatter.applyFor(
-            own,
-            com.cncverse.stremiobridge.format.StreamFormatter.contextFromId(type, id),
-            null,
-        ).associateBy { it.url ?: it.infoHash ?: it.hashCode().toString() }
-        val upstreamTagged = fromUpstream.associateBy({ it.url ?: it.infoHash ?: it.hashCode().toString() }) { u ->
-            val addon = u.info?.addonName.orEmpty()
-            u.copy(name = listOf(addon.ifBlank { "Upstream" }, u.name?.takeIf { n -> n != addon }).filterNotNull().joinToString(" • "))
-        }
-        val formatted = unique.map { st ->
-            val k = st.url ?: st.infoHash ?: st.hashCode().toString()
-            ownFormatted[k] ?: upstreamTagged[k] ?: st
-        }
-        // "Hide subtitles": no subtitle tracks go out (after formatting, so the description stays truthful)
-        val out = (if (p.hideSubtitles) formatted.map { it.copy(subtitles = null) } else formatted)
-            .map { withStreamBase(it) }
-            .map { LocalRelay.rewriteStream(it) }
-            // Media server: links that need a Referer / Cookie are fetched by this bridge and cached here
-            .map { MediaServer.rewrite(it, mediaBase()) }
-            .let { list ->
-                // "Support the project" entry on top, only above real results (can be hidden in the app)
-                if (p.showSupport && list.isNotEmpty()) listOf(SUPPORT_STREAM) + list else list
+            // Streams of upstream add-ons already carry their add-on's own name and description: keep those
+            // (marked with the add-on's name) and format only this bridge's own streams
+            val (fromUpstream, own) = unique.partition { it.info?.linkType == "UPSTREAM" }
+            val ownFormatted = com.cncverse.stremiobridge.format.StreamFormatter.applyFor(
+                own,
+                com.cncverse.stremiobridge.format.StreamFormatter.contextFromId(type, id),
+                null,
+            ).associateBy { it.url ?: it.infoHash ?: it.hashCode().toString() }
+            val upstreamTagged = fromUpstream.associateBy({ it.url ?: it.infoHash ?: it.hashCode().toString() }) { u ->
+                val addon = u.info?.addonName.orEmpty()
+                u.copy(name = listOf(addon.ifBlank { "Upstream" }, u.name?.takeIf { n -> n != addon }).filterNotNull().joinToString(" • "))
             }
-            .map { s -> s.subtitles?.let { subs -> s.copy(subtitles = subs.map { it.copy(lang = com.cncverse.stremiobridge.format.SubtitleLangs.normalize(it.lang)) }) } ?: s }
-        respond(StremioStreamResponse(out))
+            val formatted = unique.map { st ->
+                val k = st.url ?: st.infoHash ?: st.hashCode().toString()
+                ownFormatted[k] ?: upstreamTagged[k] ?: st
+            }
+            // "Hide subtitles": no subtitle tracks go out (after formatting, so the description stays truthful)
+            val out = (if (p.hideSubtitles) formatted.map { it.copy(subtitles = null) } else formatted)
+                // One odd link must never cost the whole answer: a link whose rewrite fails goes out as it is
+                .map { st ->
+                    try {
+                        // Media server: links that need a Referer / Cookie are fetched by this bridge and cached here
+                        MediaServer.rewrite(LocalRelay.rewriteStream(withStreamBase(pixeldrainBypass(st, p))), mediaBase())
+                    } catch (e: Throwable) {
+                        ServerState.warn("[Request] could not prepare a link (${st.info?.addonName}): ${e.javaClass.simpleName}: ${e.message}")
+                        st
+                    }
+                }
+                .let { list ->
+                    // "Support the project" entry on top, only above real results (can be hidden in the app)
+                    if (p.showSupport && list.isNotEmpty()) listOf(SUPPORT_STREAM) + list else list
+                }
+                .map { s -> s.subtitles?.let { subs -> s.copy(subtitles = subs.map { it.copy(lang = com.cncverse.stremiobridge.format.SubtitleLangs.normalize(it.lang)) }) } ?: s }
+
+            out
+        } catch (e: Throwable) {
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            ServerState.warn("[Request] $type/$id: preparing the list failed (${e.javaClass.simpleName}: ${e.message}) - sending the plain list. ${e.stackTraceToString().take(900)}")
+            filtered.mapNotNull { st -> if (st.url == null && st.externalUrl == null && st.infoHash == null) null else st.copy(subtitles = null) }
+        }
+        try {
+            respond(StremioStreamResponse(out))
+        } catch (e: Throwable) {
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            ServerState.warn("[Request] $type/$id: sending the list failed (${e.javaClass.simpleName}: ${e.message}) - sending it without subtitles")
+            respond(StremioStreamResponse(out.map { it.copy(subtitles = null) }))
+        }
         ServerState.info("[Request] sent ${out.size} link(s) for $type/$id (${(System.currentTimeMillis() - requestStart) / 1000.0}s)")
         runCatching {
             val parts = id.split(':')
@@ -1000,6 +1022,15 @@ object StremioServer {
         val unlabelled = streams.filter { audioKind(it) == null }
         val other = streams.filter { val k = audioKind(it); k != null && k != p.animeAudio }
         return if (p.animeAudioOnly) preferred + unlabelled else preferred + unlabelled + other
+    }
+
+    private val PIXELDRAIN = Regex("^https?://(?:www\\.)?pixeldrain\\.(?:com|dev|net)/(?:api/file|u)/([A-Za-z0-9_-]+)(?:[/?#].*)?$", RegexOption.IGNORE_CASE)
+
+    /** pixeldrain.com / .dev / .net file links -> https://cdn.pixeldrain.eu.cc/<id> (no hotlink / download limits). */
+    fun pixeldrainBypass(s: StremioStream, p: StreamPrefs): StremioStream {
+        if (!p.pixeldrainBypass) return s
+        val id = s.url?.let { PIXELDRAIN.matchEntire(it) }?.groupValues?.get(1) ?: return s
+        return s.copy(url = "https://cdn.pixeldrain.eu.cc/$id")
     }
 
     private val SUPPORT_STREAM = StremioStream(

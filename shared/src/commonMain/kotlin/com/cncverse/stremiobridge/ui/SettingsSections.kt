@@ -323,6 +323,7 @@ fun StreamsCard() {
             update(p.copy(filterNonSeekable = it))
         }
         SwitchRow("Hide subtitles", "Streams go out without subtitle tracks", p.hideSubtitles) { update(p.copy(hideSubtitles = it)) }
+        SwitchRow("Pixeldrain fast mirror", "Pixeldrain links go through cdn.pixeldrain.eu.cc (no download limit)", p.pixeldrainBypass) { update(p.copy(pixeldrainBypass = it)) }
         SwitchRow("Show \"support the project\" entry", "One donate link on top of stream lists", p.showSupport) { update(p.copy(showSupport = it)) }
 
         // ── Quality allotment ──
