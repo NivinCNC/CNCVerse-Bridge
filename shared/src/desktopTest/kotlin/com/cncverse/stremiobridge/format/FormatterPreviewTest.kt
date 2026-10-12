@@ -48,6 +48,30 @@ class FormatterPreviewTest {
     }
 
     @Test
+    fun `the file name of the link is shown`() {
+        fun stream(url: String, linkName: String? = null) = com.cncverse.stremiobridge.model.StremioStream(
+            name = "Clevatess Season 2\nAnimePahe - 1080p", title = "Clevatess - 08", url = url,
+            info = com.cncverse.stremiobridge.model.StreamInfo(addonName = "AnimePahe", quality = 1080, linkName = linkName),
+        )
+        fun render(s: com.cncverse.stremiobridge.model.StremioStream) = StreamFormatter.format(
+            s, StreamRequestContext(2, 8),
+            Template.parse(StreamFormatter.PRESET_NAME), Template.parse(StreamFormatter.PRESET_DESCRIPTION),
+        ).title.orEmpty()
+
+        // from the path (percent-encoded and with a query string)
+        assertTrue(render(stream("https://cdn.example.com/dl/Clevatess%20S02E08.1080p.WEB-DL.mkv?token=a+b")).contains("File: Clevatess S02E08.1080p.WEB-DL.mkv"))
+        // from a query parameter
+        assertTrue(render(stream("https://host.example.com/get?file=Clevatess.S02E08.720p.mp4&x=1")).contains("File: Clevatess.S02E08.720p.mp4"))
+        // from the link's own name
+        assertTrue(render(stream("https://host.example.com/v/abc123", "Clevatess.S02E08.1080p.mkv")).contains("File: Clevatess.S02E08.1080p.mkv"))
+        // adaptive streams and ids without a file name get no file line
+        assertTrue(!render(stream("https://host.example.com/hls/master.m3u8")).contains("File:"))
+        // the file name is not repeated as the link label
+        val twice = render(stream("https://cdn.example.com/a/Clevatess.S02E08.mkv", "Clevatess.S02E08.mkv"))
+        assertEquals(1, Regex("Clevatess\\.S02E08\\.mkv").findAll(twice).count(), twice)
+    }
+
+    @Test
     fun `episode context comes from every id form`() {
         assertEquals(StreamRequestContext(1, 2), StreamFormatter.contextFromId("series", "kitsu:7442:2"))
         assertEquals(StreamRequestContext(1, 3), StreamFormatter.contextFromId("series", "tmdb:1396:1:3"))

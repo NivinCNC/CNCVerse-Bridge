@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Each link shows its file name:** next to the matched extension entry, the link description now has the name of the video file the link plays ("📄 File: Clevatess.S02E08.1080p.WEB-DL.mkv"), so you can check that it is the right file. It is read from the end of the link, from a `file=` / `filename=` part of the link, or from the link's own name when that is a file name; adaptive streams (HLS) and links without a file name get no file line. Built into all four layouts, and a new formatter variable `{stream.file}` for your own layouts. A saved copy of the 1.5.10 built-in layout is moved to the new one; custom layouts are left as they are.
+
 ## 1.5.10
 
 - **More results from anime-specific extensions:** the anime name lookup (AniList, Kitsu, MyAnimeList, TMDB) is no longer cut off after 8 s - in the log that showed this it needed about 37 s, so extensions that search by title (and do not use TMDB) were only searched with the plain title and found less. Now: (1) the lookup is faster - the prequel and sequel walk of a franchise and the Kitsu / MyAnimeList name requests run side by side instead of one after the other; (2) it gets 25 s before the extensions are started with the plain title; (3) if it still finishes later, every extension is searched again with all the anime names and the exact season entry, and the new links are added to the answer (if it is still open) or to the cache, so reloading shows them.
