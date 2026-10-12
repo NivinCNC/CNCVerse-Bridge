@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.4
+
+- **Empty answers fixed:** 1.5.3 gave up after 24 s counted from the request, but looking up the title took the first seconds and the extensions were slow (Cloudflare checks), so the player got 0 links although 176 were found a little later. Now: the answer goes out as soon as the first links are found (waiting 4 s more so quick ones join), and otherwise keeps waiting up to 32 s from the request (hard limit 38 s) instead of answering empty. Anything found later is added to the cache; reloading shows the full list.
+
 ## 1.5.3
 
 - **Slow / missing answers in Nuvio (LAN):** the stream search now runs on its own, so a player that gives up (or the new 24 s limit) no longer cancels it - it finishes into the cache and the next try is instant. A request is never held longer than 24 s. The quality check of HLS links is limited to 4 s. The log shows where the time went for each request ("search ..s, quality probe ..s, seek check ..s").

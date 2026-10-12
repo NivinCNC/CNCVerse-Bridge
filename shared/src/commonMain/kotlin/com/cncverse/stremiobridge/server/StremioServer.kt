@@ -856,6 +856,7 @@ object StremioServer {
         val type = parameters["type"] ?: return respond(HttpStatusCode.BadRequest)
         val id   = parameters["id"]   ?: return respond(HttpStatusCode.BadRequest)
         val requestStart = System.currentTimeMillis()
+        streamRequestStart["$type:$id"] = requestStart
         ServerState.info("[Request] streams for $type/$id from ${request.local.remoteHost.let { request.headers["X-Forwarded-For"] ?: it }}")
 
         // The player is not kept waiting for ever: after RESPONSE_CAP_MS an empty list goes out (late results
@@ -1956,11 +1957,12 @@ object StremioServer {
      */
     private val STREAM_DEADLINE_MS = 90_000L
     /** Answer with what has loaded after this long; the rest load into the cache until STREAM_DEADLINE_MS. */
+    private val streamRequestStart = java.util.concurrent.ConcurrentHashMap<String, Long>()
     private val STREAM_SOFT_DEADLINE_MS = 8_000L
     /** Never keep a client waiting longer than this for the first answer. */
-    private val STREAM_ANSWER_CAP_MS = 18_000L
+    private val STREAM_ANSWER_CAP_MS = 32_000L
     /** Hard limit for the whole search part of a stream request. */
-    private val RESPONSE_CAP_MS = 24_000L
+    private val RESPONSE_CAP_MS = 38_000L
     private val PROVIDER_TIMEOUT_MS = 80_000L
     private val streamSearchScope = CoroutineScope(pluginDispatcher + SupervisorJob())
 
@@ -2217,12 +2219,17 @@ object StremioServer {
                 // Answer when everything is done, or once STREAM_SOFT_DEADLINE_MS has passed and
                 // there is something to show; with nothing yet, wait up to STREAM_DEADLINE_MS.
                 val waitAll = streamPrefs.waitForAll
+                var firstFoundAt = 0L
                 withTimeoutOrNull(STREAM_DEADLINE_MS) {
                     while (jobs.any { it.isActive }) {
-                        val t = System.currentTimeMillis() - started
-                        if (!waitAll && accumulated.isNotEmpty() && t >= STREAM_SOFT_DEADLINE_MS) break
-                        // Clients give up after ~30 s: answer before that even with nothing; the rest keeps filling the cache
-                        if (t >= STREAM_ANSWER_CAP_MS) break
+                        val now = System.currentTimeMillis()
+                        val t = now - started
+                        if (accumulated.isNotEmpty() && firstFoundAt == 0L) firstFoundAt = now
+                        // Something found: answer once 8 s have passed and the first links are 4 s old (others arriving
+                        // right behind it are included); the rest keeps filling the cache for the next reload
+                        if (!waitAll && firstFoundAt != 0L && t >= STREAM_SOFT_DEADLINE_MS && now - firstFoundAt >= 4_000L) break
+                        // Never later than ANSWER_CAP after the request arrived (searching the title already took time)
+                        if (now - (streamRequestStart["$type:$id"]?.takeIf { now - it < 120_000L } ?: started) >= STREAM_ANSWER_CAP_MS) break
                         delay(200)
                     }
                 }
