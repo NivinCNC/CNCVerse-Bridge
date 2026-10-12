@@ -598,7 +598,7 @@ fun MediaServerCard() {
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(
                 value = readAhead, onValueChange = { v -> readAhead = v.filter { it.isDigit() }.take(6); message = null },
-                label = { Text("Read-ahead MB") }, supportingText = { Text("0 = whole file", fontSize = 10.sp) }, singleLine = true,
+                label = { Text("Read-ahead MB") }, supportingText = { Text("kept ahead of playback; 0 = whole file", fontSize = 10.sp) }, singleLine = true,
                 modifier = Modifier.weight(1f), colors = amoledFieldColors(),
             )
             OutlinedTextField(
@@ -616,7 +616,7 @@ fun MediaServerCard() {
             )
             OutlinedTextField(
                 value = keep, onValueChange = { v -> keep = v.filter { it.isDigit() }.take(5); message = null },
-                label = { Text("Keep hours") }, singleLine = true,
+                label = { Text("Delete unused after (hours)") }, singleLine = true,
                 modifier = Modifier.weight(1f), colors = amoledFieldColors(),
             )
         }

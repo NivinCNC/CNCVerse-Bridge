@@ -61,13 +61,13 @@ data class MediaServerPrefs(
     /** HLS segments fetched ahead of the player. */
     val prefetchSegments: Int = 30,
     /** How far (MB) past the playing position a file download may run (0 = download the whole file). */
-    val readAheadMb: Int = 1024,
+    val readAheadMb: Int = 256,
     /** Upper limit of the cache folder, in MB (never more than 2048). Oldest entries are deleted first. */
     val maxCacheMb: Int = 2048,
     /** Entries not used for this many hours are deleted. */
     val keepHours: Int = 24,
     /** Settings generation (older files get the newer defaults once). */
-    val ver: Int = 2,
+    val ver: Int = 3,
 )
 
 @Serializable
@@ -125,6 +125,8 @@ object MediaServer {
             .getOrNull() ?: MediaServerPrefs()).let {
             var q = it.copy(maxCacheMb = it.maxCacheMb.coerceIn(256, HARD_MAX_MB))
             if (q.ver < 2) q = q.copy(ver = 2, mode = if (q.mode == "headers") "hls" else q.mode, prefetchSegments = maxOf(q.prefetchSegments, 30))
+            // v3: files are kept in 8 MB pieces and only a window around the playing position is kept on disk
+            if (q.ver < 3) q = q.copy(ver = 3, readAheadMb = if (q.readAheadMb >= 1024 || q.readAheadMb == 0) 256 else q.readAheadMb)
             q
         }
         val dir = File(base, "media_cache")
@@ -134,7 +136,10 @@ object MediaServer {
         secret = runCatching { if (sf.exists() && sf.length() >= 16) sf.readBytes() else null }.getOrNull()
             ?: ByteArray(32).also { java.security.SecureRandom().nextBytes(it); runCatching { sf.writeBytes(it) } }
         scope.launch { runCatching { trim() } }
+        // Old entries go after "Keep hours" even if nothing is being played
+        if (cleaner?.isActive != true) cleaner = scope.launch { while (true) { delay(10 * 60_000L); runCatching { trim() } } }
     }
+    @Volatile private var cleaner: kotlinx.coroutines.Job? = null
 
     /** Reloads the saved settings (after a backup import). */
     fun reload(cacheDir: String) = init(cacheDir)
@@ -389,14 +394,74 @@ object MediaServer {
                 if (f.value > p) p = f.value else return p
             }
         }
+        @Synchronized fun remove(start: Long, end: Long) {
+            if (end <= start) return
+            val hit = m.subMap(start - Long.MAX_VALUE / 2, true, end, false).entries.filter { it.value > start }.map { it.key to it.value }
+            for ((s0, e0) in hit) {
+                m.remove(s0)
+                if (s0 < start) m[s0] = start
+                if (e0 > end) m[end] = e0
+            }
+        }
         @Synchronized fun bytes(): Long = m.entries.sumOf { it.value - it.key }
         @Synchronized fun snapshot(): List<List<Long>> = m.entries.map { listOf(it.key, it.value) }
         @Synchronized fun restore(list: List<List<Long>>) { list.forEach { if (it.size == 2) add(it[0], it[1]) } }
     }
 
+    /** Pieces kept behind the playing position before they are deleted. */
+    private const val KEEP_BEHIND = 128L * 1024 * 1024
+
+    /** A downloaded file is stored as 8 MB pieces (chunks/0, chunks/1, ...) so pieces already watched can be deleted. */
+    private class ChunkStore(val dir: File) {
+        companion object { const val CHUNK = 8L * 1024 * 1024 }
+        fun exists(): Boolean = dir.isDirectory
+        fun file(i: Long) = File(dir, i.toString())
+        fun deleteBefore(chunkIndex: Long) {
+            dir.listFiles()?.forEach { f -> val i = f.name.toLongOrNull(); if (i != null && i < chunkIndex) f.delete() }
+        }
+        fun deleteAll() { dir.deleteRecursively() }
+        fun rw(write: Boolean) = Rw(write)
+        inner class Rw(private val write: Boolean) : java.io.Closeable {
+            private var idx = -1L
+            private var raf: RandomAccessFile? = null
+            private fun open(i: Long): RandomAccessFile {
+                if (i != idx) {
+                    raf?.close()
+                    if (write) dir.mkdirs()
+                    raf = RandomAccessFile(file(i), if (write) "rw" else "r")
+                    idx = i
+                }
+                return raf!!
+            }
+            fun write(off: Long, buf: ByteArray, len: Int) {
+                var o = off; var p = 0
+                while (p < len) {
+                    val inChunk = o % CHUNK
+                    val n = minOf((len - p).toLong(), CHUNK - inChunk).toInt()
+                    val r = open(o / CHUNK)
+                    r.seek(inChunk); r.write(buf, p, n)
+                    o += n; p += n
+                }
+            }
+            fun read(off: Long, buf: ByteArray, len: Int) {
+                var o = off; var p = 0
+                while (p < len) {
+                    val inChunk = o % CHUNK
+                    val n = minOf((len - p).toLong(), CHUNK - inChunk).toInt()
+                    val r = open(o / CHUNK)
+                    r.seek(inChunk); r.readFully(buf, p, n)
+                    o += n; p += n
+                }
+            }
+            override fun close() { runCatching { raf?.close() }; raf = null; idx = -1L }
+        }
+    }
+
     private class FileEntry(val id: String, val src: MediaSource, val dir: File) {
         val have = RangeSet()
-        val file = File(dir, "data.bin")
+        val store = ChunkStore(File(dir, "chunks"))
+        /** Bytes before this offset were watched and deleted (never counted as missing). */
+        @Volatile var floor = 0L
         val metaFile = File(dir, "meta.json")
         @Volatile var total = -1L
         @Volatile var ranges = false
@@ -412,7 +477,7 @@ object MediaServer {
         @Volatile var writePos = 0L
         @Volatile var worker: Thread? = null
         val lock = Any()
-        val complete: Boolean get() = total >= 0 && have.firstGapFrom(0) >= total
+        val complete: Boolean get() = total >= 0 && have.firstGapFrom(floor) >= total
     }
 
     private fun fileEntry(id: String): FileEntry? {
@@ -422,7 +487,9 @@ object MediaServer {
         val e = FileEntry(id, src, dir)
         // Resume what an earlier run already downloaded
         runCatching {
-            if (e.metaFile.exists() && e.file.exists()) {
+            // pieces of the old single-file format are dropped
+            File(dir, "data.bin").takeIf { it.exists() }?.delete()
+            if (e.metaFile.exists() && e.store.exists()) {
                 val m = json.decodeFromString<FileMeta>(e.metaFile.readText())
                 e.total = m.total; e.ranges = m.ranges; e.mime = m.mime
                 e.have.restore(m.have)
@@ -456,21 +523,34 @@ object MediaServer {
     private fun parseStart(contentRange: String?): Long? =
         contentRange?.substringAfter("bytes ", "")?.substringBefore('-')?.trim()?.toLongOrNull()
 
+    /** Deletes the 8 MB pieces that lie more than KEEP_BEHIND behind the playing position (only for sources that can seek). */
+    private fun trimBehind(e: FileEntry) {
+        if (!e.ranges || e.total < 0 || e.lastRead <= 0) return
+        val keepFrom = e.lastRead - KEEP_BEHIND
+        val firstKept = keepFrom / ChunkStore.CHUNK
+        if (keepFrom <= 0 || firstKept <= e.floor / ChunkStore.CHUNK) return
+        e.store.deleteBefore(firstKept)
+        e.have.remove(0, firstKept * ChunkStore.CHUNK)
+        e.floor = firstKept * ChunkStore.CHUNK
+    }
+
     private fun runWorker(e: FileEntry) {
-        var raf: RandomAccessFile? = null
+        var raf: ChunkStore.Rw? = null
         try {
             val client = clientFor(e.id, e.src)
-            raf = RandomAccessFile(e.file, "rw")
+            raf = e.store.rw(true)
             var cursor = 0L
             var sinceSave = 0L
             while (!e.stop) {
                 val want = e.focus
                 if (want >= 0) e.focus = -1
+                // A seek back into a part that was already deleted: it is fetched again
+                if (want >= 0 && want < e.floor) e.floor = (want / ChunkStore.CHUNK) * ChunkStore.CHUNK
                 var pos = if (want >= 0) want else cursor
                 if (e.total >= 0) {
                     pos = e.have.firstGapFrom(pos)
-                    if (pos >= e.total) pos = e.have.firstGapFrom(0)
-                    if (pos >= e.total) break // everything is on disk
+                    if (pos >= e.total) pos = e.have.firstGapFrom(e.floor)
+                    if (pos >= e.total) break // everything that is still needed is on disk
                 }
                 val range = if (!e.ready || e.ranges) "bytes=$pos-" else null
                 if (e.ready && !e.ranges && pos != 0L) { pos = 0L } // origin cannot seek: only a straight download works
@@ -493,7 +573,9 @@ object MediaServer {
                             return@use
                         }
                         // Bigger than the whole cache, or no room even after deleting old entries: relay live instead
-                        val tooBig = e.total > capBytes() || (e.total > 0 && !makeRoom(e.total, e.id))
+                        // A source that can seek is only kept as a moving window, so its size does not have to fit; one that
+                        // cannot seek is downloaded completely and must fit
+                        val tooBig = !e.ranges && (e.total > capBytes() || (e.total > 0 && !makeRoom(e.total, e.id)))
                         if (e.total <= 0 || tooBig) {
                             // Unknown length (live / chunked) or bigger than the whole cache: relay it live instead
                             e.passthrough = true
@@ -501,7 +583,6 @@ object MediaServer {
                             e.stop = true
                             return@use
                         }
-                        raf.setLength(e.total)
                         e.ready = true
                     }
                     val body = r.body ?: throw IOException("empty response")
@@ -522,14 +603,13 @@ object MediaServer {
                         }
                         val n = input.read(buf)
                         if (n < 0) break
-                        raf.seek(off)
-                        raf.write(buf, 0, n)
+                        raf.write(off, buf, n)
                         e.have.add(off, off + n)
                         off += n
                         e.writePos = off
                         sinceSave += n
                         if (sinceSave > 32L * 1024 * 1024) {
-                            sinceSave = 0; saveMeta(e)
+                            sinceSave = 0; trimBehind(e); saveMeta(e)
                             // Hard limit: never let the folder pass the cap
                             if (!makeRoom(0, e.id)) throw IOException("the media cache is full (limit ${prefs.maxCacheMb} MB)")
                         }
@@ -622,7 +702,7 @@ object MediaServer {
 
         if (e.ranges && e.have.contiguousEnd(start) == start) e.focus = start
         call.respondBytesWriter(ct, httpStatus, len) {
-            val reader = RandomAccessFile(e.file, "r")
+            val reader = e.store.rw(false)
             try {
                 var pos = start
                 val buf = ByteArray(256 * 1024)
@@ -642,8 +722,7 @@ object MediaServer {
                         continue
                     }
                     val n = minOf(avail - pos, end - pos + 1, buf.size.toLong()).toInt()
-                    reader.seek(pos)
-                    reader.readFully(buf, 0, n)
+                    reader.read(pos, buf, n)
                     writeFully(buf, 0, n)
                     pos += n
                     lastProgress = System.currentTimeMillis()

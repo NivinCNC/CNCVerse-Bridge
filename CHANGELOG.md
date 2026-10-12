@@ -1,5 +1,10 @@
 # Changelog
 
+## 1.5.8
+
+- **Media server keeps only what is needed:** a downloaded video is now stored in 8 MB pieces. Only a window around the playing position stays on disk: pieces more than 128 MB behind the position are deleted while you watch, and the download runs only as far ahead as "Read-ahead MB" (default now 256 MB, was 1 GB). A file bigger than the whole cache no longer has to fit - it plays from the moving window (only a source that cannot seek still needs the full file to fit). Seeking back into a deleted part simply fetches it again.
+- **Old partial downloads are deleted by time:** entries not used for the "Delete unused after (hours)" setting (default 24) are removed, checked every 10 minutes (before, only after a download finished or the app started). The 2 GB cap still applies, oldest unused first.
+
 ## 1.5.7
 
 - **Movies showed no results - cause found:** one link's name contained a cut-off emoji (half of a character), which cannot be written as text, so the whole list failed with "MalformedInputException". Such broken characters are now removed from every link before the list is sent (and the movie list is no longer lost).
