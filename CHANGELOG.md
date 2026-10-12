@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 1.5.10
 
 - **More results from anime-specific extensions:** the anime name lookup (AniList, Kitsu, MyAnimeList, TMDB) is no longer cut off after 8 s - in the log that showed this it needed about 37 s, so extensions that search by title (and do not use TMDB) were only searched with the plain title and found less. Now: (1) the lookup is faster - the prequel and sequel walk of a franchise and the Kitsu / MyAnimeList name requests run side by side instead of one after the other; (2) it gets 25 s before the extensions are started with the plain title; (3) if it still finishes later, every extension is searched again with all the anime names and the exact season entry, and the new links are added to the answer (if it is still open) or to the cache, so reloading shows them.
 - **Each link shows where it came from:** the name of the entry the extension matched is now part of the link description ("🔎 Matched: Clevatess Season 2" in the CNCVerse layout, "Matched: ..." / "Match: ..." in the Torrentio, Essentials and MediaFusion layouts), so you can see at a glance whether the extension found the right title. New formatter variable `{stream.match}` for your own layouts. A saved copy of the previous built-in layout is moved to the new one; custom layouts are left as they are.
