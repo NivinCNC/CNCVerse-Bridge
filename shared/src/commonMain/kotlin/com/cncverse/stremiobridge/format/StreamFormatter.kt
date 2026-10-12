@@ -280,7 +280,7 @@ object StreamVariables {
         "stream.resolution", "stream.quality", "stream.specs", "stream.visualTags", "stream.encode",
         "stream.audioTags", "stream.audioChannels", "stream.streamType", "stream.size",
         "stream.languages", "stream.subtitles", "stream.seasonEpisode", "stream.season",
-        "stream.episode", "stream.audioKind", "stream.subType", "stream.host", "stream.source", "stream.label", "stream.match", "stream.file", "stream.filename", "stream.name", "stream.title",
+        "stream.episode", "stream.audioKind", "stream.subType", "stream.host", "stream.source", "stream.label", "stream.match", "stream.matchEpisode", "stream.fileLine", "stream.file", "stream.filename", "stream.name", "stream.title",
     )
 
     private fun rx(p: String) = Regex("(?<![A-Za-z0-9])(?:$p)(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
@@ -583,6 +583,10 @@ object StreamVariables {
             "stream.match" to (info?.matchedName?.trim()?.takeIf { it.isNotEmpty() } ?: releaseText?.trim()),
             // The video file's name ("Clevatess.S02E08.1080p.WEB-DL.mkv"): lets the user check it is the right file
             "stream.file" to file,
+            // The episode of the entry as the extension lists it ("S2E2 · Episode name"), for judging the episode number
+            "stream.matchepisode" to info?.matchedEpisode?.trim()?.takeIf { it.isNotEmpty() },
+            // The extension's episode first, then the video file's name: "S2E2 · Ep name • Clevatess.S02E02.1080p.mkv"
+            "stream.fileline" to listOfNotNull(info?.matchedEpisode?.trim()?.takeIf { it.isNotEmpty() }, file).joinToString(" • ").takeIf { it.isNotEmpty() },
             "stream.filename" to linkText,
             "stream.name" to stream.name,
             "stream.title" to stream.title,
@@ -675,7 +679,7 @@ object StreamFormatter {
             nameTemplate = "[CNC] {stream.resolution::default('HD')} • {addon.name}",
             descriptionTemplate = "{metadata.title}{stream.seasonEpisode::exists[\" - {stream.seasonEpisode::join('')}\"||\"\"]}\n" +
                 "{stream.match::exists[\"Matched: {stream.match::truncate(60)}\"||\"\"]}\n" +
-                "{stream.file::exists[\"File: {stream.file::truncate(70)}\"||\"\"]}\n" +
+                "{stream.fileline::exists[\"File: {stream.fileline::truncate(90)}\"||\"\"]}\n" +
                 "{stream.specs::join(' ')}{stream.size::>0[\" | {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}{stream.source::exists[\" | {stream.source}\"||\"\"]}\n" +
                 "Audio: {stream.languages::default('Multi')}{stream.subtitles::exists[\" | Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
         ),
@@ -686,7 +690,7 @@ object StreamFormatter {
             nameTemplate = "⚡ CNCVerse | {stream.resolution::=2160p[\"💎 4K UHD\"||\"📺 {stream.resolution::default('FHD')}\"]} | {addon.name}",
             descriptionTemplate = "🎬 {metadata.title}{stream.seasonEpisode::exists[\" [{stream.seasonEpisode::join('')}]\"||\"\"]}\n" +
                 "{stream.match::exists[\"🔎 Match: {stream.match::truncate(90)}\"||\"\"]}\n" +
-                "{stream.file::exists[\"📄 File: {stream.file::truncate(90)}\"||\"\"]}\n" +
+                "{stream.fileline::exists[\"📄 File: {stream.fileline::truncate(110)}\"||\"\"]}\n" +
                 "⚙️ Specs: {stream.specs::join(' • ')}\n" +
                 "📦 Size: {stream.size::>0[\"{stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"Direct Stream\"]} • Host: {addon.name}\n" +
                 "🔊 Audio: {stream.languages::default('Original')}\n" +
@@ -699,7 +703,7 @@ object StreamFormatter {
             nameTemplate = "{stream.resolution::default('Auto')} • {stream.streamType::default('Direct')} • {addon.name}",
             descriptionTemplate = "{metadata.title}{stream.seasonEpisode::exists[\" • {stream.seasonEpisode::join('')}\"||\"\"]}\n" +
                 "{stream.match::exists[\"Matched: {stream.match::truncate(90)}\"||\"\"]}\n" +
-                "{stream.file::exists[\"File: {stream.file::truncate(90)}\"||\"\"]}\n" +
+                "{stream.fileline::exists[\"File: {stream.fileline::truncate(110)}\"||\"\"]}\n" +
                 "{stream.specs::join(' • ')}\n" +
                 "{stream.size::>0[\"Size: {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')} • \"||\"\"]}Audio: {stream.languages::default('Default')}"
         )
@@ -731,11 +735,24 @@ object StreamFormatter {
         "{stream.languages::exists[\"🎧 Audio: {stream.languages::join(', ')}\"||\"\"]}\n" +
         "{stream.subtitles::exists[\"💬 Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
 
-    /** Current layout: the previous one plus the file name of the link. */
-    const val PRESET_DESCRIPTION =
+    /** The layout of 1.5.11 (file name line without the extension's episode). */
+    private const val PRESET_DESCRIPTION_V5 =
         "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('CNCVerse stream')}\"]}\n" +
         "{stream.match::exists[\"🔎 Matched: {stream.match::truncate(90)}\"||\"\"]}\n" +
         "{stream.file::exists[\"📄 File: {stream.file::truncate(100)}\"||\"\"]}\n" +
+        "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
+        "{stream.audiokind::exists[\"🗣️ {stream.audiokind}{stream.subtype::exists[\" • {stream.subtype}\"||\"\"]}\"||\"\"]}\n" +
+        "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::default('Auto')} • {stream.streamType::default('HLS')}\"]}\n" +
+        "🛰️ {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}{stream.host::exists[\" • {stream.host}\"||\"\"]}\n" +
+        "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}\n" +
+        "{stream.languages::exists[\"🎧 Audio: {stream.languages::join(', ')}\"||\"\"]}\n" +
+        "{stream.subtitles::exists[\"💬 Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
+
+    /** Current layout: the extension's episode and the file name on one line. */
+    const val PRESET_DESCRIPTION =
+        "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('CNCVerse stream')}\"]}\n" +
+        "{stream.match::exists[\"🔎 Matched: {stream.match::truncate(90)}\"||\"\"]}\n" +
+        "{stream.fileline::exists[\"📄 File: {stream.fileline::truncate(110)}\"||\"\"]}\n" +
         "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
         "{stream.audiokind::exists[\"🗣️ {stream.audiokind}{stream.subtype::exists[\" • {stream.subtype}\"||\"\"]}\"||\"\"]}\n" +
         "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::default('Auto')} • {stream.streamType::default('HLS')}\"]}\n" +
@@ -751,7 +768,7 @@ object StreamFormatter {
         val srcLine = "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}"
         val v2full = PRESET_DESCRIPTION_V3.lines().joinToString("\n") { if (it.contains("stream.host")) srcLine else it }
         val v1 = v2full.lines().filter { !it.contains("stream.audiokind") }.joinToString("\n")
-        listOf(PRESET_DESCRIPTION_V4, PRESET_DESCRIPTION_V3, v2full, v1, v2.trimEnd())
+        listOf(PRESET_DESCRIPTION_V5, PRESET_DESCRIPTION_V4, PRESET_DESCRIPTION_V3, v2full, v1, v2.trimEnd())
     }
     private val OLD_PRESET_NAME = "🌀 CNCVerse {stream.resolution::=2160p[\"❄️ 4K\"||\"{stream.resolution::=1080p[\"🧊 {stream.resolution::default('Auto')}\"||\"🎬 {stream.resolution::default('Auto')}\"]}\"]} • {addon.name}"
 
