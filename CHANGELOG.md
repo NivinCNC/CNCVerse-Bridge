@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **"0 links" although the extensions found links - cause found:** the anime name / episode lookups (AniList, Kitsu, MyAnimeList, TMDB) that run before the extensions are started had no time limit. When one was slow (32 s in the log that showed this) it used up the whole 32 s answer time, so the extensions had no waiting time left and the request was answered with 0 links at once, while the 235 links they found a moment later only reached the cache. Now: (1) these lookups get 8 s, after that the search goes on with the plain title (the lookup keeps running in the background and is cached for the next try); (2) the extensions are always given at least 12 s before the answer cap can end the wait, and the wait ends 2 s before the 38 s hard limit so a late answer is still sent.
+
 ## 1.5.9
 
 - **Faster media downloads:** a file now downloads over four connections at once (the main one and three extra ones, each taking the next missing 16 MB part inside the read-ahead window, starting at the playing position). Pieces on disk are 128 MB each, and pieces more than 128 MB behind the position are deleted. Only for sources that can seek; others still use one connection.

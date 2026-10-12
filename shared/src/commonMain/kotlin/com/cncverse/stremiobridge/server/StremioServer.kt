@@ -2029,6 +2029,10 @@ object StremioServer {
     private val STREAM_ANSWER_CAP_MS = 32_000L
     /** Hard limit for the whole search part of a stream request. */
     private val RESPONSE_CAP_MS = 38_000L
+    /** Time budget for the anime name / episode mapping lookups before the providers are started. */
+    private val ANIME_RESOLVE_BUDGET_MS = 8_000L
+    /** The providers are always given at least this long before the answer cap can end the wait. */
+    private val STREAM_MIN_WINDOW_MS = 12_000L
     private val PROVIDER_TIMEOUT_MS = 80_000L
     private val streamSearchScope = CoroutineScope(pluginDispatcher + SupervisorJob())
 
@@ -2200,25 +2204,36 @@ object StremioServer {
                 val (title, year) = resolved
                 com.cncverse.stremiobridge.state.StreamHistory.noteTitle(id, title)
                 ServerState.debug("Media resolve success: title='$title', year=$year")
-                // tt / tmdb / tvdb ids of anime: collect every alternative name (AniList, Kitsu, MyAnimeList) too
-                val animeNames = animeInfo ?: if ((type == "series" || type == "anime") && ext.scheme in setOf("imdb", "tmdb", "tvdb")) {
-                    val base = AnimeResolver.fromTitle(title, year)
-                    val sn = ext.season
-                    if (base != null && sn != null && sn > 1) {
-                        // Later season: AniList lists it as its own entry (own names, own episode count)
-                        val s2 = AnimeResolver.fromTitle("$title Season $sn", null)
-                            ?: AnimeResolver.fromTitle("$title ${mapOf(2 to "2nd", 3 to "3rd").getOrDefault(sn, "${sn}th")} Season", null)
-                        if (s2 != null && AnimeMatcher.seasonNumber(AnimeMatcher.normalize(s2.titles.first())) == sn)
-                            s2.copy(titles = (s2.titles + base.titles).distinct(), seasonHint = sn)
-                        else base.copy(seasonHint = sn, episodeCount = null, aniListId = null, malId = null)
-                    } else base
-                } else null
-
-                // TMDB (season, episode) -> the AniList entry and the episode number inside it
-                val animeTarget: AnimeTarget? = if (animeNames != null && ext.scheme in setOf("imdb", "tmdb", "tvdb") &&
-                    ext.season != null && ext.episode != null && animeNames.aniListId != null) {
-                    tmdbAllSeasonCounts(ext)?.let { counts -> AnimeResolver.mapEpisode(animeNames, ext.season, ext.episode, counts) }
-                } else null
+                // tt / tmdb / tvdb ids of anime: collect every alternative name (AniList, Kitsu, MyAnimeList) too,
+                // and map TMDB (season, episode) onto the AniList entry and the episode number inside it.
+                // This is only a refinement of the search, so it gets a time budget: the lookups are blocking HTTP
+                // calls (AniList / Kitsu / MAL / TMDB) and when one is slow they used to eat the whole answer time,
+                // so the providers started late and the player got 0 links. The lookup keeps running detached
+                // (it fills the resolver cache for the next try); this request carries on with the plain title.
+                val animeResolution = streamSearchScope.async {
+                    val names = animeInfo ?: if ((type == "series" || type == "anime") && ext.scheme in setOf("imdb", "tmdb", "tvdb")) {
+                        val base = AnimeResolver.fromTitle(title, year)
+                        val sn = ext.season
+                        if (base != null && sn != null && sn > 1) {
+                            // Later season: AniList lists it as its own entry (own names, own episode count)
+                            val s2 = AnimeResolver.fromTitle("$title Season $sn", null)
+                                ?: AnimeResolver.fromTitle("$title ${mapOf(2 to "2nd", 3 to "3rd").getOrDefault(sn, "${sn}th")} Season", null)
+                            if (s2 != null && AnimeMatcher.seasonNumber(AnimeMatcher.normalize(s2.titles.first())) == sn)
+                                s2.copy(titles = (s2.titles + base.titles).distinct(), seasonHint = sn)
+                            else base.copy(seasonHint = sn, episodeCount = null, aniListId = null, malId = null)
+                        } else base
+                    } else null
+                    val target: AnimeTarget? = if (names != null && ext.scheme in setOf("imdb", "tmdb", "tvdb") &&
+                        ext.season != null && ext.episode != null && names.aniListId != null) {
+                        tmdbAllSeasonCounts(ext)?.let { counts -> AnimeResolver.mapEpisode(names, ext.season, ext.episode, counts) }
+                    } else null
+                    names to target
+                }
+                val (animeNames, animeTarget) = withTimeoutOrNull(ANIME_RESOLVE_BUDGET_MS) { animeResolution.await() }
+                    ?: run {
+                        ServerState.warn("[Streams] '$title': anime lookup took longer than ${ANIME_RESOLVE_BUDGET_MS / 1000}s - searching with the plain title")
+                        animeInfo to null
+                    }
                 val animeForSearch = animeTarget?.entry?.copy(titles = (animeTarget.entry.titles + (animeNames?.titles.orEmpty())).distinct()) ?: animeNames
 
                 // Exclude live-TV-only extensions from generic TMDB VOD searches —
@@ -2294,8 +2309,13 @@ object StremioServer {
                         // Something found: answer once 8 s have passed and the first links are 4 s old (others arriving
                         // right behind it are included); the rest keeps filling the cache for the next reload
                         if (!waitAll && firstFoundAt != 0L && t >= STREAM_SOFT_DEADLINE_MS && now - firstFoundAt >= 4_000L) break
-                        // Never later than ANSWER_CAP after the request arrived (searching the title already took time)
-                        if (now - (streamRequestStart["$type:$id"]?.takeIf { now - it < 120_000L } ?: started) >= STREAM_ANSWER_CAP_MS) break
+                        // Never later than ANSWER_CAP after the request arrived (searching the title already took time) -
+                        // but the providers always get STREAM_MIN_WINDOW_MS first: when the title lookup used up the
+                        // cap, this used to break on the very first pass and answer 0 links with every provider
+                        // still running. The hard stop leaves time to send before RESPONSE_CAP_MS cuts the request off.
+                        val sinceRequest = now - (streamRequestStart["$type:$id"]?.takeIf { now - it < 120_000L } ?: started)
+                        if (sinceRequest >= RESPONSE_CAP_MS - 2_000L) break
+                        if (sinceRequest >= STREAM_ANSWER_CAP_MS && t >= STREAM_MIN_WINDOW_MS) break
                         delay(200)
                     }
                 }
