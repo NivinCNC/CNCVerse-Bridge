@@ -110,6 +110,10 @@ object AnimeResolver {
     private class Node(val hit: Hit, val prequel: Int?, val sequel: Int?)
 
     private val chainCache = ConcurrentHashMap<Int, List<Hit>>()
+    /** Threads for the independent lookups (franchise prequel walk, MyAnimeList titles). */
+    private val walkPool: java.util.concurrent.ExecutorService by lazy {
+        java.util.concurrent.Executors.newCachedThreadPool { r -> Thread(r, "anime-lookup").apply { isDaemon = true } }
+    }
     private val TV_FORMATS = setOf("TV", "TV_SHORT", "ONA")
 
     /** One AniList entry with its prequel / sequel (TV entries only). */
@@ -155,21 +159,28 @@ object AnimeResolver {
         chainCache[anilistId]?.let { return it }
         val start = aniListNode(anilistId) ?: return emptyList()
         val back = ArrayList<Hit>()
-        val seen = HashSet<Int>().apply { add(anilistId) }
-        var p = start.prequel
-        while (p != null && back.size < 10 && seen.add(p)) {
-            val n = aniListNode(p) ?: break
-            back.add(n.hit)
-            p = n.prequel
-        }
         val fwd = ArrayList<Hit>()
+        // Prequels and sequels are independent walks: run them side by side instead of one after the other
+        // (each hop is a network call; a long franchise used to take 30+ s one hop at a time)
+        val backJob = walkPool.submit(Runnable {
+            val seen = HashSet<Int>().apply { add(anilistId) }
+            var p = start.prequel
+            while (p != null && back.size < 10 && seen.add(p)) {
+                val n = aniListNode(p) ?: break
+                back.add(n.hit)
+                p = n.prequel
+            }
+        })
+        val seenFwd = HashSet<Int>().apply { add(anilistId) }
         var q = start.sequel
-        while (q != null && fwd.size < 10 && seen.add(q)) {
+        while (q != null && fwd.size < 10 && seenFwd.add(q)) {
             val n = aniListNode(q) ?: break
             fwd.add(n.hit)
             q = n.sequel
         }
-        val chain = back.reversed() + start.hit + fwd
+        // If the prequel walk is somehow still running after 60 s, do not read the list it is still filling
+        val backDone = runCatching { backJob.get(60, TimeUnit.SECONDS) }.isSuccess
+        val chain = (if (backDone) back.reversed() else emptyList()) + start.hit + fwd
         chainCache[anilistId] = chain
         for (h in chain) h.anilistId?.let { chainCache[it] = chain }
         return chain
@@ -224,11 +235,15 @@ object AnimeResolver {
     private fun enrich(hit: Hit): AnimeInfo {
         var info = hit.info
         val extra = ArrayList<String>()
+        // Kitsu (through the id mapping) and MyAnimeList do not depend on each other: ask both at once
+        val jikanJob = hit.malId?.let { mal ->
+            walkPool.submit(java.util.concurrent.Callable { runCatching { jikanTitles(mal) }.getOrNull() })
+        }
         hit.anilistId?.let { al ->
             runCatching { get("https://arm.haglund.dev/api/v2/ids?source=anilist&id=$al")?.str("kitsu") }.getOrNull()
                 ?.let { k -> runCatching { kitsu(k) }.getOrNull()?.let { extra += it.titles } }
         }
-        hit.malId?.let { mal -> runCatching { jikanTitles(mal) }.getOrNull()?.let { extra += it } }
+        jikanJob?.let { j -> runCatching { j.get(20, TimeUnit.SECONDS) }.getOrNull()?.let { extra += it } }
         if (extra.isNotEmpty()) {
             val seen = info.titles.map { AnimeMatcher.normalize(it) }.toMutableSet()
             val add = extra.filter { it.isNotBlank() && seen.add(AnimeMatcher.normalize(it)) }
