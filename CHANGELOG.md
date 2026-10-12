@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.7
+
+- **Movies showed no results - cause found:** one link's name contained a cut-off emoji (half of a character), which cannot be written as text, so the whole list failed with "MalformedInputException". Such broken characters are now removed from every link before the list is sent (and the movie list is no longer lost).
+
 ## 1.5.6
 
 - **Movies showed no results:** the list was found (hundreds of links) but never sent. Preparing and sending the list is now fail-safe: a link that cannot be prepared goes out as it is, a failed send is retried without subtitles, and any error is written to the log with its cause ("[Request] ... failed").

@@ -928,12 +928,14 @@ object StremioServer {
             ServerState.warn("[Request] $type/$id: preparing the list failed (${e.javaClass.simpleName}: ${e.message}) - sending the plain list. ${e.stackTraceToString().take(900)}")
             filtered.mapNotNull { st -> if (st.url == null && st.externalUrl == null && st.infoHash == null) null else st.copy(subtitles = null) }
         }
+        // Text with a broken emoji (a lone surrogate half) cannot be written as UTF-8 and would fail the whole answer
+        val safeOut = out.map { sanitizeStream(it) }
         try {
-            respond(StremioStreamResponse(out))
+            respond(StremioStreamResponse(safeOut))
         } catch (e: Throwable) {
             kotlinx.coroutines.currentCoroutineContext().ensureActive()
             ServerState.warn("[Request] $type/$id: sending the list failed (${e.javaClass.simpleName}: ${e.message}) - sending it without subtitles")
-            respond(StremioStreamResponse(out.map { it.copy(subtitles = null) }))
+            respond(StremioStreamResponse(safeOut.map { it.copy(subtitles = null) }))
         }
         ServerState.info("[Request] sent ${out.size} link(s) for $type/$id (${(System.currentTimeMillis() - requestStart) / 1000.0}s)")
         runCatching {
@@ -1023,6 +1025,39 @@ object StremioServer {
         val other = streams.filter { val k = audioKind(it); k != null && k != p.animeAudio }
         return if (p.animeAudioOnly) preferred + unlabelled else preferred + unlabelled + other
     }
+
+    /** Drops unpaired UTF-16 surrogates (cut-off emoji) that make JSON/UTF-8 encoding throw MalformedInputException. */
+    fun cleanText(t: String?): String? {
+        if (t == null) return null
+        var bad = false
+        for (i in t.indices) {
+            val c = t[i]
+            if (Character.isHighSurrogate(c)) { if (i + 1 >= t.length || !Character.isLowSurrogate(t[i + 1])) { bad = true; break } }
+            else if (Character.isLowSurrogate(c)) { if (i == 0 || !Character.isHighSurrogate(t[i - 1])) { bad = true; break } }
+        }
+        if (!bad) return t
+        val sb = StringBuilder(t.length)
+        var i = 0
+        while (i < t.length) {
+            val c = t[i]
+            if (Character.isHighSurrogate(c) && i + 1 < t.length && Character.isLowSurrogate(t[i + 1])) { sb.append(c).append(t[i + 1]); i += 2; continue }
+            if (!Character.isSurrogate(c)) sb.append(c)
+            i++
+        }
+        return sb.toString()
+    }
+
+    fun sanitizeStream(s: StremioStream): StremioStream = s.copy(
+        name = cleanText(s.name), title = cleanText(s.title), url = cleanText(s.url),
+        externalUrl = cleanText(s.externalUrl),
+        subtitles = s.subtitles?.map { it.copy(id = cleanText(it.id) ?: "", lang = cleanText(it.lang) ?: "", url = cleanText(it.url) ?: "") },
+        behaviorHints = s.behaviorHints?.let { h ->
+            h.copy(
+                bingeGroup = cleanText(h.bingeGroup),
+                proxyHeaders = h.proxyHeaders?.let { ph -> ph.copy(request = ph.request?.entries?.associate { (k, v) -> (cleanText(k) ?: "") to (cleanText(v) ?: "") }) },
+            )
+        },
+    )
 
     private val PIXELDRAIN = Regex("^https?://(?:www\\.)?pixeldrain\\.(?:com|dev|net)/(?:api/file|u)/([A-Za-z0-9_-]+)(?:[/?#].*)?$", RegexOption.IGNORE_CASE)
 
