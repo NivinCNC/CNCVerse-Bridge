@@ -858,20 +858,28 @@ object StremioServer {
         val requestStart = System.currentTimeMillis()
         ServerState.info("[Request] streams for $type/$id from ${request.local.remoteHost.let { request.headers["X-Forwarded-For"] ?: it }}")
 
-        val streams = withContext(pluginDispatcher) { buildStreams(type, id) }
-            // Archive downloads (".zip" season packs) can never play in any player
-            .filter { !SeekProbe.isArchiveUrl(it.url) }
+        // The player is not kept waiting for ever: after RESPONSE_CAP_MS an empty list goes out (late results
+        // are in the cache for the next try)
+        // The search runs detached: a player that hangs up (or this cap) must not cancel it, it keeps filling the cache
+        val search = streamSearchScope.async(pluginDispatcher) { buildStreams(type, id) }
+        val built = withTimeoutOrNull(RESPONSE_CAP_MS) { search.await() }
+        if (built == null) ServerState.warn("[Request] $type/$id: search still running after ${RESPONSE_CAP_MS / 1000}s - answering now, results will be in the cache for the next try")
+        val tBuilt = System.currentTimeMillis()
+        // Archive downloads (".zip" season packs) can never play in any player
+        val streams = (built ?: emptyList()).filter { !SeekProbe.isArchiveUrl(it.url) }
         // Filters and ordering from the app's stream settings
         val p = streamPrefs
         // Adaptive HLS links report no quality: read their playlist for the real resolution
-        val probed = if (p.probeHls || p.splitHls) QualityProbe.enrich(streams, p.splitHls, 6_000L, p.bestHls) else streams
+        val probed = if (p.probeHls || p.splitHls) QualityProbe.enrich(streams, p.splitHls, 4_000L, p.bestHls) else streams
+        val tProbed = System.currentTimeMillis()
         val sorted = sortStreamsByQuality(probed)
 
         val kept = filterStreamsByProfile(sorted, p)
         // Whatever the settings above did, the list that goes out is sorted by resolution and has nothing below 720p
-        val filtered = enforceResolutionOrder(hardsubFirst(applyAnimeAudio(
-            arrangeStreams(if (p.filterNonSeekable) SeekProbe.dropNonSeekable(kept) else kept, p), p
-        )))
+        val seekable = if (p.filterNonSeekable) SeekProbe.dropNonSeekable(kept) else kept
+        val tSeek = System.currentTimeMillis()
+        val filtered = enforceResolutionOrder(hardsubFirst(applyAnimeAudio(arrangeStreams(seekable, p), p)))
+        ServerState.info("[Request] $type/$id timing: search ${(tBuilt - requestStart) / 1000.0}s, quality probe ${(tProbed - tBuilt) / 1000.0}s, seek check ${(tSeek - tProbed) / 1000.0}s")
 
         // Drop results whose link is exactly the same as an earlier (better ranked) one; different links are never merged
         val unique = filtered.distinctBy<StremioStream, Any> { it.url ?: it.externalUrl ?: it.infoHash?.let { h -> "magnet:$h" } ?: it.ytId?.let { y -> "yt:$y" } ?: it }
@@ -1951,6 +1959,8 @@ object StremioServer {
     private val STREAM_SOFT_DEADLINE_MS = 8_000L
     /** Never keep a client waiting longer than this for the first answer. */
     private val STREAM_ANSWER_CAP_MS = 18_000L
+    /** Hard limit for the whole search part of a stream request. */
+    private val RESPONSE_CAP_MS = 24_000L
     private val PROVIDER_TIMEOUT_MS = 38_000L
     private val streamSearchScope = CoroutineScope(pluginDispatcher + SupervisorJob())
 

@@ -1,5 +1,9 @@
 # Changelog
 
+## 1.5.3
+
+- **Slow / missing answers in Nuvio (LAN):** the stream search now runs on its own, so a player that gives up (or the new 24 s limit) no longer cancels it - it finishes into the cache and the next try is instant. A request is never held longer than 24 s. The quality check of HLS links is limited to 4 s. The log shows where the time went for each request ("search ..s, quality probe ..s, seek check ..s").
+
 ## 1.5.2
 
 - **Free tunnel:** no longer tries to keep the same link. Free quick tunnels cannot keep one, and reusing the old one made the second start fail. Every start now makes a fresh tunnel (retried once if Cloudflare is slow); the new link is shown in the app. For a fixed link use your own tunnel token and domain.
