@@ -72,6 +72,39 @@ class FormatterPreviewTest {
     }
 
     @Test
+    fun `the extension's episode number and name are shown with the file name`() {
+        fun render(matchedEpisode: String?, url: String = "https://cdn.example.com/Clevatess.S02E08.1080p.mkv") = StreamFormatter.format(
+            com.cncverse.stremiobridge.model.StremioStream(
+                name = "Clevatess Season 2\nAnimePahe - 1080p", title = "Clevatess - 08", url = url,
+                info = com.cncverse.stremiobridge.model.StreamInfo(
+                    addonName = "AnimePahe", quality = 1080, matchedName = "Clevatess Season 2", matchedEpisode = matchedEpisode,
+                ),
+            ),
+            StreamRequestContext(2, 8),
+            Template.parse(StreamFormatter.PRESET_NAME), Template.parse(StreamFormatter.PRESET_DESCRIPTION),
+        ).title.orEmpty()
+
+        // episode as the extension lists it, then the file, on one line
+        val both = render("S2E8 · The Demon King")
+        assertTrue(both.contains("Ep S2E8 · The Demon King • File: Clevatess.S02E08.1080p.mkv"), both)
+        // a link with no file name still shows the episode; one without an episode keeps the file line as before
+        assertTrue(render("S2E8 · The Demon King", "https://host.example.com/hls/master.m3u8").contains("Ep S2E8 · The Demon King"))
+        val noEpisode = render(null)
+        assertTrue(noEpisode.contains("File: Clevatess.S02E08.1080p.mkv") && !noEpisode.contains("Ep S"), noEpisode)
+        // every built-in layout carries it
+        for (p in StreamFormatter.PRESETS) {
+            val out = StreamFormatter.format(
+                com.cncverse.stremiobridge.model.StremioStream(
+                    name = "Clevatess Season 2\nAnimePahe - 1080p", title = "Clevatess - 08", url = "https://cdn.example.com/a.mkv",
+                    info = com.cncverse.stremiobridge.model.StreamInfo(addonName = "AnimePahe", quality = 1080, matchedEpisode = "S2E8 · The Demon King"),
+                ),
+                StreamRequestContext(2, 8), Template.parse(p.nameTemplate), Template.parse(p.descriptionTemplate),
+            ).title.orEmpty()
+            assertTrue(out.contains("S2E8 · The Demon King"), "preset ${p.id}: $out")
+        }
+    }
+
+    @Test
     fun `episode context comes from every id form`() {
         assertEquals(StreamRequestContext(1, 2), StreamFormatter.contextFromId("series", "kitsu:7442:2"))
         assertEquals(StreamRequestContext(1, 3), StreamFormatter.contextFromId("series", "tmdb:1396:1:3"))

@@ -234,6 +234,39 @@ object MediaServer {
 
     private val OWN_PATH = Regex("^https?://[^/]+/(proxy/|decrypt|init_decrypt|media/)", RegexOption.IGNORE_CASE)
 
+    /**
+     * Other addresses of the same file, tried when the given one answers a range request with the whole file:
+     * the fast Pixeldrain mirror (cdn.pixeldrain.eu.cc, no download limit) has Pixeldrain's own API address behind
+     * it, which honours range requests.
+     */
+    internal fun alternatesOf(url: String): List<String> {
+        val m = Regex("^https?://cdn\\.pixeldrain\\.eu\\.cc/([A-Za-z0-9_-]+)(?:[/?#].*)?$", RegexOption.IGNORE_CASE).find(url) ?: return emptyList()
+        val id = m.groupValues[1]
+        return listOf("pixeldrain.com", "pixeldrain.dev", "pixeldrain.net").map { "https://$it/api/file/$id" }
+    }
+
+    /** Result of [probeRanges]: [url] answers a range request with 206; [total] is the file size, -1 when unknown. */
+    private class RangeProbe(val url: String, val total: Long)
+
+    /**
+     * Asks for two bytes ("bytes=0-1") of the current address first, then of its alternates, and returns the first
+     * one that answers 206. The download's own first request is the open-ended "bytes=0-", which some servers answer
+     * with a plain 200 and the whole file (allowed by HTTP) although they seek perfectly: only a closed range tells.
+     */
+    private fun probeRanges(e: FileEntry, client: okhttp3.OkHttpClient): RangeProbe? {
+        for (u in listOf(e.url) + alternatesOf(e.url)) {
+            val total = runCatching {
+                client.newCall(requestFor(e.src, u, "bytes=0-1")).execute().use { r ->
+                    if (r.code == 206) (parseTotal(r.header("Content-Range")) ?: -1L) else null
+                }
+            }.getOrNull()
+            if (total != null) return RangeProbe(u, total)
+        }
+        return null
+    }
+
+    private fun hostOf(url: String): String = runCatching { java.net.URI(url).host }.getOrNull() ?: url
+
     private fun looksLikeHls(url: String, linkType: String?): Boolean =
         linkType.equals("M3U8", true) || url.substringBefore('?').endsWith(".m3u8", true) || url.contains(".m3u8", true)
 
@@ -461,6 +494,8 @@ object MediaServer {
     }
 
     private class FileEntry(val id: String, val src: MediaSource, val dir: File) {
+        /** The address downloads use: the registered one, or an alternate address of the same file that can seek. */
+        @Volatile var url: String = src.url
         val have = RangeSet()
         val store = ChunkStore(File(dir, "chunks"))
         /** Bytes before this offset were watched and deleted (never counted as missing). */
@@ -593,7 +628,7 @@ object MediaServer {
     private fun downloadSegment(e: FileEntry, client: okhttp3.OkHttpClient, s0: Long, s1: Long, buf: ByteArray, wr: ChunkStore.Rw) {
         val pos = e.have.firstGapFrom(s0)
         if (pos >= s1) return
-        client.newCall(requestFor(e.src, e.src.url, "bytes=$pos-${s1 - 1}")).execute().use { r ->
+        client.newCall(requestFor(e.src, e.url, "bytes=$pos-${s1 - 1}")).execute().use { r ->
             if (r.code != 206) return@use // ranges not honoured: the main connection copes
             val input = r.body?.byteStream() ?: return@use
             var off = parseStart(r.header("Content-Range")) ?: pos
@@ -634,6 +669,7 @@ object MediaServer {
             raf = e.store.rw(true)
             var cursor = 0L
             var sinceSave = 0L
+            var probed = false
             while (!e.stop) {
                 val want = e.focus
                 if (want >= 0) e.focus = -1
@@ -647,15 +683,33 @@ object MediaServer {
                 }
                 val range = if (!e.ready || e.ranges) "bytes=$pos-" else null
                 if (e.ready && !e.ranges && pos != 0L) { pos = 0L } // origin cannot seek: only a straight download works
-                client.newCall(requestFor(e.src, e.src.url, range)).execute().use { r ->
+                client.newCall(requestFor(e.src, e.url, range)).execute().use { r ->
                     if (r.code != 200 && r.code != 206) throw IOException("HTTP ${r.code} from the source")
                     if (!e.ready) {
-                        if (r.code == 206) {
+                        // A 200 to a range request: the origin may still seek (it only answered "bytes=0-" with the whole
+                        // file), or another address of the same file may. Only when neither does is it downloaded in order.
+                        var probeTotal = -1L
+                        var seeks = r.code == 206
+                        if (r.code == 200 && !probed) {
+                            probed = true
+                            val hit = probeRanges(e, client)
+                            if (hit != null && hit.url != e.url) {
+                                ServerState.info("[MediaServer] ${hostOf(e.url)} cannot seek - using ${hostOf(hit.url)} instead")
+                                e.url = hit.url
+                                return@use // start again on the address that can seek
+                            }
+                            if (hit != null) { seeks = true; probeTotal = hit.total }
+                        }
+                        if (seeks) {
                             e.ranges = true
-                            e.total = parseTotal(r.header("Content-Range")) ?: -1L
+                            e.total = (if (r.code == 206) parseTotal(r.header("Content-Range")) else null)
+                                ?: probeTotal.takeIf { it > 0 }
+                                ?: r.body?.contentLength()
+                                ?: -1L
                         } else {
                             e.ranges = false
                             e.total = r.body?.contentLength() ?: -1L
+                            ServerState.warn("[MediaServer] ${hostOf(e.url)} cannot seek: the file is downloaded in order, so jumping ahead waits for the download")
                         }
                         r.header("Content-Type")?.substringBefore(';')?.trim()?.takeIf { it.isNotEmpty() }?.let { e.mime = it }
                         // The link is really an HLS playlist: hand over to the playlist route
@@ -763,7 +817,7 @@ object MediaServer {
         ensureWorker(e)
         withTimeoutOrNull(45_000) { while (!e.ready) delay(10) }
         if (!e.ready) return call.respondText("The source did not answer in time", status = HttpStatusCode.GatewayTimeout)
-        if (e.isPlaylist) return call.respondRedirect("../pl/${token(id, e.src.url)}.m3u8")
+        if (e.isPlaylist) return call.respondRedirect("../pl/${token(id, e.url)}.m3u8")
         if (e.passthrough) return passthrough(call, e)
         if (e.total <= 0) {
             return call.respondText("Source error: ${e.error ?: "unknown"}", status = HttpStatusCode.BadGateway)
@@ -833,7 +887,7 @@ object MediaServer {
     private suspend fun passthrough(call: ApplicationCall, e: FileEntry) {
         val rangeHeader = call.request.header("Range")
         val resp = try {
-            withContext(Dispatchers.IO) { clientFor(e.id, e.src).newCall(requestFor(e.src, e.src.url, rangeHeader)).execute() }
+            withContext(Dispatchers.IO) { clientFor(e.id, e.src).newCall(requestFor(e.src, e.url, rangeHeader)).execute() }
         } catch (t: Exception) {
             return call.respondText("Upstream unavailable", status = HttpStatusCode.BadGateway)
         }
