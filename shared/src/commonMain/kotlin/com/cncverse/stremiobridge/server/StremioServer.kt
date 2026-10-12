@@ -2030,7 +2030,7 @@ object StremioServer {
     /** Hard limit for the whole search part of a stream request. */
     private val RESPONSE_CAP_MS = 38_000L
     /** Time budget for the anime name / episode mapping lookups before the providers are started. */
-    private val ANIME_RESOLVE_BUDGET_MS = 8_000L
+    private val ANIME_RESOLVE_BUDGET_MS = 25_000L
     /** The providers are always given at least this long before the answer cap can end the wait. */
     private val STREAM_MIN_WINDOW_MS = 12_000L
     private val PROVIDER_TIMEOUT_MS = 80_000L
@@ -2229,9 +2229,11 @@ object StremioServer {
                     } else null
                     names to target
                 }
+                var animeTimedOut = false
                 val (animeNames, animeTarget) = withTimeoutOrNull(ANIME_RESOLVE_BUDGET_MS) { animeResolution.await() }
                     ?: run {
-                        ServerState.warn("[Streams] '$title': anime lookup took longer than ${ANIME_RESOLVE_BUDGET_MS / 1000}s - searching with the plain title")
+                        animeTimedOut = true
+                        ServerState.warn("[Streams] '$title': anime lookup took longer than ${ANIME_RESOLVE_BUDGET_MS / 1000}s - searching with the plain title first, the anime names are added when the lookup finishes")
                         animeInfo to null
                     }
                 val animeForSearch = animeTarget?.entry?.copy(titles = (animeTarget.entry.titles + (animeNames?.titles.orEmpty())).distinct()) ?: animeNames
@@ -2294,6 +2296,36 @@ object StremioServer {
                             }
                         }
                         if (answered.get() && accumulated.isNotEmpty()) publish()
+                    }
+                }
+
+                // The anime lookup missed its time budget: the extensions above were searched with the plain title only.
+                // When the lookup does finish (it keeps running detached), search every extension again with all the
+                // names / the exact season entry and add whatever is new - to this answer if it is still open, else to the cache.
+                if (animeTimedOut) {
+                    streamSearchScope.launch {
+                        val late = withTimeoutOrNull(STREAM_DEADLINE_MS) { animeResolution.await() } ?: return@launch
+                        val (lateNames, lateTarget) = late
+                        val lateSearch = lateTarget?.entry?.copy(titles = (lateTarget.entry.titles + (lateNames?.titles.orEmpty())).distinct()) ?: lateNames
+                            ?: return@launch // not an anime after all: nothing more to find
+                        ServerState.info("[Streams] '$title': anime lookup finished late - searching the extensions again with the anime names")
+                        val seen = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+                        accumulated.forEach { st -> (st.url ?: st.infoHash ?: st.externalUrl)?.let { seen.add(it) } }
+                        activePlugins.map { api ->
+                            launch {
+                                sem.withPermit {
+                                    withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
+                                        try {
+                                            val more = doBuildGenericStreamsForApi(api, type, id, title, year, lateSearch, lateTarget)
+                                            accumulated.addAll(more.filter { st -> (st.url ?: st.infoHash ?: st.externalUrl)?.let { seen.add(it) } ?: true })
+                                        } catch (e: Throwable) {
+                                            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+                                        }
+                                    }
+                                }
+                            }
+                        }.joinAll()
+                        if (accumulated.isNotEmpty()) publish()
                     }
                 }
 
@@ -2635,7 +2667,7 @@ object StremioServer {
             return links.map { stream ->
                 val newName = bestMatch.name + (if (!stream.name.isNullOrBlank()) "\n${stream.name}" else "")
                 val info = (stream.info ?: com.cncverse.stremiobridge.model.StreamInfo(addonName = api.name))
-                    .copy(metadataTitle = title, metadataYear = year)
+                    .copy(metadataTitle = title, metadataYear = year, matchedName = bestMatch.name)
                 stream.copy(name = newName, info = info)
             }
         } catch (e: Throwable) {

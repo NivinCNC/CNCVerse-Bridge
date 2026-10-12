@@ -280,7 +280,7 @@ object StreamVariables {
         "stream.resolution", "stream.quality", "stream.specs", "stream.visualTags", "stream.encode",
         "stream.audioTags", "stream.audioChannels", "stream.streamType", "stream.size",
         "stream.languages", "stream.subtitles", "stream.seasonEpisode", "stream.season",
-        "stream.episode", "stream.audioKind", "stream.subType", "stream.host", "stream.source", "stream.label", "stream.filename", "stream.name", "stream.title",
+        "stream.episode", "stream.audioKind", "stream.subType", "stream.host", "stream.source", "stream.label", "stream.match", "stream.filename", "stream.name", "stream.title",
     )
 
     private fun rx(p: String) = Regex("(?<![A-Za-z0-9])(?:$p)(?![A-Za-z0-9])", RegexOption.IGNORE_CASE)
@@ -551,6 +551,9 @@ object StreamVariables {
             // same item apart (live feeds like "Hindi" / "English", servers,
             // release names). Empty when it only repeats the addon/source name.
             "stream.label" to labelName(info?.linkName, addon, info?.source, source),
+            // The entry of the extension this link was taken from ("Clevatess Season 2"): lets the user judge if the
+            // extension matched the right title. Links cached by an older version carry it as the first line of the name.
+            "stream.match" to (info?.matchedName?.trim()?.takeIf { it.isNotEmpty() } ?: releaseText?.trim()),
             "stream.filename" to linkText,
             "stream.name" to stream.name,
             "stream.title" to stream.title,
@@ -642,6 +645,7 @@ object StreamFormatter {
             description = "Ultra-compact 2-line layout inspired by Torrentio and Cyberflix.",
             nameTemplate = "[CNC] {stream.resolution::default('HD')} • {addon.name}",
             descriptionTemplate = "{metadata.title}{stream.seasonEpisode::exists[\" - {stream.seasonEpisode::join('')}\"||\"\"]}\n" +
+                "{stream.match::exists[\"Matched: {stream.match::truncate(60)}\"||\"\"]}\n" +
                 "{stream.specs::join(' ')}{stream.size::>0[\" | {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}{stream.source::exists[\" | {stream.source}\"||\"\"]}\n" +
                 "Audio: {stream.languages::default('Multi')}{stream.subtitles::exists[\" | Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
         ),
@@ -651,6 +655,7 @@ object StreamFormatter {
             description = "Detailed specifications with HDR/DV tags, codecs, and server tags.",
             nameTemplate = "⚡ CNCVerse | {stream.resolution::=2160p[\"💎 4K UHD\"||\"📺 {stream.resolution::default('FHD')}\"]} | {addon.name}",
             descriptionTemplate = "🎬 {metadata.title}{stream.seasonEpisode::exists[\" [{stream.seasonEpisode::join('')}]\"||\"\"]}\n" +
+                "{stream.match::exists[\"🔎 Match: {stream.match::truncate(90)}\"||\"\"]}\n" +
                 "⚙️ Specs: {stream.specs::join(' • ')}\n" +
                 "📦 Size: {stream.size::>0[\"{stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"Direct Stream\"]} • Host: {addon.name}\n" +
                 "🔊 Audio: {stream.languages::default('Original')}\n" +
@@ -662,6 +667,7 @@ object StreamFormatter {
             description = "Clean essentials without emojis or redundant lines.",
             nameTemplate = "{stream.resolution::default('Auto')} • {stream.streamType::default('Direct')} • {addon.name}",
             descriptionTemplate = "{metadata.title}{stream.seasonEpisode::exists[\" • {stream.seasonEpisode::join('')}\"||\"\"]}\n" +
+                "{stream.match::exists[\"Matched: {stream.match::truncate(90)}\"||\"\"]}\n" +
                 "{stream.specs::join(' • ')}\n" +
                 "{stream.size::>0[\"Size: {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')} • \"||\"\"]}Audio: {stream.languages::default('Default')}"
         )
@@ -670,8 +676,21 @@ object StreamFormatter {
     const val PRESET_NAME =
         "🌀 CNCVerse {stream.resolution::=2160p[\"❄️ 4K\"||\"{stream.resolution::=1080p[\"🧊 {stream.resolution::default('Auto')}\"||\"🎬 {stream.resolution::default('Auto')}\"]}\"]} • {addon.name}" +
             "{stream.subtype::exists[\" • {stream.subtype}\"||\"{stream.audiokind::exists[\" • {stream.audiokind}\"||\"\"]}\"]}"
+    /** The layout before the "Matched" line was added (1.5.9): a saved copy of it is moved to the current layout. */
+    private const val PRESET_DESCRIPTION_V3 =
+        "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('CNCVerse stream')}\"]}\n" +
+        "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
+        "{stream.audiokind::exists[\"🗣️ {stream.audiokind}{stream.subtype::exists[\" • {stream.subtype}\"||\"\"]}\"||\"\"]}\n" +
+        "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::default('Auto')} • {stream.streamType::default('HLS')}\"]}\n" +
+        "🛰️ {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}{stream.host::exists[\" • {stream.host}\"||\"\"]}\n" +
+        "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}\n" +
+        "{stream.languages::exists[\"🎧 Audio: {stream.languages::join(', ')}\"||\"\"]}\n" +
+        "{stream.subtitles::exists[\"💬 Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
+
+    /** Current layout: the same, plus the name of the entry in the extension the link came from. */
     const val PRESET_DESCRIPTION =
         "{stream.seasonEpisode::exists[\"📡 {metadata.title} • {stream.seasonEpisode::join('')}\"||\"🍿 {metadata.title::default('CNCVerse stream')}\"]}\n" +
+        "{stream.match::exists[\"🔎 Matched: {stream.match::truncate(90)}\"||\"\"]}\n" +
         "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
         "{stream.audiokind::exists[\"🗣️ {stream.audiokind}{stream.subtype::exists[\" • {stream.subtype}\"||\"\"]}\"||\"\"]}\n" +
         "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::default('Auto')} • {stream.streamType::default('HLS')}\"]}\n" +
@@ -682,12 +701,12 @@ object StreamFormatter {
 
     /** Built-in layouts of earlier versions: a saved copy of one of them is moved to the current layout. */
     private val OLD_PRESET_DESCRIPTIONS: List<String> = run {
-        val v2 = PRESET_DESCRIPTION.lines().filter { !it.contains("stream.host") }.joinToString("\n") +
+        val v2 = PRESET_DESCRIPTION_V3.lines().filter { !it.contains("stream.host") }.joinToString("\n") +
             "\n" // placeholder to keep the list non-empty on odd inputs
         val srcLine = "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}"
-        val v2full = PRESET_DESCRIPTION.lines().joinToString("\n") { if (it.contains("stream.host")) srcLine else it }
+        val v2full = PRESET_DESCRIPTION_V3.lines().joinToString("\n") { if (it.contains("stream.host")) srcLine else it }
         val v1 = v2full.lines().filter { !it.contains("stream.audiokind") }.joinToString("\n")
-        listOf(v2full, v1, v2.trimEnd())
+        listOf(PRESET_DESCRIPTION_V3, v2full, v1, v2.trimEnd())
     }
     private val OLD_PRESET_NAME = "🌀 CNCVerse {stream.resolution::=2160p[\"❄️ 4K\"||\"{stream.resolution::=1080p[\"🧊 {stream.resolution::default('Auto')}\"||\"🎬 {stream.resolution::default('Auto')}\"]}\"]} • {addon.name}"
 
@@ -706,7 +725,7 @@ object StreamFormatter {
             .onFailure { ServerState.warn("Stream formatter config unreadable: ${it.message}") }
             .getOrNull()?.let { c ->
                 // Saved copy of an earlier built-in layout: move it to the current one
-                if (c.nameTemplate == OLD_PRESET_NAME && c.descriptionTemplate in OLD_PRESET_DESCRIPTIONS)
+                if ((c.nameTemplate == OLD_PRESET_NAME || c.nameTemplate == PRESET_NAME) && c.descriptionTemplate in OLD_PRESET_DESCRIPTIONS)
                     c.copy(nameTemplate = PRESET_NAME, descriptionTemplate = PRESET_DESCRIPTION) else c
             } ?: StreamFormatterConfig(enabled = true, nameTemplate = PRESET_NAME, descriptionTemplate = PRESET_DESCRIPTION)
         runCatching { install(loaded) }.onFailure {

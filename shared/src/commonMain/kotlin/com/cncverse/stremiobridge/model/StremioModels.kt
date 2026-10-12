@@ -163,6 +163,8 @@ data class StreamInfo(
     val metadataYear: Int? = null,
     /** Display name of the extension (MainAPI.name, e.g. "4K HDHUB") - what the configure page lists. */
     val providerName: String? = null,
+    /** Name of the entry in the extension this link was taken from (the search result that was matched), so the user can judge if it is the right title. */
+    val matchedName: String? = null,
 )
 
 @Serializable

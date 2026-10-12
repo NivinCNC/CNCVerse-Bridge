@@ -33,7 +33,8 @@ object QualityProbe {
 
     private const val TTL_MS = 30 * 60_000L
     private val cache = ConcurrentHashMap<String, Cached>()
-    private val limit = Semaphore(8)
+    // Playlist reads are tiny: with 8 at a time 40+ HLS links needed several waves and the request waited for the last one
+    private val limit = Semaphore(32)
 
     private val client by lazy {
         okhttp3.OkHttpClient.Builder()

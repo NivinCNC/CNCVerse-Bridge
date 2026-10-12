@@ -111,7 +111,7 @@ object MediaServer {
     private val served = AtomicLong(0)
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private val prefetchLimit = Semaphore(8)
+    private val prefetchLimit = Semaphore(12)
 
     private val sources = ConcurrentHashMap<String, MediaSource>()
     private val files = ConcurrentHashMap<String, FileEntry>()
@@ -318,6 +318,9 @@ object MediaServer {
 
     private val baseClient by lazy {
         okhttp3.OkHttpClient.Builder()
+            // Several connections per file / many HLS segments: keep them open for the next piece instead of
+            // closing all but five and paying a new TCP + TLS handshake for every segment
+            .connectionPool(okhttp3.ConnectionPool(48, 5, TimeUnit.MINUTES))
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(45, TimeUnit.SECONDS)
             .followRedirects(true)
@@ -525,8 +528,8 @@ object MediaServer {
     }
 
     /** Segment size and number of extra connections that download ahead of the player in parallel. */
-    private const val SEG = 16L * 1024 * 1024
-    private const val BOOSTERS = 3
+    private const val SEG = 8L * 1024 * 1024
+    private const val BOOSTERS = 5
 
     private fun startBoosters(e: FileEntry) {
         if (!e.boosters.compareAndSet(0, BOOSTERS)) return
@@ -758,7 +761,7 @@ object MediaServer {
         e.lastAccess = System.currentTimeMillis()
         served.incrementAndGet()
         ensureWorker(e)
-        withTimeoutOrNull(45_000) { while (!e.ready) delay(50) }
+        withTimeoutOrNull(45_000) { while (!e.ready) delay(10) }
         if (!e.ready) return call.respondText("The source did not answer in time", status = HttpStatusCode.GatewayTimeout)
         if (e.isPlaylist) return call.respondRedirect("../pl/${token(id, e.src.url)}.m3u8")
         if (e.passthrough) return passthrough(call, e)
@@ -808,7 +811,7 @@ object MediaServer {
                         if (e.ranges && !near && e.focus < 0) e.focus = pos
                         if (e.error != null && e.worker == null) throw IOException(e.error)
                         if (System.currentTimeMillis() - lastProgress > 90_000) throw IOException("download stalled")
-                        delay(40)
+                        delay(15)
                         continue
                     }
                     val n = minOf(avail - pos, end - pos + 1, buf.size.toLong()).toInt()
@@ -1037,16 +1040,20 @@ object MediaServer {
         val f = segFile(id, url)
         if (f.exists()) return f
         val lock = segLocks.getOrPut("$id|$url") { Any() }
-        synchronized(lock) {
-            if (f.exists()) return f
-            val (bytes, mime) = fetchRemote(id, src, url)
-            val tmp = File(f.parentFile, f.name + ".tmp")
-            tmp.writeBytes(bytes)
-            mime?.let { runCatching { File(f.parentFile, f.name + ".ct").writeText(it) } }
-            if (!tmp.renameTo(f)) { tmp.copyTo(f, overwrite = true); tmp.delete() }
-            if (segWrites.incrementAndGet() % 20L == 0L) makeRoom(0, id)
+        try {
+            synchronized(lock) {
+                if (f.exists()) return f
+                val (bytes, mime) = fetchRemote(id, src, url)
+                val tmp = File(f.parentFile, f.name + ".tmp")
+                tmp.writeBytes(bytes)
+                mime?.let { runCatching { File(f.parentFile, f.name + ".ct").writeText(it) } }
+                if (!tmp.renameTo(f)) { tmp.copyTo(f, overwrite = true); tmp.delete() }
+                if (segWrites.incrementAndGet() % 20L == 0L) makeRoom(0, id)
+            }
+        } finally {
+            // also when the download failed or the file was already there: the lock map must not grow for ever
+            segLocks.remove("$id|$url")
         }
-        segLocks.remove("$id|$url")
         return f
     }
 
