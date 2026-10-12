@@ -249,18 +249,25 @@ object MediaServer {
     private class RangeProbe(val url: String, val total: Long)
 
     /**
-     * Asks for two bytes ("bytes=0-1") of the current address first, then of its alternates, and returns the first
-     * one that answers 206. The download's own first request is the open-ended "bytes=0-", which some servers answer
-     * with a plain 200 and the whole file (allowed by HTTP) although they seek perfectly: only a closed range tells.
+     * Finds out whether a file that answered the open-ended "bytes=0-" with a plain 200 can seek after all. Tried, in order,
+     * on the address itself, on the file its redirects end at ([finalUrl], e.g. a CDN node with its own address) and on the
+     * known alternates: a closed range at the start ("bytes=0-1"), then a closed range in the middle of the file (some
+     * servers only ignore ranges that start at 0). The first address that answers 206 with the bytes asked for wins.
+     * [length] is the size the 200 response announced (-1 unknown): it places the mid-file probe.
      */
-    private fun probeRanges(e: FileEntry, client: okhttp3.OkHttpClient): RangeProbe? {
-        for (u in listOf(e.url) + alternatesOf(e.url)) {
-            val total = runCatching {
-                client.newCall(requestFor(e.src, u, "bytes=0-1")).execute().use { r ->
-                    if (r.code == 206) (parseTotal(r.header("Content-Range")) ?: -1L) else null
-                }
-            }.getOrNull()
-            if (total != null) return RangeProbe(u, total)
+    private fun probeRanges(e: FileEntry, client: okhttp3.OkHttpClient, finalUrl: String?, length: Long): RangeProbe? {
+        val candidates = (listOf(e.url) + listOfNotNull(finalUrl) + alternatesOf(e.url)).distinct()
+        for (u in candidates) {
+            val starts = if (length > 4_000_000L) listOf(0L, (length / 2)) else listOf(0L)
+            for (start in starts) {
+                val total = runCatching {
+                    client.newCall(requestFor(e.src, u, "bytes=$start-${start + 1}")).execute().use { r ->
+                        val cr = r.header("Content-Range")
+                        if (r.code == 206 && (parseStart(cr) ?: start) == start) (parseTotal(cr) ?: length) else null
+                    }
+                }.getOrNull()
+                if (total != null) return RangeProbe(u, total)
+            }
         }
         return null
     }
@@ -505,6 +512,8 @@ object MediaServer {
         val claimed: MutableSet<Long> = ConcurrentHashMap.newKeySet()
         val metaFile = File(dir, "meta.json")
         @Volatile var total = -1L
+        /** Size of a file whose server answers the open-ended "bytes=N-" with the whole file but honours closed ranges: downloads then ask "bytes=N-(size-1)". -1 = not needed. */
+        @Volatile var closedTotal = -1L
         @Volatile var ranges = false
         @Volatile var mime = "application/octet-stream"
         @Volatile var ready = false
@@ -681,7 +690,7 @@ object MediaServer {
                     if (pos >= e.total) pos = e.have.firstGapFrom(e.floor)
                     if (pos >= e.total) break // everything that is still needed is on disk
                 }
-                val range = if (!e.ready || e.ranges) "bytes=$pos-" else null
+                val range = if (!e.ready || e.ranges) (if (e.closedTotal > 0) "bytes=$pos-${e.closedTotal - 1}" else "bytes=$pos-") else null
                 if (e.ready && !e.ranges && pos != 0L) { pos = 0L } // origin cannot seek: only a straight download works
                 client.newCall(requestFor(e.src, e.url, range)).execute().use { r ->
                     if (r.code != 200 && r.code != 206) throw IOException("HTTP ${r.code} from the source")
@@ -692,7 +701,8 @@ object MediaServer {
                         var seeks = r.code == 206
                         if (r.code == 200 && !probed) {
                             probed = true
-                            val hit = probeRanges(e, client)
+                            val hit = probeRanges(e, client, r.request.url.toString(), r.body?.contentLength() ?: -1L)
+                            if (hit != null && hit.total > 0) e.closedTotal = hit.total
                             if (hit != null && hit.url != e.url) {
                                 ServerState.info("[MediaServer] ${hostOf(e.url)} cannot seek - using ${hostOf(hit.url)} instead")
                                 e.url = hit.url
@@ -709,7 +719,7 @@ object MediaServer {
                         } else {
                             e.ranges = false
                             e.total = r.body?.contentLength() ?: -1L
-                            ServerState.warn("[MediaServer] ${hostOf(e.url)} cannot seek: the file is downloaded in order, so jumping ahead waits for the download")
+                            ServerState.warn("[MediaServer] NOT SEEKABLE: ${e.url} ignores range requests (also tried its redirect target and mid-file ranges), so the file is downloaded in order and jumping ahead waits for the download")
                         }
                         r.header("Content-Type")?.substringBefore(';')?.trim()?.takeIf { it.isNotEmpty() }?.let { e.mime = it }
                         // The link is really an HLS playlist: hand over to the playlist route
