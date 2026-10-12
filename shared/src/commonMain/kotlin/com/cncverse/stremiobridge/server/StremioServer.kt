@@ -2615,6 +2615,13 @@ object StremioServer {
         }
 
         var dataUrlToLoad = mediaInfo.dataUrl
+        // The episode the extension's link is for, as the extension lists it ("S2E2 · Episode name"), shown next to the file name
+        var matchedEpisode: String? = null
+        fun episodeLabel(ep: MediaInfoEpisode): String? {
+            val numbers = listOfNotNull(ep.season?.let { "S$it" }, ep.episode?.let { "E$it" }).joinToString("")
+            return listOfNotNull(numbers.takeIf { it.isNotEmpty() }, ep.name?.trim()?.takeIf { it.isNotEmpty() })
+                .joinToString(" · ").takeIf { it.isNotEmpty() }
+        }
         if (anime != null) {
             val parsed = ExternalIds.parse(id)
             // TMDB numbering was translated to the AniList entry: its own episode number, or the running number on a site that merges seasons
@@ -2636,6 +2643,7 @@ object StremioServer {
                     return emptyList()
                 }
                 dataUrlToLoad = ep.dataUrl
+                matchedEpisode = episodeLabel(ep)
                 ServerState.debug("[${api.name}] Anime episode $epNo -> '${ep.name}'")
             }
         } else if (type == "series" && id.contains(":")) {
@@ -2647,6 +2655,7 @@ object StremioServer {
                 val ep = mediaInfo.episodes?.find { (it.season ?: 1) == season && it.episode == episode }
                 if (ep != null) {
                     dataUrlToLoad = ep.dataUrl
+                    matchedEpisode = episodeLabel(ep)
                     ServerState.debug("[${api.name}] Found episode S${season}E${episode}")
                 } else {
                     ServerState.debug("[STREAM_EMPTY] [${api.name}] Episode S${season}E${episode} not found")
@@ -2667,7 +2676,7 @@ object StremioServer {
             return links.map { stream ->
                 val newName = bestMatch.name + (if (!stream.name.isNullOrBlank()) "\n${stream.name}" else "")
                 val info = (stream.info ?: com.cncverse.stremiobridge.model.StreamInfo(addonName = api.name))
-                    .copy(metadataTitle = title, metadataYear = year, matchedName = bestMatch.name)
+                    .copy(metadataTitle = title, metadataYear = year, matchedName = bestMatch.name, matchedEpisode = matchedEpisode)
                 stream.copy(name = newName, info = info)
             }
         } catch (e: Throwable) {

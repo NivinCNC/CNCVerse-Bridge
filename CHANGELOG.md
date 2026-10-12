@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- **Episode shown with the file name:** the "File" line of every result now starts with the episode the extension used for that link - its number and name as the extension lists it, e.g. `Ep S2E8 · The Demon King • File: Clevatess.S02E08.1080p.mkv` - so you can see at a glance whether the right episode was picked. All four built-in layouts carry it; a saved copy of the previous default layout moves to the new one automatically. New variables for your own layouts: `{stream.fileline}` (episode and file) and `{stream.matchepisode}` (the episode alone).
+- **Seeking in Pixeldrain links (media server):** the media server asked for the file with an open-ended range ("bytes=0-"), and a server may answer that with the whole file (allowed) and still seek fine - such a link was wrongly downloaded in order, so jumping ahead had to wait for the download. Now a plain answer is checked with a two-byte range request first. If the fast mirror (cdn.pixeldrain.eu.cc) really cannot seek, the media server switches to Pixeldrain's own address of the same file (pixeldrain.com / .dev / .net `/api/file/ID`), which can: seeking works and only the part that is watched is downloaded. A source that cannot seek at all is still downloaded in order (the log says so).
+
 ## 1.5.11
 
 - **Each link shows its file name:** next to the matched extension entry, the link description now has the name of the video file the link plays ("📄 File: Clevatess.S02E08.1080p.WEB-DL.mkv"), so you can check that it is the right file. It is read from the end of the link, from a `file=` / `filename=` part of the link, or from the link's own name when that is a file name; adaptive streams (HLS) and links without a file name get no file line. Built into all four layouts, and a new formatter variable `{stream.file}` for your own layouts. A saved copy of the 1.5.10 built-in layout is moved to the new one; custom layouts are left as they are.

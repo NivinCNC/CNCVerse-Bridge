@@ -165,6 +165,8 @@ data class StreamInfo(
     val providerName: String? = null,
     /** Name of the entry in the extension this link was taken from (the search result that was matched), so the user can judge if it is the right title. */
     val matchedName: String? = null,
+    /** The episode of that entry this link belongs to, as the extension lists it ("S2E2 · Episode name"), so the user can judge if it is the right episode. */
+    val matchedEpisode: String? = null,
 )
 
 @Serializable
