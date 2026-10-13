@@ -175,6 +175,7 @@ actual class PluginLoader {
                 .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
                 .addInterceptor(TMDB_HOST_REWRITE)
                 .dispatcher(PLUGIN_DISPATCHER)
+                .pingInterval(PLUGIN_PING_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
                 .eventListenerFactory(LeakSafeEventListener.FACTORY)
                 .build()
             okClientField.set(currentNiceClient, newOk)
@@ -213,6 +214,7 @@ actual class PluginLoader {
                             .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
                             .addInterceptor(TMDB_HOST_REWRITE)
                             .dispatcher(PLUGIN_DISPATCHER)
+                            .pingInterval(PLUGIN_PING_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
                             .eventListenerFactory(LeakSafeEventListener.FACTORY)
                             .build()
                         runCatching { baseClientField.set(target, patched) }
@@ -260,6 +262,7 @@ actual class PluginLoader {
                         // Tags each call with its plugin — without it geo routing sees no plugin
                         .addInterceptor(TMDB_HOST_REWRITE)
                         .dispatcher(PLUGIN_DISPATCHER)
+                        .pingInterval(PLUGIN_PING_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
                         .eventListenerFactory(LeakSafeEventListener.FACTORY)
                         .build()
                     okField.set(requests, patched)
@@ -734,17 +737,28 @@ internal val PLUGIN_DISPATCHER = okhttp3.Dispatcher().apply {
 }
 
 /**
+ * HTTP/2 keepalive ping for extension clients. A site's connection can die silently (WARP/NAT
+ * drop): OkHttp kept sending every new request down it and waited for headers that never came.
+ * The 25 s detail-page limit cancels those calls before the 35 s read timeout, and a cancel
+ * doesn't mark the connection bad — so 4khdhub.one stayed stuck for 10+ min while curl answered
+ * in 0.3 s. An unanswered ping fails the connection and the next request opens a fresh one.
+ */
+internal const val PLUGIN_PING_SECONDS = 10L
+
+/**
  * Threads for extension calls. Plugins block a thread per HTTP request (up to the 35 s read
- * timeout), and on the shared Dispatchers.IO (64 threads) ~40 such waits filled it: every other
- * call, detail pages included, queued until the 25 s meta limit and answered 404. An IO view
- * is elastic — it gets its own threads beyond IO's 64 — so this caps extension work separately.
+ * timeout) and parse pages on it. On the shared Dispatchers.IO (64) they filled every thread
+ * alongside proxy probes and the relay, so a detail page queued until the 25 s meta limit and
+ * answered 404. An IO view gets its own threads beyond IO's 64, so extension work now has its
+ * own cap — kept below the old 64: 256 let so much parsing run at once that 2 vCPUs went from
+ * load ~30 to ~50 and everything slowed down.
  */
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-internal val PLUGIN_IO = Dispatchers.IO.limitedParallelism(256)
+internal val PLUGIN_IO = Dispatchers.IO.limitedParallelism(48)
 
-/** Detail pages (a user just opened a title) get their own threads: background stream scraping can't starve them. */
+/** Detail pages (a user just opened a title) get reserved threads: background stream scraping can't starve them. */
 @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-internal val PLUGIN_LOAD_IO = Dispatchers.IO.limitedParallelism(64)
+internal val PLUGIN_LOAD_IO = Dispatchers.IO.limitedParallelism(12)
 
 /**
  * OkHttp EventListener that auto-closes any [Response] body left open when

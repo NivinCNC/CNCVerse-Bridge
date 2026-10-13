@@ -2194,7 +2194,8 @@ object StremioServer {
             ?: loadedApis.find { nameSlug(it.name) == nameSlugFromId }
             ?: loadedApis.find { it.internalName == nameSlugFromId }          // old-format compat
             ?: loadedApis.find { rest.startsWith(it.internalName + "_") }    // prefix fallback
-            ?: loadedApis.firstOrNull()
+            // No "first loaded extension" fallback: while plugins load at startup the real one is
+            // missing, and BollyFlix's home page got cached as HDHub4U's, Movix's… for 30 min
             ?: return emptyList()
 
         val sectionName = genre
@@ -2457,7 +2458,8 @@ object StremioServer {
             ?: loadedApis.find { nameSlug(it.name) == nameSlugFromId }
             ?: loadedApis.find { it.internalName == nameSlugFromId }
             ?: loadedApis.find { rest.startsWith(it.internalName + "_") }
-            ?: loadedApis.firstOrNull()
+            // No "first loaded extension" fallback: while plugins load at startup the real one is
+            // missing, and BollyFlix's home page got cached as HDHub4U's, Movix's… for 30 min
             ?: return emptyList()
 
         if (ServerState.disableCatalogsGlobally) return emptyList()
