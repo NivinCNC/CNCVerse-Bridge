@@ -94,12 +94,20 @@ object BridgeRuntime {
 
     private val pluginMutationMutex = Mutex()
 
+    /** Server only: in the app a new source usually means the user just enabled a playlist. */
+    private fun checkNewSources() {
+        if (!headlessMode) return
+        runCatching { StremioServer.disableNewSources() }
+            .onFailure { ServerState.warn("New-source check failed: ${it.message}") }
+    }
+
     private suspend fun doReloadPlugins() {
         val installed = withContext(Dispatchers.IO) { PluginInstaller.loadInstalledPlugins(cacheDir) }
         RepoState.setInstalledPlugins(installed)
         installed.forEach { RepoState.setInstallState(it.internalName, PluginInstallState.Installed) }
         val cs3Files = PluginInstaller.getInstalledFiles(cacheDir)
         GlobalPluginManager.reloadAllPlugins(installed, cs3Files)
+        checkNewSources()
         StremioServer.initFastCatalogs()
         registerGeoPlugins(installed)
     }
@@ -333,6 +341,8 @@ object BridgeRuntime {
         val ipAddress = getLocalIpAddress() ?: "127.0.0.1"
         CloudflaredManager.deviceIp = ipAddress
         val boundPort = StremioServer.start(preferredPort, cacheDir)
+        // The first load above runs before start() has opened the data files
+        checkNewSources()
 
         ServerState.updateStatus(
             ServerStatus.Running(

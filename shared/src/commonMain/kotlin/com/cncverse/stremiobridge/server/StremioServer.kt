@@ -1087,6 +1087,65 @@ object StremioServer {
         saveDisabledPlugins()
     }
 
+    /** Plugins and sources this server has loaded before; tells a newly added source from an old one. */
+    @Serializable
+    private data class KnownSources(val plugins: Set<String> = emptySet(), val sources: Set<String> = emptySet())
+
+    private val knownSourcesFile: File? get() = disabledPluginsFile?.let { File(it.parentFile, "known_sources.json") }
+    @Volatile private var knownSourcesCache: KnownSources? = null
+
+    private fun readKnownSources(): KnownSources? {
+        knownSourcesCache?.let { return it }
+        val f = knownSourcesFile?.takeIf { it.exists() } ?: return null
+        return runCatching { serverJson.decodeFromString<KnownSources>(f.readText()) }
+            .onFailure { ServerState.warn("Failed to read known sources: ${it.message}") }
+            .getOrNull()?.also { knownSourcesCache = it }
+    }
+
+    /**
+     * Server mode: a source that appears later under an already-installed, globally-on plugin
+     * (a new playlist / section) starts switched off globally. Otherwise it is on in every
+     * profile, since no profile has chosen it yet. The admin switches it on when it's wanted.
+     * New plugins are covered by the repo install (disabled by default); on the very first run
+     * every loaded source is only recorded. Returns how many sources were switched off.
+     */
+    fun disableNewSources(): Int {
+        val file = knownSourcesFile ?: return 0
+        if (loadedApis.isEmpty()) return 0
+        val sources = loadedApis.filter { isSourceId(it.internalName) }
+        val known = readKnownSources()
+        // Only the new source itself goes off: never its plugin, never sources that were already
+        // there, and never an id another API also answers to (the disabled set would hit it too)
+        val fresh = if (known == null) emptyList() else sources.filter { src ->
+            src.internalName !in known.sources && src.pluginInternalName in known.plugins &&
+                src.internalName != src.pluginInternalName && !isGloballyDisabled(src) &&
+                loadedApis.none { other ->
+                    other !== src && (other.internalName == src.internalName ||
+                        other.pluginInternalName == src.internalName ||
+                        nameSlug(other.name) == src.internalName || other.name == src.internalName)
+                }
+        }
+        fresh.forEach {
+            disabledPlugins.add(it.internalName)
+            enabledSources.remove(it.internalName)
+        }
+        if (fresh.isNotEmpty()) {
+            saveDisabledPlugins()
+            ServerState.info("New sources switched off globally (enable in admin): " +
+                fresh.joinToString(", ") { "${it.name} [${it.pluginInternalName}]" })
+        }
+        val updated = KnownSources(
+            plugins = (known?.plugins ?: emptySet()) + loadedApis.map { it.pluginInternalName },
+            sources = (known?.sources ?: emptySet()) + sources.map { it.internalName },
+        )
+        if (updated != known) {
+            runCatching { file.writeText(serverJson.encodeToString(updated)) }
+                .onFailure { ServerState.warn("Failed to save known sources: ${it.message}") }
+            knownSourcesCache = updated
+        }
+        return fresh.size
+    }
+
     /** Number of home-page items cached for [api] (any type/section), 0 when none. */
     fun cachedHomeItems(api: MainApiWrapper): Int {
         val key = apiKey(api)
@@ -1117,8 +1176,10 @@ object StremioServer {
         if (installed.isEmpty()) return
         val canonicalNames = installed.map { it.internalName }.toSet()
         val before = disabledPlugins.size
-        // Per-source entries ("<plugin>_<source>") of installed plugins are kept
-        val isKept = { id: String -> id in canonicalNames || canonicalNames.any { id.startsWith(it + "_") } }
+        // Per-source entries ("<plugin>_<source>") of installed plugins are kept, and so are
+        // sources this server has loaded (their ids don't always carry the plugin prefix)
+        val knownSourceIds = readKnownSources()?.sources ?: emptySet()
+        val isKept = { id: String -> id in canonicalNames || id in knownSourceIds || canonicalNames.any { id.startsWith(it + "_") } }
         val stale = disabledPlugins.filter { !isKept(it) }.toSet()
         enabledSources.removeIf { !isKept(it) }
         if (stale.isNotEmpty()) {
