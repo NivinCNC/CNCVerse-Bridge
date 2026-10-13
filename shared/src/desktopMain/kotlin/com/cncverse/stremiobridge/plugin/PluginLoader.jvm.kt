@@ -706,19 +706,8 @@ actual class PluginLoader {
     }
 }
 
-/**
- * api.themoviedb.org has its connections reset about half the time from the server (India:
- * the hostname is filtered on many networks); api.tmdb.org is the same API and answers
- * reliably. Plugins hard-code the former, so their requests are pointed at the latter.
- */
-internal val TMDB_HOST_REWRITE = okhttp3.Interceptor { chain ->
-    val req = chain.request()
-    if (req.url.host.equals("api.themoviedb.org", ignoreCase = true)) {
-        chain.proceed(req.newBuilder().url(req.url.newBuilder().host("api.tmdb.org").build()).build())
-    } else {
-        chain.proceed(req)
-    }
-}
+/** TMDB requests: api.tmdb.org, own client, shared answer cache (see [TmdbGateway]). */
+internal val TMDB_HOST_REWRITE: okhttp3.Interceptor = TmdbGateway
 
 /**
  * One dispatcher for every plugin HTTP client. NiceHttp sends requests asynchronously, and
