@@ -4403,6 +4403,40 @@ input:checked + .slider:before {
   white-space: nowrap;
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+body.save-bar-on .toast { bottom: 68px; }
+.save-bar {
+  position: fixed;
+  bottom: 16px;
+  left: 50%;
+  transform: translateX(-50%) translateY(20px);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: calc(100vw - 32px);
+  background: var(--surface-card);
+  border: 1px solid var(--border-focus);
+  color: var(--text);
+  font-size: 12.5px;
+  font-weight: 700;
+  padding: 9px 16px;
+  border-radius: 999px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  opacity: 0;
+  pointer-events: none;
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+  z-index: 501;
+}
+.save-bar.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.save-bar.saved { color: var(--green); }
+.save-bar.error { color: #f43f5e; border-color: rgba(244, 63, 94, 0.5); }
+.save-spin {
+  width: 13px; height: 13px; flex: none;
+  border: 2px solid var(--border-focus);
+  border-top-color: var(--cyan);
+  border-radius: 50%;
+  animation: save-spin 0.7s linear infinite;
+}
+@keyframes save-spin { to { transform: rotate(360deg); } }
 .empty { grid-column: 1 / -1; text-align: center; padding: 2rem 1rem; color: var(--text-dim); font-size: 12.5px; }
 
 /* Page Footer */
@@ -4939,6 +4973,7 @@ input:checked + .slider:before {
 </aside>
 
 <div class="toast" id="toast"></div>
+<div class="save-bar" id="save-bar" role="status" aria-live="polite"></div>
 
 <script>
 "use strict";
@@ -5183,7 +5218,7 @@ function updateUrls() {
     syncStatusText.textContent = isCustom ? "All changes auto-sync to your addon" : "Default configuration active (auto-sync enabled)";
   }
   if (statModeVal) {
-    statModeVal.innerHTML = isCustom ? "Saved &#10003;" : "Dev Choice";
+    statModeVal.innerHTML = syncCardHtml(isCustom);
   }
 }
 
@@ -5229,11 +5264,7 @@ function toggleEnableCatalogs(enable) {
   updateCatalogStatusUI();
   updateUrls();
 
-  fetch("/api/profile/" + encodeURIComponent(pid) + "/catalogs", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ disableCatalogs: !enable })
-  }).then(function(r){ return r.json(); })
+  profilePost("/catalogs", { disableCatalogs: !enable }).then(function(r){ return r.json(); })
     .then(function(p){
       pData.disableCatalogs = p.disableCatalogs || false;
       updateCatalogStatusUI();
@@ -5363,11 +5394,8 @@ function resetToDevChoice() {
   toast("Reset to Developer's Choice");
 
   // Clear profile overrides on server
-  fetch("/api/profile/" + encodeURIComponent(pid) + "/set", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ disabledExtensions: [], enabledExtensions: [], disabledCatalogs: [], disableCatalogs: false })
-  }).catch(function(){});
+  profilePost("/set", { disabledExtensions: [], enabledExtensions: [], disabledCatalogs: [], disableCatalogs: false })
+    .catch(function(){});
 }
 
 function onRepoFilterChange(val) {
@@ -5448,10 +5476,12 @@ function toggleCard(name) {
 var saveTimer = null;
 function saveProfileDebounced() {
   if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(function(){ saveProfileState(); }, 350);
+  saveTimer = setTimeout(function(){ saveTimer = null; saveProfileState(); renderSaveBar(); }, 350);
+  renderSaveBar();
 }
 
 function saveProfileState() {
+  if (!profileReady()) return;
   updateMetrics();
   renderCards();
   updateUrls();
@@ -5463,11 +5493,7 @@ function saveProfileState() {
     disableCatalogs: pData.disableCatalogs
   };
 
-  fetch("/api/profile/" + encodeURIComponent(pid) + "/set", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  }).then(function(r){
+  profilePost("/set", payload).then(function(r){
       if (r.status === 409) {
         // Over the per-profile limit: show why and go back to what is saved
         return r.json().then(function(err){ toast(err.message || "Extension limit reached"); loadProfile(); return null; });
@@ -6000,9 +6026,7 @@ function previewUserFormatter() {
 function saveUserFormatter() {
   var f = currentUserFormatter();
   var st = document.getElementById("ufmt-status");
-  fetch("/api/profile/" + encodeURIComponent(pid) + "/formatter", {
-    method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(f)
-  })
+  profilePost("/formatter", f)
     .then(function(r) { return r.json().then(function(j) { return { ok: r.ok, body: j }; }); })
     .then(function(res) {
       if (!res.ok) { st.innerHTML = '<span style="color:#f43f5e;">' + esc(res.body.error || "Could not save") + '</span>'; return; }
@@ -6020,10 +6044,119 @@ function applyUserFormatterFromProfile(p) {
   if (ufmtCatalog) renderUserFormatterControls();
 }
 
+// Saves send the whole selection, so nothing may be saved until the real profile is in:
+// a failed/slow load used to leave the page on the server defaults and the next tap
+// overwrote the user's picks with them.
+var profileLoaded = false;
+var profileLoadTries = 0;
+function profileReady() {
+  if (profileLoaded) return true;
+  toast("Still loading your profile — try again in a moment");
+  lastSaveOk = false;
+  lastSaveStatus = -1;
+  renderSaveBar();
+  loadProfile();
+  return false;
+}
+
+/* Save status bar: shows "Saving…" while a change is waiting or in flight, then whether it
+   reached the server, and warns before leaving the page with unsaved changes. */
+var savesInFlight = 0;
+var lastSaveOk = true;
+var lastSaveStatus = 200;
+var saveBarTimer = null;
+
+function savesPending() {
+  return savesInFlight + (saveTimer ? 1 : 0) + (playbackTimer ? 1 : 0);
+}
+
+/** The SYNC stat card follows the real save state instead of always claiming "Saved". */
+function syncCardHtml(isCustom) {
+  if (savesPending() > 0) return "Saving…";
+  if (lastSaveOk === false) return '<span style="color:#f43f5e;">Not saved</span>';
+  return isCustom ? "Saved &#10003;" : "Dev Choice";
+}
+
+function renderSaveBar() {
+  var bar = document.getElementById("save-bar");
+  if (!bar) return;
+  if (saveBarTimer) { clearTimeout(saveBarTimer); saveBarTimer = null; }
+  bar.classList.remove("saved", "error");
+  if (savesPending() > 0) {
+    bar.innerHTML = '<span class="save-spin"></span><span>Saving… keep this page open</span>';
+  } else if (lastSaveOk) {
+    bar.classList.add("saved");
+    bar.textContent = "✓ All changes saved";
+    saveBarTimer = setTimeout(function() {
+      bar.classList.remove("show");
+      document.body.classList.remove("save-bar-on");
+    }, 2500);
+  } else {
+    bar.classList.add("error");
+    bar.textContent = lastSaveStatus === 409
+      ? "⚠ Not saved — 50 extensions is the limit"
+      : lastSaveStatus === -1 ? "⚠ Not saved — your profile is still loading, try again"
+      : "⚠ Not saved — check your connection and change it again";
+  }
+  bar.classList.add("show");
+  document.body.classList.add("save-bar-on");
+  var statModeVal = document.getElementById("stat-mode-val");
+  if (statModeVal) statModeVal.innerHTML = syncCardHtml(isProfileCustomized());
+}
+
+/** POSTs a profile change and tracks it in the save bar; resolves with the Response. */
+function profilePost(path, body) {
+  savesInFlight++;
+  renderSaveBar();
+  return fetch("/api/profile/" + encodeURIComponent(pid) + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+    keepalive: true
+  }).then(function(r) {
+    savesInFlight--;
+    lastSaveOk = r.ok;
+    lastSaveStatus = r.status;
+    renderSaveBar();
+    return r;
+  }, function(e) {
+    savesInFlight--;
+    lastSaveOk = false;
+    lastSaveStatus = 0;
+    renderSaveBar();
+    throw e;
+  });
+}
+
+// Send waiting (debounced) changes right away when the page is being left or hidden —
+// in-app browsers (Nuvio) often close without a beforeunload prompt.
+function flushPendingSaves() {
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; saveProfileState(); }
+  if (playbackTimer) { clearTimeout(playbackTimer); playbackTimer = null; sendPlayback(); }
+}
+document.addEventListener("visibilitychange", function() {
+  if (document.visibilityState === "hidden") flushPendingSaves();
+});
+window.addEventListener("pagehide", flushPendingSaves);
+window.addEventListener("beforeunload", function(e) {
+  flushPendingSaves();
+  if (savesPending() > 0) { e.preventDefault(); e.returnValue = ""; return ""; }
+});
+
 function loadProfile() {
   fetch("/api/profile/" + encodeURIComponent(pid))
     .then(function(r){ if(!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
     .then(function(p){
+      profileLoaded = true;
+      profileLoadTries = 0;
+      if (lastSaveStatus === -1 && savesPending() === 0) {
+        // The "still loading" warning is stale now: the page shows the saved profile
+        lastSaveOk = true;
+        lastSaveStatus = 200;
+        var sb = document.getElementById("save-bar");
+        if (sb) sb.classList.remove("show");
+        document.body.classList.remove("save-bar-on");
+      }
       pData.profileId = pid;
       pData.disabledExtensions = p.disabledExtensions || [];
       pData.enabledExtensions = p.enabledExtensions || [];
@@ -6054,7 +6187,12 @@ function loadProfile() {
       renderCards();
       updateUrls();
     })
-    .catch(function(){});
+    .catch(function(){
+      if (profileLoaded) return;
+      profileLoadTries++;
+      if (profileLoadTries === 2) toast("Couldn't load your profile — retrying…");
+      setTimeout(loadProfile, Math.min(2000 * profileLoadTries, 15000));
+    });
 }
 
 function applyQualityPreferences(p) {
@@ -6107,16 +6245,13 @@ function onQualityChange() {
   var excludeCam = document.getElementById('q-exclude-cam') ? document.getElementById('q-exclude-cam').checked : false;
   var maxStreams = parseInt(document.getElementById('sel-max-streams') ? document.getElementById('sel-max-streams').value : '0', 10);
 
+  if (!profileReady()) return;
   updateQualityBadge();
 
-  fetch("/api/profile/" + encodeURIComponent(pid) + "/quality", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      allowedResolutions: allowed,
-      excludeCam: excludeCam,
-      maxStreamsPerResolution: maxStreams
-    })
+  profilePost("/quality", {
+    allowedResolutions: allowed,
+    excludeCam: excludeCam,
+    maxStreamsPerResolution: maxStreams
   }).then(function(r){ return r.json(); })
     .then(function(p){
       pData.allowedResolutions = p.allowedResolutions || [];
@@ -6169,30 +6304,33 @@ function onPlaybackChange() {
 
 var playbackTimer = null;
 function savePlayback() {
+  if (!profileReady()) return;
   if (playbackTimer) clearTimeout(playbackTimer);
   playbackTimer = setTimeout(function() {
-    fetch("/api/profile/" + encodeURIComponent(pid) + "/playback", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        hideSubtitles: !!pData.hideSubtitles,
-        groupBy: pData.groupBy || "default",
-        sortBy: pData.sortBy || "default",
-        minSizeGb: pData.minSizeGb || 0,
-        maxSizeGb: pData.maxSizeGb || 0,
-        providerOrder: pData.providerOrder || [],
-        showSupport: pData.showSupport !== false,
-        filterNonSeekable: !!pData.filterNonSeekable
-      })
-    }).then(function(r){ return r.json(); })
-      .then(function(p){
-        // The server tidies the values (min cannot exceed max…): show what is saved
-        var el = document.getElementById("pb-min-gb"); if (el) el.value = p.minSizeGb > 0 ? p.minSizeGb : "";
-        el = document.getElementById("pb-max-gb"); if (el) el.value = p.maxSizeGb > 0 ? p.maxSizeGb : "";
-        pData.minSizeGb = p.minSizeGb || 0;
-        pData.maxSizeGb = p.maxSizeGb || 0;
-      }).catch(function(e){ console.error("Playback save error", e); });
+    playbackTimer = null;
+    sendPlayback();
   }, 300);
+  renderSaveBar();
+}
+
+function sendPlayback() {
+  profilePost("/playback", {
+    hideSubtitles: !!pData.hideSubtitles,
+    groupBy: pData.groupBy || "default",
+    sortBy: pData.sortBy || "default",
+    minSizeGb: pData.minSizeGb || 0,
+    maxSizeGb: pData.maxSizeGb || 0,
+    providerOrder: pData.providerOrder || [],
+    showSupport: pData.showSupport !== false,
+    filterNonSeekable: !!pData.filterNonSeekable
+  }).then(function(r){ return r.json(); })
+    .then(function(p){
+      // The server tidies the values (min cannot exceed max…): show what is saved
+      var el = document.getElementById("pb-min-gb"); if (el) el.value = p.minSizeGb > 0 ? p.minSizeGb : "";
+      el = document.getElementById("pb-max-gb"); if (el) el.value = p.maxSizeGb > 0 ? p.maxSizeGb : "";
+      pData.minSizeGb = p.minSizeGb || 0;
+      pData.maxSizeGb = p.maxSizeGb || 0;
+    }).catch(function(e){ console.error("Playback save error", e); });
 }
 
 function activeProviderNames() {
