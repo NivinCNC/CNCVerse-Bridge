@@ -5541,11 +5541,23 @@ function saveProfileDebounced() {
   renderSaveBar();
 }
 
-function saveProfileState() {
+// One selection save at a time: each sends the whole selection, so an older one landing
+// later would undo newer taps. Taps made meanwhile are sent when the running save returns.
+var setInFlight = false;
+var setDirty = false;
+
+function saveProfileState(force) {
   if (!profileReady()) return;
   updateMetrics();
   renderCards();
   updateUrls();
+  if (setInFlight && !force) {
+    setDirty = true;
+    renderSaveBar();
+    return;
+  }
+  setInFlight = true;
+  setDirty = false;
 
   var payload = {
     disabledExtensions: Array.from(pData._d),
@@ -5554,15 +5566,30 @@ function saveProfileState() {
     disableCatalogs: pData.disableCatalogs
   };
 
+  // A newer tap is waiting (queued or still in its debounce): its own save will bring the
+  // server's answer, and applying this older one now would switch those taps back off
+  function newerChangesWaiting() { return setDirty || !!saveTimer; }
+  function finish() {
+    setInFlight = false;
+    if (setDirty) saveProfileState();
+    else renderSaveBar();
+  }
+
   profilePost("/set", payload).then(function(r){
       if (r.status === 409) {
         // Over the per-profile limit: show why and go back to what is saved
-        return r.json().then(function(err){ toast(err.message || "Extension limit reached"); loadProfile(); return null; });
+        return r.json().then(function(err){
+          toast(err.message || "Extension limit reached");
+          if (!newerChangesWaiting()) loadProfile();
+          return null;
+        });
       }
       return r.json();
     })
     .then(function(p){
-      if (!p) return;
+      var stale = newerChangesWaiting();
+      finish();
+      if (!p || stale) return;
       pData.disabledExtensions = p.disabledExtensions || [];
       pData.enabledExtensions = p.enabledExtensions || [];
       pData.disabledCatalogs = p.disabledCatalogs || [];
@@ -5574,7 +5601,10 @@ function saveProfileState() {
       renderCards();
       updateUrls();
     })
-    .catch(function(e){ toast("Sync error: " + e.message); });
+    .catch(function(e){
+      if (setInFlight) finish();
+      toast("Sync error: " + e.message);
+    });
 }
 
 /* Dead extensions: probed directly and via proxy, no links. Users can hide them. */
@@ -6128,7 +6158,7 @@ var lastSaveStatus = 200;
 var saveBarTimer = null;
 
 function savesPending() {
-  return savesInFlight + (saveTimer ? 1 : 0) + (playbackTimer ? 1 : 0);
+  return savesInFlight + (saveTimer ? 1 : 0) + (setDirty ? 1 : 0) + (playbackTimer ? 1 : 0);
 }
 
 /** The SYNC stat card follows the real save state instead of always claiming "Saved". */
@@ -6192,7 +6222,9 @@ function profilePost(path, body) {
 // Send waiting (debounced) changes right away when the page is being left or hidden —
 // in-app browsers (Nuvio) often close without a beforeunload prompt.
 function flushPendingSaves() {
-  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; saveProfileState(); }
+  // The page may not live until the running save returns, so queued taps go out now
+  if (saveTimer) { clearTimeout(saveTimer); saveTimer = null; saveProfileState(true); }
+  else if (setDirty) saveProfileState(true);
   if (playbackTimer) { clearTimeout(playbackTimer); playbackTimer = null; sendPlayback(); }
 }
 document.addEventListener("visibilitychange", function() {
