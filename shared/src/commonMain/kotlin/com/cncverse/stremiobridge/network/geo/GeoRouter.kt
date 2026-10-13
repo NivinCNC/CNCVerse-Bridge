@@ -110,6 +110,8 @@ data class HostRoute(
     val plugins: Set<String> = emptySet(),
     /** A GET the server was refused on, retried by the re-check ("" = the site root). */
     val probeUrl: String = "",
+    /** Learned from timeouts/resets only, never a refusal — possibly just an overloaded moment. */
+    val byTimeout: Boolean = false,
 )
 
 @Serializable
@@ -556,17 +558,23 @@ object GeoRouter {
     fun hasProxyRoutes(): Boolean =
         hostBlocks.isNotEmpty() || pluginProxy.isNotEmpty() || overrides.values.any { it.mode == "always" }
 
-    private fun markBlocked(plugin: String?, host: String, country: String, probeUrl: String? = null) {
+    private fun markBlocked(plugin: String?, host: String, country: String, probeUrl: String? = null, byTimeout: Boolean = false) {
         val now = System.currentTimeMillis()
-        val until = now + settings.blockTtlHours * 3_600_000L
-        val prev = hostBlocks[host]
+        val prev = hostBlocks[host]?.takeIf { it.until > now }
+        // A refusal is proof for the whole block time; timeouts only until the next re-checks
+        val soft = byTimeout && (prev == null || prev.byTimeout)
+        val ttl = settings.blockTtlHours * 3_600_000L
+        val until = now + if (soft) minOf(ttl, TIMEOUT_BLOCK_MS) else ttl
         hostBlocks[host] = HostRoute(
             country, until, (prev?.plugins ?: emptySet()) + setOfNotNull(plugin),
             probeUrl = probeUrl ?: prev?.probeUrl ?: "",
+            byTimeout = soft,
         )
         // Cleared by the re-check and refused again soon after: the re-check's probe isn't
-        // telling the truth for this host, so leave it on the proxy for the rest of the block
-        if ((recheckClearedAt[host] ?: 0L) > now - RECHECK_FLAP_MS) noRecheckUntil[host] = until
+        // telling the truth for this host, so leave it on the proxy for the rest of the block.
+        // Not for timeouts: those say nothing about the probe — HDHub timed out at an overloaded
+        // moment right after a re-check cleared it and then sat behind a slow proxy for 12 h.
+        if (!soft && (recheckClearedAt[host] ?: 0L) > now - RECHECK_FLAP_MS) noRecheckUntil[host] = until
         if (prev == null || prev.until < now) {
             event(plugin, "$host blocks the server IP — routing via $country proxy (all extensions)")
         }
@@ -578,6 +586,8 @@ object GeoRouter {
     private val directStrikes = ConcurrentHashMap<String, Pair<Int, Long>>()
     private const val STRIKES_TO_BLOCK = 3
     private const val STRIKE_WINDOW_MS = 10 * 60_000L
+    /** How long a block learned from timeouts alone lasts (re-checks may clear it sooner). */
+    private const val TIMEOUT_BLOCK_MS = 2 * 3_600_000L
 
     /** Counts a direct connection failure for [host]; true once there have been enough recently. */
     private fun directStrike(host: String): Boolean {
@@ -814,7 +824,9 @@ object GeoRouter {
                 // A refusal (403/45x) proves the block at once. A timeout or reset may just be a
                 // bad moment (server overloaded, WARP hiccup) — that once put MovieBox's API and
                 // Cinemeta behind proxies for 12 h — so it takes a few in a row to mark the host.
-                if (!fromError || directStrike(host)) markBlocked(plugin, host, country, req.url.toString().takeIf { req.method == "GET" })
+                if (!fromError || directStrike(host)) {
+                    markBlocked(plugin, host, country, req.url.toString().takeIf { req.method == "GET" }, byTimeout = fromError)
+                }
                 return viaProxy
             }
             viaProxy?.close()

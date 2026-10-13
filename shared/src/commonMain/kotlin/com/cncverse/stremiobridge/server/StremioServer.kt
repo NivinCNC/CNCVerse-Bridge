@@ -2806,7 +2806,10 @@ object StremioServer {
                                 // Catalog items opened straight from a row (defaultVideoId) carry the
                                 // item URL, not the load() data — e.g. Netflix mirrors need the title
                                 // that only load() adds. Resolve it once and retry.
-                                if (links.isEmpty() && cachedData == null && !api.supportedTypes.all { it == "tv" }) {
+                                // Only a page URL: episode data (HDHub's JSON link list) isn't one.
+                                if (links.isEmpty() && cachedData == null && !api.supportedTypes.all { it == "tv" } &&
+                                    dataUrl.startsWith("http")
+                                ) {
                                     val resolved = loadData(runCatching { api.load(dataUrl) }.getOrNull())
                                     if (resolved != null) {
                                         ServerState.info("[${api.name}] Retrying with load() data")
