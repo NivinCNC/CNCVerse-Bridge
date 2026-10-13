@@ -9,6 +9,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
 import java.io.File
@@ -103,7 +104,13 @@ private data class GeoStateFile(
 
 /** A host that refuses the server IP: proxy country, expiry, and the extensions seen using it. */
 @Serializable
-data class HostRoute(val country: String, val until: Long, val plugins: Set<String> = emptySet())
+data class HostRoute(
+    val country: String,
+    val until: Long,
+    val plugins: Set<String> = emptySet(),
+    /** A GET the server was refused on, retried by the re-check ("" = the site root). */
+    val probeUrl: String = "",
+)
 
 @Serializable
 data class PluginGeoStatus(
@@ -209,10 +216,17 @@ object GeoRouter {
         com.cncverse.stremiobridge.state.StreamTracker.proxiedNow = { routesViaProxy(it) }
         applySettings()
         ProxyPool.start()
+        // First re-check of learned blocks 5 minutes after start, then every RECHECK_INTERVAL_MS
+        lastRecheck = System.currentTimeMillis() - RECHECK_INTERVAL_MS + 5 * 60_000L
         scope.launch {
             while (isActive) {
                 delay(30_000)
                 runCatching { expireLeases() }
+                if (System.currentTimeMillis() - lastRecheck >= RECHECK_INTERVAL_MS) {
+                    lastRecheck = System.currentTimeMillis()
+                    runCatching { recheckBlockedHosts() }
+                        .onFailure { ServerState.warn("[GeoProxy] re-check failed: ${it.message}") }
+                }
                 if (dirty) save()
             }
         }
@@ -300,6 +314,81 @@ object GeoRouter {
         hostBlocks.remove(host)
         noHelp.remove(host)
         markDirty()
+    }
+
+    // ── Re-checking learned blocks ───────────────────────────────────────────
+
+    /**
+     * A learned block holds for [GeoProxySettings.blockTtlHours], but one challenge or refusal at
+     * a bad moment is enough to learn it — HDHub's sites sat behind slow Indian proxies for hours
+     * while they answered the server in under a second. So learned hosts are retried on the normal
+     * route regularly and dropped as soon as they answer it again.
+     */
+    private const val RECHECK_INTERVAL_MS = 30 * 60_000L
+    /** Refused again this soon after the re-check cleared it = the probe was wrong for that host. */
+    private const val RECHECK_FLAP_MS = 2 * 3_600_000L
+    @Volatile private var lastRecheck = 0L
+    private val recheckClearedAt = ConcurrentHashMap<String, Long>()
+    private val noRecheckUntil = ConcurrentHashMap<String, Long>()
+
+    /** The normal route (WARP, then the server's own IP), like the global selector's default. */
+    private val recheckClient: okhttp3.OkHttpClient by lazy {
+        okhttp3.OkHttpClient.Builder()
+            .proxySelector(object : java.net.ProxySelector() {
+                override fun select(uri: java.net.URI?): List<java.net.Proxy> = listOfNotNull(warp) + java.net.Proxy.NO_PROXY
+                override fun connectFailed(uri: java.net.URI?, sa: java.net.SocketAddress?, ioe: IOException?) {}
+            })
+            .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(10, java.util.concurrent.TimeUnit.SECONDS)
+            .callTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+    }
+
+    /**
+     * True when [host] answers the normal route without a refusal or a challenge — on the GET it
+     * was refused on when known (an API can refuse its endpoints while its home page loads).
+     * Only the headers are read.
+     */
+    private fun answersDirectly(host: String, probeUrl: String): Boolean {
+        val url = probeUrl.toHttpUrlOrNull()?.takeIf { it.host == host } ?: "https://$host/".toHttpUrlOrNull() ?: return false
+        val req = Request.Builder().url(url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+            .build()
+        return runCatching {
+            recheckClient.newCall(req).execute().use { r ->
+                // 5xx may be a bad moment of the site itself: not proof either way, keep the route
+                r.code < 500 && !geoBlocked(host, r.code) && r.header("cf-mitigated") == null
+            }
+        }.getOrDefault(false)
+    }
+
+    /** Drops learned blocks whose host answers the normal route again. Returns how many. */
+    fun recheckBlockedHosts(): Int {
+        val now = System.currentTimeMillis()
+        // Domain-rule hosts are proxied on purpose; local addresses are never routed
+        noRecheckUntil.entries.removeIf { it.value <= now }
+        recheckClearedAt.entries.removeIf { it.value <= now - RECHECK_FLAP_MS }
+        val routes = hostBlocks.filterValues { it.until > now }
+            .filterKeys { !isLocalHost(it) && ruleCountry(it) == null && !noRecheckUntil.containsKey(it) }
+        val hosts = routes.keys.toList()
+        if (hosts.isEmpty()) return 0
+        val pool = java.util.concurrent.Executors.newFixedThreadPool(16)
+        val cleared = try {
+            hosts.map { h -> h to pool.submit<Boolean> { answersDirectly(h, routes[h]?.probeUrl.orEmpty()) } }
+                .filter { (_, f) -> runCatching { f.get(30, java.util.concurrent.TimeUnit.SECONDS) }.getOrDefault(false) }
+                .map { it.first }
+        } finally {
+            pool.shutdownNow()
+        }
+        cleared.forEach { h ->
+            val route = hostBlocks.remove(h) ?: return@forEach
+            noHelp.remove(h)
+            recheckClearedAt[h] = now
+            event(route.plugins.singleOrNull(), "$h answers the server again — back to the normal route (was via ${route.country} proxy)")
+        }
+        if (cleared.isNotEmpty()) markDirty()
+        ServerState.info("[GeoProxy] re-checked ${hosts.size} learned blocked host(s): ${cleared.size} answer directly again")
+        return cleared.size
     }
 
     // ── Plugin → country ─────────────────────────────────────────────────────
@@ -467,11 +556,18 @@ object GeoRouter {
     fun hasProxyRoutes(): Boolean =
         hostBlocks.isNotEmpty() || pluginProxy.isNotEmpty() || overrides.values.any { it.mode == "always" }
 
-    private fun markBlocked(plugin: String?, host: String, country: String) {
-        val until = System.currentTimeMillis() + settings.blockTtlHours * 3_600_000L
+    private fun markBlocked(plugin: String?, host: String, country: String, probeUrl: String? = null) {
+        val now = System.currentTimeMillis()
+        val until = now + settings.blockTtlHours * 3_600_000L
         val prev = hostBlocks[host]
-        hostBlocks[host] = HostRoute(country, until, (prev?.plugins ?: emptySet()) + setOfNotNull(plugin))
-        if (prev == null || prev.until < System.currentTimeMillis()) {
+        hostBlocks[host] = HostRoute(
+            country, until, (prev?.plugins ?: emptySet()) + setOfNotNull(plugin),
+            probeUrl = probeUrl ?: prev?.probeUrl ?: "",
+        )
+        // Cleared by the re-check and refused again soon after: the re-check's probe isn't
+        // telling the truth for this host, so leave it on the proxy for the rest of the block
+        if ((recheckClearedAt[host] ?: 0L) > now - RECHECK_FLAP_MS) noRecheckUntil[host] = until
+        if (prev == null || prev.until < now) {
             event(plugin, "$host blocks the server IP — routing via $country proxy (all extensions)")
         }
         counters.getOrPut(plugin ?: ANY) { Counters() }.blocked.incrementAndGet()
@@ -718,7 +814,7 @@ object GeoRouter {
                 // A refusal (403/45x) proves the block at once. A timeout or reset may just be a
                 // bad moment (server overloaded, WARP hiccup) — that once put MovieBox's API and
                 // Cinemeta behind proxies for 12 h — so it takes a few in a row to mark the host.
-                if (!fromError || directStrike(host)) markBlocked(plugin, host, country)
+                if (!fromError || directStrike(host)) markBlocked(plugin, host, country, req.url.toString().takeIf { req.method == "GET" })
                 return viaProxy
             }
             viaProxy?.close()

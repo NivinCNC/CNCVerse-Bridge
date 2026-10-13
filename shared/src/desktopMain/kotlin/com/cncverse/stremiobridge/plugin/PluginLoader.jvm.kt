@@ -734,6 +734,19 @@ internal val PLUGIN_DISPATCHER = okhttp3.Dispatcher().apply {
 }
 
 /**
+ * Threads for extension calls. Plugins block a thread per HTTP request (up to the 35 s read
+ * timeout), and on the shared Dispatchers.IO (64 threads) ~40 such waits filled it: every other
+ * call, detail pages included, queued until the 25 s meta limit and answered 404. An IO view
+ * is elastic — it gets its own threads beyond IO's 64 — so this caps extension work separately.
+ */
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+internal val PLUGIN_IO = Dispatchers.IO.limitedParallelism(256)
+
+/** Detail pages (a user just opened a title) get their own threads: background stream scraping can't starve them. */
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+internal val PLUGIN_LOAD_IO = Dispatchers.IO.limitedParallelism(64)
+
+/**
  * OkHttp EventListener that auto-closes any [Response] body left open when
  * a [Call] finishes (normally or with a failure). Plugins call NiceHttp inside
  * coroutine callbacks and sometimes exit before consuming/closing the body
@@ -894,7 +907,7 @@ private class DirectMainApiWrapper(
         return staticSections
     }
 
-    override suspend fun search(query: String): List<SearchResult> = withContext(Dispatchers.IO + netCtx) {
+    override suspend fun search(query: String): List<SearchResult> = withContext(PLUGIN_IO + netCtx) {
         try {
             val rawResults: List<*>? = try {
                 api.search(query)
@@ -909,7 +922,7 @@ private class DirectMainApiWrapper(
         }
     }
 
-    override suspend fun getMainPage(page: Int, type: String, sectionName: String?): List<SearchResult> = withContext(Dispatchers.IO + netCtx) {
+    override suspend fun getMainPage(page: Int, type: String, sectionName: String?): List<SearchResult> = withContext(PLUGIN_IO + netCtx) {
         try {
             val mainPageDataList = api.mainPage
             val allResults = mutableListOf<SearchResult>()
@@ -966,7 +979,7 @@ private class DirectMainApiWrapper(
         }
     }
 
-    override suspend fun load(url: String): MediaInfo? = withContext(Dispatchers.IO + netCtx) {
+    override suspend fun load(url: String): MediaInfo? = withContext(PLUGIN_LOAD_IO + netCtx) {
         try {
             val resp = api.load(url) ?: return@withContext null
             (resp as Any).reflectToMediaInfo(url)
@@ -976,7 +989,7 @@ private class DirectMainApiWrapper(
         }
     }
 
-    override suspend fun loadLinks(dataUrl: String): List<StremioStream> = withContext(Dispatchers.IO + netCtx) {
+    override suspend fun loadLinks(dataUrl: String): List<StremioStream> = withContext(PLUGIN_IO + netCtx) {
         val streams = mutableListOf<StremioStream>()
         val subtitles = mutableListOf<StremioSubtitle>()
         ServerState.debug("loadLinks called: plugin=${plugin.name} dataUrl=$dataUrl")

@@ -46,6 +46,7 @@ import io.ktor.server.routing.routing
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
 import java.io.File
 import java.net.InetSocketAddress
@@ -734,6 +735,12 @@ object WebAdmin {
                     ?: return@post call.respond(AdminActionResult(false, "Invalid request"))
                 com.cncverse.stremiobridge.network.geo.GeoRouter.clearHost(host)
                 call.respond(AdminActionResult(true, "Forgot $host — it is tried directly again"))
+            }
+
+            post("/geo/recheck") {
+                if (!call.checkAdminAuth()) return@post call.respondUnauthorized()
+                val n = withContext(Dispatchers.IO) { com.cncverse.stremiobridge.network.geo.GeoRouter.recheckBlockedHosts() }
+                call.respond(AdminActionResult(true, "$n learned blocked host(s) answer directly again and were cleared"))
             }
 
             post("/geo/refill") {
