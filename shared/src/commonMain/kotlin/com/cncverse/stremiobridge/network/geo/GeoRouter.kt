@@ -672,6 +672,27 @@ object GeoRouter {
      * two extra steps: the proxy that last worked for the host goes first, and after [country]'s
      * proxies fail, up to three residential proxies from any other country are tried.
      */
+    /**
+     * Which proxy each IP-bound user token went out through. NetMirror's NewTV API (tv.imgcdn.kim)
+     * ties a Usertoken to the IP that used it: its master playlist then serves the real video only
+     * to that IP, and anyone else gets a 10-minute "use the app" placeholder in its place. The token
+     * (first `::` part, which the playlist link's `in=` repeats) is remembered with the proxy that
+     * sent it, so /proxy/bound can fetch that playlist from the same IP.
+     */
+    private val tokenEgress = ConcurrentHashMap<String, Pair<ProxyEndpoint, Long>>()
+    private const val TOKEN_EGRESS_MS = 6 * 60 * 60_000L
+
+    private fun noteEgress(req: Request, ep: ProxyEndpoint) {
+        val token = req.header("Usertoken")?.substringBefore("::")?.takeIf { it.length >= 16 } ?: return
+        val now = System.currentTimeMillis()
+        if (tokenEgress.size > 5_000) tokenEgress.entries.removeIf { it.value.second < now }
+        tokenEgress[token] = ep to now + TOKEN_EGRESS_MS
+    }
+
+    /** The proxy that sent user token [token] (its first `::` part), while it is remembered. */
+    fun egressForToken(token: String): ProxyEndpoint? =
+        tokenEgress[token]?.takeIf { it.second > System.currentTimeMillis() }?.first
+
     fun viaPool(plugin: String?, country: String, req: Request, residentialOnly: Boolean = false): Response? {
         val host = req.url.host
         val anyCountry = anyCountryHost(host)
@@ -704,6 +725,7 @@ object GeoRouter {
                         ProxyPool.reportSuccess(p, System.currentTimeMillis() - started)
                         counters.getOrPut(plugin ?: ANY) { Counters() }.ok.incrementAndGet()
                         markProxied(plugin, host)
+                        noteEgress(req, p.endpoint)
                         if (anyCountry) ProxyPool.rememberGood(host, p)
                         // The site answers from here, so a 403 from the earlier proxy was about its IP
                         // (e.g. Ultrasurf on tv.imgcdn.kim) — skip it for this host for a while
@@ -748,6 +770,7 @@ object GeoRouter {
                     lastBlocked?.close()
                     ProxyPool.reportSuccess(t, System.currentTimeMillis() - started)
                     counters.getOrPut(plugin ?: ANY) { Counters() }.ok.incrementAndGet()
+                    if (sendReq === req) noteEgress(req, t.endpoint)
                     event(plugin, "$host: no proxy got through — used the India tunnel (last resort)")
                     return resp
                 }

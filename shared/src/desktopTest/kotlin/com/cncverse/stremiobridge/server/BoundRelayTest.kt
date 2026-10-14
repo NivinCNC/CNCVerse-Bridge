@@ -46,6 +46,28 @@ class BoundRelayTest {
     }
 
     @Test
+    fun `an IP-bound master relays only its playlists, from the server itself`() {
+        val nf = mapOf("Referer" to "https://net52.cc/")
+        val master = """
+            #EXTM3U
+            #EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",NAME="English",URI="https://subscdn.top/subs/81749852/en.m3u8"
+            #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="aac",NAME="English",URI="https://s00021.freecdn4.top/files/81749852/a/5/5.m3u8"
+            #EXT-X-STREAM-INF:BANDWIDTH=1000000,AUDIO="aac",RESOLUTION=1920x1080
+            https://hd1.freecdn4.top/files/81749852/1080p/1080p.m3u8?in=1.2.3.4::abc::1791988112::ni::t
+        """.trimIndent()
+        val out = BoundRelay.rewritePlaylist(master, "https://tv.imgcdn.kim/newtv/hls/nf/81749852.m3u8?in=x", nf, "t:abc").lines()
+        assertEquals(BoundRelay.relayUrl("https://subscdn.top/subs/81749852/en.m3u8", nf, "d"), Regex("URI=\"([^\"]+)\"").find(out[1])!!.groupValues[1])
+        assertEquals(BoundRelay.relayUrl("https://s00021.freecdn4.top/files/81749852/a/5/5.m3u8", nf, "d"), Regex("URI=\"([^\"]+)\"").find(out[2])!!.groupValues[1])
+        assertEquals(BoundRelay.relayUrl("https://hd1.freecdn4.top/files/81749852/1080p/1080p.m3u8?in=1.2.3.4::abc::1791988112::ni::t", nf, "d"), out[4])
+        // Its segments go straight from the CDN to the player
+        val variant = "#EXTM3U\n#EXTINF:3.6,\n3670_000.jpg"
+        val v = BoundRelay.rewritePlaylist(variant, "https://hd1.freecdn4.top/files/81749852/1080p/1080p.m3u8?in=t", nf, "d").lines()
+        assertEquals("https://hd1.freecdn4.top/files/81749852/1080p/3670_000.jpg", v[2])
+        // The route is part of the signature
+        assertTrue(BoundRelay.relayUrl("https://a/x.m3u8", nf, "d").substringAfter("sig=") != BoundRelay.relayUrl("https://a/x.m3u8", nf).substringAfter("sig="))
+    }
+
+    @Test
     fun `a relay link signed for one url does not open another`() {
         val a = BoundRelay.relayUrl("https://hanerix.com/a.m3u8", ref).substringAfter("sig=")
         val b = BoundRelay.relayUrl("https://evil.example/", ref).substringAfter("sig=")

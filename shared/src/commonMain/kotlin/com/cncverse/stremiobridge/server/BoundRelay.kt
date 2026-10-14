@@ -2,6 +2,7 @@ package com.cncverse.stremiobridge.server
 
 import com.cncverse.stremiobridge.model.StremioStream
 import com.cncverse.stremiobridge.network.geo.GeoRouter
+import com.cncverse.stremiobridge.network.geo.ProxyPool
 import com.cncverse.stremiobridge.state.ServerState
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
@@ -38,6 +39,12 @@ import java.util.concurrent.TimeUnit
  * Direct video files are relayed too when their link says it was signed for WARP's network:
  * MovieLinkBD's fsldownload.com MKVs carry `mg=<expiry>.13335.<sig>` (13335 = Cloudflare's ASN)
  * and answer anyone else with 403 "FILE DELETED!".
+ *
+ * NetMirror's NewTV links (tv.imgcdn.kim `…m3u8?in=<token>::…`) are bound to the IP that got the
+ * token — a residential proxy, since the host refuses datacenter IPs. Only that master playlist
+ * checks the IP: it is fetched through the same proxy (route `t:<token>`), its variant and audio
+ * playlists (which need the Referer, not the IP) from the server itself (route `d`), and the
+ * segments go straight from the CDN to the player.
  */
 object BoundRelay {
     private const val TTL_MS = 6 * 60 * 60_000L
@@ -89,6 +96,16 @@ object BoundRelay {
         return s.externalUrl == null && s.infoHash == null && !isHls(s) && WARP_SIGNED.containsMatchIn(url)
     }
 
+    /** `in=<token>::…` of an IP-bound NewTV link whose token's proxy is known (see GeoRouter.egressForToken). */
+    private val IN_TOKEN = Regex("""[?&]in=([0-9a-f]{16,})::""")
+
+    internal fun ipBoundToken(s: StremioStream): String? {
+        val url = s.url ?: return null
+        if (!isHls(s)) return null
+        val token = IN_TOKEN.find(url)?.groupValues?.get(1) ?: return null
+        return token.takeIf { GeoRouter.egressForToken(it) != null }
+    }
+
     private fun hostOf(url: String): String? = runCatching { java.net.URI(url).host?.lowercase() }.getOrNull()
 
     private fun cached(site: String): Boolean? {
@@ -121,6 +138,16 @@ object BoundRelay {
 
     /** Points links locked to WARP at the relay; everything else is returned unchanged. */
     suspend fun wrap(streams: List<StremioStream>): List<StremioStream> {
+        val tokens = streams.map { ipBoundToken(it) }
+        if (tokens.all { it == null }) return wrapWarp(streams)
+        val rest = wrapWarp(streams.filterIndexed { i, _ -> tokens[i] == null }).iterator()
+        return streams.mapIndexed { i, s ->
+            val token = tokens[i] ?: return@mapIndexed rest.next()
+            s.copy(url = relayUrl(s.url!!, headersOf(s), "t:$token"), behaviorHints = s.behaviorHints?.copy(proxyHeaders = null))
+        }
+    }
+
+    private suspend fun wrapWarp(streams: List<StremioStream>): List<StremioStream> {
         if (GeoRouter.warp == null) return streams // no WARP: links are unlocked from the server's own IP
         val videos = streams.filter { warpSignedVideo(it) && hostOf(it.url!!)?.let { h -> h !in ServerState.ownHosts } == true }
         val candidates = streams.filter { isHls(it) && hostOf(it.url!!)?.let { h -> h !in ServerState.ownHosts } == true }
@@ -152,38 +179,65 @@ object BoundRelay {
 
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
 
-    private fun sign(url: String, headers: Map<String, String>): String {
+    private fun sign(url: String, headers: Map<String, String>, route: String? = null): String {
         val mac = javax.crypto.Mac.getInstance("HmacSHA256")
         mac.init(javax.crypto.spec.SecretKeySpec(key, "HmacSHA256"))
-        val msg = url + "\n" + headers.toSortedMap().entries.joinToString("\n") { "${it.key}:${it.value}" }
+        val msg = url + "\n" + headers.toSortedMap().entries.joinToString("\n") { "${it.key}:${it.value}" } +
+            (route?.let { "\n#route:$it" } ?: "")
         return mac.doFinal(msg.toByteArray()).take(12).joinToString("") { "%02x".format(it) }
     }
 
-    internal fun relayUrl(url: String, headers: Map<String, String>): String =
+    /** [route]: null = through WARP, `d` = from the server itself, `t:<token>` = through the proxy that sent that token. */
+    internal fun relayUrl(url: String, headers: Map<String, String>, route: String? = null): String =
         base() + "/proxy/bound?d=" + enc(url) + headers.entries.joinToString("") { "&h_" + enc(it.key) + "=" + enc(it.value) } +
-            "&sig=" + sign(url, headers)
+            (route?.let { "&r=" + enc(it) } ?: "") + "&sig=" + sign(url, headers, route)
 
     private val URI_ATTR = Regex("URI=\"([^\"]+)\"")
 
-    internal fun rewritePlaylist(text: String, finalUrl: String, headers: Map<String, String>): String {
+    private val M3U8_PATH = Regex("""[.]m3u8([?#]|$)""", RegexOption.IGNORE_CASE)
+
+    /**
+     * WARP route (null): every entry goes back through the relay. Other routes: only the IP-bound
+     * link's playlists need the relay (from the server itself — they check the Referer, not the IP);
+     * segments, keys and subtitles become absolute links the player fetches straight from the CDN.
+     */
+    internal fun rewritePlaylist(text: String, finalUrl: String, headers: Map<String, String>, route: String? = null): String {
         val baseUri = java.net.URI(finalUrl)
         fun abs(u: String) = runCatching { baseUri.resolve(u.trim()).toString() }.getOrDefault(u)
+        fun entry(u: String): String {
+            val a = abs(u)
+            return when {
+                route == null -> relayUrl(a, headers)
+                M3U8_PATH.containsMatchIn(a) -> relayUrl(a, headers, "d")
+                else -> a
+            }
+        }
         return text.lines().joinToString("\n") { line ->
             val t = line.trim()
             when {
                 t.isEmpty() -> line
-                t.startsWith("#") -> URI_ATTR.replace(line) { m -> "URI=\"" + relayUrl(abs(m.groupValues[1]), headers) + "\"" }
-                else -> relayUrl(abs(t), headers)
+                t.startsWith("#") -> URI_ATTR.replace(line) { m -> "URI=\"" + entry(m.groupValues[1]) + "\"" }
+                else -> entry(t)
             }
         }
+    }
+
+    private val directRelayClient by lazy {
+        clientVia(java.net.Proxy.NO_PROXY).newBuilder().readTimeout(15, TimeUnit.SECONDS).callTimeout(20, TimeUnit.SECONDS).build()
     }
 
     suspend fun handle(call: ApplicationCall) {
         val q = call.request.queryParameters
         val url = q["d"] ?: return call.respondText("Missing d", status = HttpStatusCode.BadRequest)
         val headers = q.names().filter { it.startsWith("h_") }.associate { it.removePrefix("h_") to (q[it] ?: "") }
-        if (q["sig"] != sign(url, headers)) return call.respondText("Forbidden", status = HttpStatusCode.Forbidden)
-        val client = warp() ?: return call.respondText("Relay unavailable", status = HttpStatusCode.ServiceUnavailable)
+        val route = q["r"]
+        if (q["sig"] != sign(url, headers, route)) return call.respondText("Forbidden", status = HttpStatusCode.Forbidden)
+        val client = when {
+            route == null -> warp()
+            route == "d" -> directRelayClient
+            route.startsWith("t:") -> GeoRouter.egressForToken(route.removePrefix("t:"))?.let { ProxyPool.clientFor(it) }
+            else -> null
+        } ?: return call.respondText("Relay unavailable", status = HttpStatusCode.ServiceUnavailable)
 
         val head = call.request.httpMethod == io.ktor.http.HttpMethod.Head
         val b = okhttp3.Request.Builder().url(url).header("User-Agent", UA)
@@ -218,7 +272,7 @@ object BoundRelay {
                 val bytes = withContext(Dispatchers.IO) { body.bytes() }
                 val text = bytes.toString(Charsets.UTF_8)
                 if (text.trimStart().startsWith("#EXTM3U")) {
-                    call.respondText(rewritePlaylist(text, r.request.url.toString(), headers),
+                    call.respondText(rewritePlaylist(text, r.request.url.toString(), headers, route),
                         ContentType.parse("application/vnd.apple.mpegurl"), HttpStatusCode.fromValue(r.code))
                 } else {
                     val ct = runCatching { ContentType.parse(type) }.getOrDefault(ContentType.Application.OctetStream)
