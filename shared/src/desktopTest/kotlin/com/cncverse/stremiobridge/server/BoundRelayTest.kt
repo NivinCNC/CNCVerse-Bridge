@@ -34,6 +34,18 @@ class BoundRelayTest {
     }
 
     @Test
+    fun `video files signed for WARP's network are relayed, others are not`() {
+        fun s(url: String) = com.cncverse.stremiobridge.model.StremioStream(url = url)
+        assertTrue(BoundRelay.warpSignedVideo(s("https://fsldownload.com/p/KUBQ5v.TFwe?mg=1791999293.13335.f-G0JwShPUvrsYaMrpVeqQ")))
+        assertTrue(BoundRelay.warpSignedVideo(s("https://cdn.example/v.mkv?x=1&asn=13335&t=2")))
+        // Unlocked from the server's own network (Oracle, AS31898): plays anywhere it plays at all
+        assertTrue(!BoundRelay.warpSignedVideo(s("https://fsldownload.com/p/KUBQ5v?mg=1791999293.31898.NoO5RJTPy23rcwR0DZdvBg")))
+        assertTrue(!BoundRelay.warpSignedVideo(s("https://cdn.example/v.mkv?id=13335")))
+        // Playlists go through the playlist check instead
+        assertTrue(!BoundRelay.warpSignedVideo(s("https://cdn.example/master.m3u8?asn=13335")))
+    }
+
+    @Test
     fun `a relay link signed for one url does not open another`() {
         val a = BoundRelay.relayUrl("https://hanerix.com/a.m3u8", ref).substringAfter("sig=")
         val b = BoundRelay.relayUrl("https://evil.example/", ref).substringAfter("sig=")

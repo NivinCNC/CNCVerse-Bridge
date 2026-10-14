@@ -7,7 +7,9 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.application.ApplicationCall
 import io.ktor.server.request.header
+import io.ktor.server.request.httpMethod
 import io.ktor.server.response.header
+import io.ktor.server.response.respond
 import io.ktor.server.response.respondBytes
 import io.ktor.server.response.respondOutputStream
 import io.ktor.server.response.respondText
@@ -32,6 +34,10 @@ import java.util.concurrent.TimeUnit
  * Such sites are found by asking for the playlist twice (directly and through WARP); when only WARP
  * gets it, the site's links are played through /proxy/bound, which fetches the playlist and every
  * segment through WARP. Relay links are signed, so this never becomes an open proxy.
+ *
+ * Direct video files are relayed too when their link says it was signed for WARP's network:
+ * MovieLinkBD's fsldownload.com MKVs carry `mg=<expiry>.13335.<sig>` (13335 = Cloudflare's ASN)
+ * and answer anyone else with 403 "FILE DELETED!".
  */
 object BoundRelay {
     private const val TTL_MS = 6 * 60 * 60_000L
@@ -75,6 +81,14 @@ object BoundRelay {
         return type == "M3U8" || (type == null && PLAYLIST_HINT.containsMatchIn(url))
     }
 
+    /** A link signed for Cloudflare's network (AS13335), i.e. unlocked through WARP. */
+    private val WARP_SIGNED = Regex("""[?&](asn=13335|mg=\d+\.13335\.)""")
+
+    internal fun warpSignedVideo(s: StremioStream): Boolean {
+        val url = s.url ?: return false
+        return s.externalUrl == null && s.infoHash == null && !isHls(s) && WARP_SIGNED.containsMatchIn(url)
+    }
+
     private fun hostOf(url: String): String? = runCatching { java.net.URI(url).host?.lowercase() }.getOrNull()
 
     private fun cached(site: String): Boolean? {
@@ -108,8 +122,9 @@ object BoundRelay {
     /** Points links locked to WARP at the relay; everything else is returned unchanged. */
     suspend fun wrap(streams: List<StremioStream>): List<StremioStream> {
         if (GeoRouter.warp == null) return streams // no WARP: links are unlocked from the server's own IP
+        val videos = streams.filter { warpSignedVideo(it) && hostOf(it.url!!)?.let { h -> h !in ServerState.ownHosts } == true }
         val candidates = streams.filter { isHls(it) && hostOf(it.url!!)?.let { h -> h !in ServerState.ownHosts } == true }
-        if (candidates.isEmpty()) return streams
+        if (candidates.isEmpty() && videos.isEmpty()) return streams
         // `asn=13335` = signed for Cloudflare's network, i.e. unlocked through WARP: no need to ask
         candidates.filter { "asn=13335" in it.url!! }.forEach { verdicts[siteOf(hostOf(it.url!!)!!)] = true to System.currentTimeMillis() }
         val toProbe = candidates.filter { cached(siteOf(hostOf(it.url!!)!!)) == null }.distinctBy { siteOf(hostOf(it.url!!)!!) }
@@ -123,7 +138,8 @@ object BoundRelay {
             }
         }
         return streams.map { s ->
-            if (s !in candidates || cached(siteOf(hostOf(s.url!!)!!)) != true) s
+            if (s in videos) s.copy(url = relayUrl(s.url!!, headersOf(s)), behaviorHints = s.behaviorHints?.copy(proxyHeaders = null))
+            else if (s !in candidates || cached(siteOf(hostOf(s.url!!)!!)) != true) s
             else s.copy(url = relayUrl(s.url!!, headersOf(s)), behaviorHints = s.behaviorHints?.copy(proxyHeaders = null))
         }
     }
@@ -169,15 +185,29 @@ object BoundRelay {
         if (q["sig"] != sign(url, headers)) return call.respondText("Forbidden", status = HttpStatusCode.Forbidden)
         val client = warp() ?: return call.respondText("Relay unavailable", status = HttpStatusCode.ServiceUnavailable)
 
+        val head = call.request.httpMethod == io.ktor.http.HttpMethod.Head
         val b = okhttp3.Request.Builder().url(url).header("User-Agent", UA)
         headers.forEach { (k, v) -> runCatching { b.header(k, v) } }
         call.request.header("Range")?.let { b.header("Range", it) }
+        // A player's HEAD (size / type check) must not start a multi-GB download through WARP
+        if (head) b.head()
         val resp = try {
             withContext(Dispatchers.IO) { client.newCall(b.build()).execute() }
         } catch (e: Exception) {
             return call.respondText("Upstream unavailable", status = HttpStatusCode.BadGateway)
         }
         resp.use { r ->
+            if (head) {
+                r.header("Content-Range")?.let { call.response.header("Content-Range", it) }
+                r.header("Accept-Ranges")?.let { call.response.header("Accept-Ranges", it) }
+                val len = r.header("Content-Length")?.toLongOrNull()
+                val ct = r.header("Content-Type")?.let { runCatching { ContentType.parse(it) }.getOrNull() }
+                return call.respond(object : io.ktor.http.content.OutgoingContent.NoContent() {
+                    override val status = HttpStatusCode.fromValue(r.code)
+                    override val contentType = ct
+                    override val contentLength = len
+                })
+            }
             val body = r.body ?: return call.respondText("", status = HttpStatusCode.fromValue(r.code))
             val type = r.header("Content-Type").orEmpty()
             val path = r.request.url.encodedPath
@@ -203,7 +233,8 @@ object BoundRelay {
                 val bytes = withContext(Dispatchers.IO) { body.bytes() }
                 call.respondBytes(bytes, ct, HttpStatusCode.fromValue(r.code))
             } else {
-                call.respondOutputStream(ct, HttpStatusCode.fromValue(r.code)) {
+                // The length lets players seek in a relayed MKV/MP4 (Range requests)
+                call.respondOutputStream(ct, HttpStatusCode.fromValue(r.code), body.contentLength().takeIf { it >= 0 }) {
                     body.byteStream().use { it.copyTo(this) }
                 }
             }
