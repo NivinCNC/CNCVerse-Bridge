@@ -46,7 +46,7 @@ class BoundRelayTest {
     }
 
     @Test
-    fun `an IP-bound master relays only its playlists, from the server itself`() {
+    fun `an IP-bound master relays only its playlists, from the server first`() {
         val nf = mapOf("Referer" to "https://net52.cc/")
         val master = """
             #EXTM3U
@@ -56,9 +56,9 @@ class BoundRelayTest {
             https://hd1.freecdn4.top/files/81749852/1080p/1080p.m3u8?in=1.2.3.4::abc::1791988112::ni::t
         """.trimIndent()
         val out = BoundRelay.rewritePlaylist(master, "https://tv.imgcdn.kim/newtv/hls/nf/81749852.m3u8?in=x", nf, "t:abc").lines()
-        assertEquals(BoundRelay.relayUrl("https://subscdn.top/subs/81749852/en.m3u8", nf, "d"), Regex("URI=\"([^\"]+)\"").find(out[1])!!.groupValues[1])
-        assertEquals(BoundRelay.relayUrl("https://s00021.freecdn4.top/files/81749852/a/5/5.m3u8", nf, "d"), Regex("URI=\"([^\"]+)\"").find(out[2])!!.groupValues[1])
-        assertEquals(BoundRelay.relayUrl("https://hd1.freecdn4.top/files/81749852/1080p/1080p.m3u8?in=1.2.3.4::abc::1791988112::ni::t", nf, "d"), out[4])
+        assertEquals(BoundRelay.relayUrl("https://subscdn.top/subs/81749852/en.m3u8", nf, "d:abc"), Regex("URI=\"([^\"]+)\"").find(out[1])!!.groupValues[1])
+        assertEquals(BoundRelay.relayUrl("https://s00021.freecdn4.top/files/81749852/a/5/5.m3u8", nf, "d:abc"), Regex("URI=\"([^\"]+)\"").find(out[2])!!.groupValues[1])
+        assertEquals(BoundRelay.relayUrl("https://hd1.freecdn4.top/files/81749852/1080p/1080p.m3u8?in=1.2.3.4::abc::1791988112::ni::t", nf, "d:abc"), out[4])
         // Its segments go straight from the CDN to the player
         val variant = "#EXTM3U\n#EXTINF:3.6,\n3670_000.jpg"
         val v = BoundRelay.rewritePlaylist(variant, "https://hd1.freecdn4.top/files/81749852/1080p/1080p.m3u8?in=t", nf, "d").lines()

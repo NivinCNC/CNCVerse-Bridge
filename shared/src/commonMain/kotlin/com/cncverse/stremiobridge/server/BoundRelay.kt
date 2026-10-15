@@ -43,8 +43,9 @@ import java.util.concurrent.TimeUnit
  * NetMirror's NewTV links (tv.imgcdn.kim `…m3u8?in=<token>::…`) are bound to the IP that got the
  * token — a residential proxy, since the host refuses datacenter IPs. Only that master playlist
  * checks the IP: it is fetched through the same proxy (route `t:<token>`), its variant and audio
- * playlists (which need the Referer, not the IP) from the server itself (route `d`), and the
- * segments go straight from the CDN to the player.
+ * playlists from the server itself, with the Referer (route `d:<token>`: through the token's proxy
+ * again when the CDN refuses, as nm-cdn6 does), and the segments go straight from the CDN to the
+ * player.
  */
 object BoundRelay {
     private const val TTL_MS = 6 * 60 * 60_000L
@@ -187,7 +188,10 @@ object BoundRelay {
         return mac.doFinal(msg.toByteArray()).take(12).joinToString("") { "%02x".format(it) }
     }
 
-    /** [route]: null = through WARP, `d` = from the server itself, `t:<token>` = through the proxy that sent that token. */
+    /**
+     * [route]: null = through WARP, `d` = from the server itself, `t:<token>` = through the proxy that
+     * sent that token, `d:<token>` = from the server itself, then that proxy if the answer is no playlist.
+     */
     internal fun relayUrl(url: String, headers: Map<String, String>, route: String? = null): String =
         base() + "/proxy/bound?d=" + enc(url) + headers.entries.joinToString("") { "&h_" + enc(it.key) + "=" + enc(it.value) } +
             (route?.let { "&r=" + enc(it) } ?: "") + "&sig=" + sign(url, headers, route)
@@ -198,17 +202,23 @@ object BoundRelay {
 
     /**
      * WARP route (null): every entry goes back through the relay. Other routes: only the IP-bound
-     * link's playlists need the relay (from the server itself — they check the Referer, not the IP);
-     * segments, keys and subtitles become absolute links the player fetches straight from the CDN.
+     * link's playlists need the relay — from the server itself (they need the Referer), falling back
+     * to the token's proxy where the CDN checks the IP too (`d:<token>`); segments, keys and
+     * subtitles become absolute links the player fetches straight from the CDN.
      */
     internal fun rewritePlaylist(text: String, finalUrl: String, headers: Map<String, String>, route: String? = null): String {
         val baseUri = java.net.URI(finalUrl)
         fun abs(u: String) = runCatching { baseUri.resolve(u.trim()).toString() }.getOrDefault(u)
+        val childRoute = when {
+            route == null -> null
+            route.startsWith("t:") -> "d:" + route.removePrefix("t:")
+            else -> route
+        }
         fun entry(u: String): String {
             val a = abs(u)
             return when {
                 route == null -> relayUrl(a, headers)
-                M3U8_PATH.containsMatchIn(a) -> relayUrl(a, headers, "d")
+                M3U8_PATH.containsMatchIn(a) -> relayUrl(a, headers, childRoute)
                 else -> a
             }
         }
@@ -234,10 +244,12 @@ object BoundRelay {
         if (q["sig"] != sign(url, headers, route)) return call.respondText("Forbidden", status = HttpStatusCode.Forbidden)
         val client = when {
             route == null -> warp()
-            route == "d" -> directRelayClient
+            route == "d" || route.startsWith("d:") -> directRelayClient
             route.startsWith("t:") -> GeoRouter.egressForToken(route.removePrefix("t:"))?.let { ProxyPool.clientFor(it) }
             else -> null
         } ?: return call.respondText("Relay unavailable", status = HttpStatusCode.ServiceUnavailable)
+        // `d:<token>`: some CDNs (nm-cdn6) check the IP on variant playlists too — refused from here, retry from the token's IP
+        val fallback = route?.takeIf { it.startsWith("d:") }?.let { GeoRouter.egressForToken(it.removePrefix("d:")) }
 
         val head = call.request.httpMethod == io.ktor.http.HttpMethod.Head
         val b = okhttp3.Request.Builder().url(url).header("User-Agent", UA)
@@ -245,8 +257,14 @@ object BoundRelay {
         call.request.header("Range")?.let { b.header("Range", it) }
         // A player's HEAD (size / type check) must not start a multi-GB download through WARP
         if (head) b.head()
+        val upstream = b.build()
         val resp = try {
-            withContext(Dispatchers.IO) { client.newCall(b.build()).execute() }
+            withContext(Dispatchers.IO) {
+                val first = client.newCall(upstream).execute()
+                if (fallback == null || head) return@withContext first
+                val isPlaylist = first.isSuccessful && runCatching { first.peekBody(64).string() }.getOrDefault("").trimStart().startsWith("#EXTM3U")
+                if (isPlaylist) first else { first.close(); ProxyPool.clientFor(fallback).newCall(upstream).execute() }
+            }
         } catch (e: Exception) {
             return call.respondText("Upstream unavailable", status = HttpStatusCode.BadGateway)
         }
