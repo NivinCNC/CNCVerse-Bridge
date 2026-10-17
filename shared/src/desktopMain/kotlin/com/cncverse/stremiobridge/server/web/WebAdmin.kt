@@ -310,7 +310,8 @@ object WebAdmin {
                             ServerState.warn("Install failed: plugin '$internalName' not found in any repo")
                             return@launch
                         }
-                    BridgeRuntime.installPlugin(ap)
+                    // A new extension starts off globally, like "Install all": users opt in from their profile
+                    BridgeRuntime.installPlugin(ap, disableIfNew = true)
                 }
                 // Return immediately; UI polls for updates
                 call.respond(AdminActionResult(true, "Installing…"))

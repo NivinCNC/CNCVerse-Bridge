@@ -132,14 +132,37 @@ object BridgeRuntime {
         }.onFailure { ServerState.warn("Geo proxy registration failed: ${it.message}") }
     }
 
-    /** Install a plugin and hot-reload it into the running server. */
-    suspend fun installPlugin(ap: AvailablePlugin): Boolean = pluginMutationMutex.withLock {
+    /**
+     * Install a plugin and hot-reload it into the running server.
+     *
+     * @param disableIfNew a plugin that was not installed before starts switched off globally, as
+     *   with "Install all": otherwise it is on in every profile at once. Users opt in from their
+     *   profile, the admin switches it on for everyone. Updates keep their state either way.
+     */
+    suspend fun installPlugin(ap: AvailablePlugin, disableIfNew: Boolean = false): Boolean = pluginMutationMutex.withLock {
+        val isNew = RepoState.installedPlugins.value.none { it.internalName == ap.plugin.internalName }
         val success = PluginInstaller.installPlugin(ap, cacheDir)
         if (success) {
-            ServerState.info("Loading installed plugin '${ap.plugin.name}'…")
+            val disable = disableIfNew && isNew
+            if (disable) StremioServer.setPluginDisabled(ap.plugin.internalName, disabled = true)
+            ServerState.info("Loading installed plugin '${ap.plugin.name}'…" +
+                if (disable) " (disabled by default — enable per profile or via admin)" else "")
             forceReloadPlugins()
+            if (disable) {
+                disableLoadedPlugins(setOf(ap.plugin.internalName))
+                StremioServer.cleanupDisabledPlugins()
+            }
         }
         return success
+    }
+
+    /** Switches the given plugins off at plugin level, under every id their loaded APIs answer to. */
+    private fun disableLoadedPlugins(names: Set<String>) {
+        // Plugin level only: per-source entries would override the plugin switch
+        // (enabling the plugin later must turn its sources on)
+        StremioServer.loadedApis.filter { it.pluginInternalName in names || it.internalName in names }.forEach { api ->
+            StremioServer.setPluginDisabled(api.pluginInternalName, disabled = true)
+        }
     }
 
     /** Full plugin reload that waits for any install/uninstall in progress (nightly maintenance). */
@@ -246,14 +269,9 @@ object BridgeRuntime {
             ServerState.info("Loading $ok new extension(s)…")
             forceReloadPlugins()
             if (disableNewPluginsByDefault) {
-                val newlyInstalledNames = RepoState.installedPlugins.value
+                disableLoadedPlugins(RepoState.installedPlugins.value
                     .filter { it.repoUrl == repoUrl && it.internalName !in before }
-                    .map { it.internalName }.toSet()
-                // Plugin level only: per-source entries would override the plugin switch
-                // (enabling the plugin later must turn its sources on)
-                StremioServer.loadedApis.filter { it.pluginInternalName in newlyInstalledNames || it.internalName in newlyInstalledNames }.forEach { api ->
-                    StremioServer.setPluginDisabled(api.pluginInternalName, disabled = true)
-                }
+                    .map { it.internalName }.toSet())
             }
             // Normalize the disabled set to remove any alias duplicates just created
             StremioServer.cleanupDisabledPlugins()
