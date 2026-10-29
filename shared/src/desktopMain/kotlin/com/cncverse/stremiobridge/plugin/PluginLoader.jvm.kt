@@ -168,6 +168,7 @@ actual class PluginLoader {
                 .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
                 .addInterceptor(TMDB_HOST_REWRITE)
                 .dispatcher(PLUGIN_DISPATCHER)
+                .pingInterval(PLUGIN_PING_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
                 .eventListenerFactory(LeakSafeEventListener.FACTORY)
                 .build()
             okClientField.set(currentNiceClient, newOk)
@@ -205,6 +206,7 @@ actual class PluginLoader {
                             .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
                             .addInterceptor(TMDB_HOST_REWRITE)
                             .dispatcher(PLUGIN_DISPATCHER)
+                            .pingInterval(PLUGIN_PING_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
                             .eventListenerFactory(LeakSafeEventListener.FACTORY)
                             .build()
                         runCatching { baseClientField.set(target, patched) }
@@ -250,6 +252,7 @@ actual class PluginLoader {
                         .addInterceptor(cfKiller)
                         .addInterceptor(TMDB_HOST_REWRITE)
                         .dispatcher(PLUGIN_DISPATCHER)
+                        .pingInterval(PLUGIN_PING_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
                         .eventListenerFactory(LeakSafeEventListener.FACTORY)
                         .build()
                     okField.set(requests, patched)
@@ -724,6 +727,30 @@ internal val PLUGIN_DISPATCHER = okhttp3.Dispatcher().apply {
 }
 
 /**
+ * HTTP/2 keepalive ping for extension clients. A site's connection can die silently (NAT
+ * drop): OkHttp kept sending every new request down it and waited for headers that never came.
+ * The 25 s detail-page limit cancels those calls before the 35 s read timeout, and a cancel
+ * doesn't mark the connection bad — so 4khdhub.one stayed stuck for 10+ min while curl answered
+ * in 0.3 s. An unanswered ping fails the connection and the next request opens a fresh one.
+ */
+internal const val PLUGIN_PING_SECONDS = 10L
+
+/**
+ * Threads for extension calls. Plugins block a thread per HTTP request (up to the 35 s read
+ * timeout) and parse pages on it. On the shared Dispatchers.IO (64) they filled every thread
+ * alongside the relay, so a detail page queued until the 25 s meta limit and
+ * answered 404. An IO view gets its own threads beyond IO's 64, so extension work now has its
+ * own cap, kept below the old 64: 256 let so much parsing run at once that a 2-core machine went from
+ * load ~30 to ~50 and everything slowed down.
+ */
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+internal val PLUGIN_IO = Dispatchers.IO.limitedParallelism(48)
+
+/** Detail pages (a user just opened a title) get reserved threads: background stream scraping can't starve them. */
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+internal val PLUGIN_LOAD_IO = Dispatchers.IO.limitedParallelism(12)
+
+/**
  * OkHttp EventListener that auto-closes any [Response] body left open when
  * a [Call] finishes (normally or with a failure). Plugins call NiceHttp inside
  * coroutine callbacks and sometimes exit before consuming/closing the body
@@ -883,7 +910,7 @@ private class DirectMainApiWrapper(
         return staticSections
     }
 
-    override suspend fun search(query: String): List<SearchResult> = withContext(Dispatchers.IO + netCtx) {
+    override suspend fun search(query: String): List<SearchResult> = withContext(PLUGIN_IO + netCtx) {
         try {
             val rawResults: List<*>? = try {
                 api.search(query)
@@ -898,7 +925,7 @@ private class DirectMainApiWrapper(
         }
     }
 
-    override suspend fun getMainPage(page: Int, type: String, sectionName: String?): List<SearchResult> = withContext(Dispatchers.IO + netCtx) {
+    override suspend fun getMainPage(page: Int, type: String, sectionName: String?): List<SearchResult> = withContext(PLUGIN_IO + netCtx) {
         try {
             val mainPageDataList = api.mainPage
             val allResults = mutableListOf<SearchResult>()
@@ -955,7 +982,7 @@ private class DirectMainApiWrapper(
         }
     }
 
-    override suspend fun load(url: String): MediaInfo? = withContext(Dispatchers.IO + netCtx) {
+    override suspend fun load(url: String): MediaInfo? = withContext(PLUGIN_LOAD_IO + netCtx) {
         try {
             val resp = api.load(url) ?: return@withContext null
             (resp as Any).reflectToMediaInfo(url)
@@ -965,7 +992,7 @@ private class DirectMainApiWrapper(
         }
     }
 
-    override suspend fun loadLinks(dataUrl: String): List<StremioStream> = withContext(Dispatchers.IO + netCtx) {
+    override suspend fun loadLinks(dataUrl: String): List<StremioStream> = withContext(PLUGIN_IO + netCtx) {
         val streams = mutableListOf<StremioStream>()
         val subtitles = mutableListOf<StremioSubtitle>()
         ServerState.debug("loadLinks called: plugin=${plugin.name} dataUrl=$dataUrl")
