@@ -2,10 +2,10 @@ package com.cncverse.stremiobridge.server
 
 import com.cncverse.stremiobridge.model.StremioStream
 import com.cncverse.stremiobridge.state.ServerState
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
@@ -24,14 +24,30 @@ import java.util.concurrent.TimeUnit
  */
 object SeekProbe {
     private const val HOST_TTL_MS = 6 * 60 * 60_000L
-    private const val BUDGET_MS = 3_500L
+    internal var budgetMs = 3_500L // tests shorten it
 
     /** host -> (seekable, checkedAt) */
     private val verdicts = ConcurrentHashMap<String, Pair<Boolean, Long>>()
-    private val probeLimit = Semaphore(16)
+
+    /**
+     * Hosts whose links only redirect to a download page on another site (HubCloud "10Gbps":
+     * gpdl2.rohitkiskk.workers.dev/?id=… -> cryptonewz.online/dl.php): host -> seenAt. Every
+     * link of such a host is hidden without asking again.
+     */
+    private val pageHosts = ConcurrentHashMap<String, Long>()
+    private val probeLimit = Semaphore(32)
+
+    /**
+     * Checks outlive the request that started them: one still running when the budget ends
+     * finishes here and its verdict is kept, so the next request already knows the link.
+     * Before, a title with ~40 name-less links (each judged on its own) never got past the
+     * first ~20 in 3.5 s, and the ones after - the "10Gbps" pages - were kept every time.
+     */
+    private val probeScope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.IO)
+    private val inFlight = ConcurrentHashMap<String, kotlinx.coroutines.Deferred<Unit>>()
 
     /** Tests only: forget every host verdict. */
-    internal fun resetForTest() = verdicts.clear()
+    internal fun resetForTest() { verdicts.clear(); pageHosts.clear() }
 
     private val client by lazy {
         okhttp3.OkHttpClient.Builder()
@@ -111,8 +127,12 @@ object SeekProbe {
                         "mpegurl" in type || "dash+xml" in type -> true
                         r.code !in 200..299 -> null // 403/404/5xx: says nothing about seeking
                         // A web page is not a file at all (download pages such as gamerxyt dl.php,
-                        // which can even answer 206 with one byte of HTML)
-                        type.startsWith("text/html") -> false
+                        // which can even answer 206 with one byte of HTML). Sent there from another
+                        // host: that host only hands out such pages
+                        type.startsWith("text/html") -> {
+                            hostOf(s.url!!)?.takeIf { it != finalHost }?.let { pageHosts[it] = System.currentTimeMillis() }
+                            false
+                        }
                         // An archive (cinecloud /vz/… links serve whole-season .zip packs)
                         ARCHIVE_TYPES.any { "application/$it" in type } -> false
                         // Google Drive downloads ignore ranges
@@ -125,25 +145,47 @@ object SeekProbe {
         }
     }
 
+    private fun hostOf(url: String): String? = runCatching { java.net.URI(url).host?.lowercase() }.getOrNull()
+
+    private fun isPageHost(s: StremioStream): Boolean {
+        val host = hostOf(s.url ?: return false) ?: return false
+        val at = pageHosts[host] ?: return false
+        if (System.currentTimeMillis() - at > HOST_TTL_MS) { pageHosts.remove(host); return false }
+        return true
+    }
+
+    /**
+     * HubCloud "Instant Download": throwaway workers.dev hosts that often refuse a seek with 403
+     * after the first bytes (some answer every range, some none), so they are hidden by name.
+     */
+    private val INSTANT_DOWNLOAD = Regex("instant\\s*(download|dl)\\b", RegexOption.IGNORE_CASE)
+
+    fun isInstantDownload(s: StremioStream): Boolean =
+        listOfNotNull(s.info?.linkName, s.name, s.title).any { INSTANT_DOWNLOAD.containsMatchIn(it) }
+
     /** [streams] without the direct files that cannot seek or are not playable (pages, archives). */
-    suspend fun dropNonSeekable(streams: List<StremioStream>): List<StremioStream> {
+    suspend fun dropNonSeekable(all: List<StremioStream>): List<StremioStream> {
+        val streams = all.filterNot { isInstantDownload(it) }
         if (verdicts.size > 20_000) { val now = System.currentTimeMillis(); verdicts.entries.removeIf { now - it.value.second > HOST_TTL_MS } }
-        val hostOf = streams.associateWith { s -> verdictKey(s) }
+        val keyOf = streams.associateWith { s -> verdictKey(s) }
         // One probe per unknown key (host, or the link itself), all at once, within a small time budget
-        val toProbe = hostOf.entries.filter { (_, h) -> h != null && cached(h) == null }
+        val toProbe = keyOf.entries.filter { (s, k) -> k != null && cached(k) == null && !isPageHost(s) }
             .distinctBy { it.value }.map { it.key to it.value!! }
         if (toProbe.isNotEmpty()) {
-            withTimeoutOrNull(BUDGET_MS) {
-                coroutineScope {
-                    toProbe.map { (s, host) ->
-                        async { probe(s)?.let { verdicts[host] = it to System.currentTimeMillis() } }
-                    }.awaitAll()
+            val jobs = toProbe.map { (s, key) ->
+                val job = probeScope.async(start = CoroutineStart.LAZY) {
+                    probe(s)?.let { verdicts[key] = it to System.currentTimeMillis() }; Unit
+                }
+                inFlight.putIfAbsent(key, job) ?: job.also {
+                    it.invokeOnCompletion { inFlight.remove(key, job) }
+                    it.start()
                 }
             }
+            withTimeoutOrNull(budgetMs) { jobs.awaitAll() }
         }
         return streams.filter { s ->
-            val host = hostOf[s] ?: return@filter true
-            cached(host) != false
+            val key = keyOf[s] ?: return@filter true
+            cached(key) != false && !isPageHost(s)
         }
     }
 }

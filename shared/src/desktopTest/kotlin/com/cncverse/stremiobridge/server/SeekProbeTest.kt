@@ -50,12 +50,24 @@ class SeekProbeTest {
             ex.responseHeaders.add("Content-Type", "video/x-matroska")
             ex.sendResponseHeaders(206, 1); ex.responseBody.use { it.write(0x1a) }
         }
+        // HubCloud "10Gbps": a name-less link that only redirects to another site's download page
+        server.createContext("/gpdl") { ex ->
+            ex.responseHeaders.add("Location", "http://localhost:$port/dl.php?link=x")
+            ex.sendResponseHeaders(302, -1); ex.close()
+        }
+        // A host slower than the check's time budget
+        server.createContext("/slow") { ex ->
+            Thread.sleep(1_200)
+            ex.responseHeaders.add("Content-Type", "text/html")
+            ex.sendResponseHeaders(206, 1); ex.responseBody.use { it.write('B'.code) }
+        }
+        server.executor = java.util.concurrent.Executors.newCachedThreadPool()
         server.start()
         port = server.address.port
     }
 
     @AfterTest
-    fun stop() = server.stop(0)
+    fun stop() { server.stop(0); SeekProbe.budgetMs = 3_500L }
 
     private fun file(url: String, type: String? = "VIDEO") = StremioStream(name = url, url = url, info = StreamInfo(linkType = type))
 
@@ -105,5 +117,39 @@ class SeekProbeTest {
         val zip = file("http://127.0.0.1:$port/vz/abc?k=1")
         val mkv = file("http://127.0.0.1:$port/vz/mkv?k=2")
         assertEquals(listOf(mkv), SeekProbe.dropNonSeekable(listOf(zip, mkv)))
+    }
+
+    @Test
+    fun `a host that redirects to download pages loses all its links`() = runBlocking {
+        SeekProbe.resetForTest()
+        val first = file("http://127.0.0.1:$port/gpdl?id=1")
+        assertEquals(emptyList(), SeekProbe.dropNonSeekable(listOf(first)))
+        // Another link of that host is hidden without asking (this one would take 1.2 s)
+        val second = file("http://127.0.0.1:$port/slow?id=2")
+        SeekProbe.budgetMs = 300
+        val started = System.currentTimeMillis()
+        assertEquals(emptyList(), SeekProbe.dropNonSeekable(listOf(second)))
+        assertTrue(System.currentTimeMillis() - started < 250)
+    }
+
+    @Test
+    fun `instant download links are hidden by name`() = runBlocking {
+        SeekProbe.resetForTest()
+        val instant = StremioStream(name = "4K", url = "http://127.0.0.1:$port/seekable.mkv",
+            title = "Source: FourKHDHub • HubCloud [Instant Download]", info = StreamInfo(linkType = "VIDEO"))
+        val dl = instant.copy(title = null, info = StreamInfo(linkType = "VIDEO", linkName = "HubCloud [Instant DL]"))
+        val fsl = instant.copy(title = "Source: Movies4u • HubCloud [FSLv2]")
+        assertEquals(listOf(fsl), SeekProbe.dropNonSeekable(listOf(instant, dl, fsl)))
+    }
+
+    @Test
+    fun `a check slower than the budget still counts for the next request`() = runBlocking {
+        SeekProbe.resetForTest()
+        SeekProbe.budgetMs = 300
+        val page = file("http://localhost:$port/slow?id=3")
+        // Undecided in time: kept this once
+        assertEquals(listOf(page), SeekProbe.dropNonSeekable(listOf(page)))
+        Thread.sleep(1_500)
+        assertEquals(emptyList(), SeekProbe.dropNonSeekable(listOf(page)))
     }
 }
