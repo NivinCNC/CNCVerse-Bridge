@@ -2085,13 +2085,24 @@ object StremioServer {
         }
     }
 
-    /** Lower-cases and strips punctuation/extra spaces so "Spider-Man: No Way Home" == "spider man no way home". */
-    private fun normalizeTitle(s: String): String = s.lowercase()
+    /**
+     * Lower-cases and strips punctuation/extra spaces so "Spider-Man: No Way Home" == "spider man no
+     * way home". German umlauts are spelled out (ä → ae, ß → ss) and other accents dropped: TMDB
+     * says "Mädchen für alles", a site "Maedchen fuer alles"; "Pokémon" is "Pokemon".
+     */
+    private fun normalizeTitle(s: String): String =
+        java.text.Normalizer.normalize(
+            java.text.Normalizer.normalize(s, java.text.Normalizer.Form.NFC).lowercase()
+                .replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss"),
+            java.text.Normalizer.Form.NFD,
+        )
+        .replace(COMBINING_MARKS, "")
         .replace("&", " and ")
         .replace(TITLE_PUNCT, " ")
         .replace(MULTI_SPACE, " ")
         .trim()
 
+    private val COMBINING_MARKS = Regex("\\p{Mn}+")
     private val IMDB_ID = Regex("tt[0-9]+")
     private val TITLE_PUNCT = Regex("[^\\p{L}\\p{N}]+")
     private val MULTI_SPACE = Regex("\\s+")
@@ -2133,14 +2144,14 @@ object StremioServer {
     /**
      * The result that is episode [episode] of season [season] of one of [names]: sites like
      * FilmPalast list every episode as its own entry ("VisionQuest S01E02"), with no episode list
-     * inside. Also "<name> staffel 1 folge 2" / "… episode 2".
+     * inside. Also "<name> staffel 1 folge 2" / "… episode 2" / "<name> 1x02".
      */
     internal fun episodeEntryMatch(results: List<SearchResult>, names: List<String>, season: Int, episode: Int): SearchResult? {
         for (name in names) {
             val wanted = normalizeTitle(name)
             if (wanted.isEmpty()) continue
             val rx = Regex("^" + Regex.escape(wanted) +
-                " (?:s0*$season ?e0*$episode|(?:season|staffel) 0*$season (?:episode|folge|e) 0*$episode)( |$)")
+                " (?:s0*$season ?e0*$episode|0*${season}x0*$episode|(?:season|staffel) 0*$season (?:episode|folge|e) 0*$episode)( |$)")
             results.firstOrNull { rx.containsMatchIn(normalizeTitle(it.name)) }?.let { return it }
         }
         return null

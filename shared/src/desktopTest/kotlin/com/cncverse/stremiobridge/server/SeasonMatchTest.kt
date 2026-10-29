@@ -50,5 +50,21 @@ class SeasonMatchTest {
         assertNull(s.episodeEntryMatch(listOf(r("Other Show S01E01")), listOf("Show"), 1, 1))
         assertEquals("Haus des Geldes Staffel 2 Folge 3",
             s.episodeEntryMatch(listOf(r("Haus des Geldes Staffel 2 Folge 3")), listOf("Haus des Geldes"), 2, 3)?.name)
+        assertEquals("Dark 2x03", s.episodeEntryMatch(listOf(r("Dark 2x13"), r("Dark 2x03")), listOf("Dark"), 2, 3)?.name)
+    }
+
+    @Test
+    fun umlautsAndAccentsMatchEitherSpelling() {
+        val s = StremioServer
+        // TMDB writes the umlauts, the site spells them out (or the other way round)
+        assertEquals("Tuerkisch fuer Anfaenger Staffel 2",
+            s.seasonMatch(listOf(r("Tuerkisch fuer Anfaenger Staffel 2")), listOf("Türkisch für Anfänger"), 2)?.name)
+        assertEquals("Türkisch für Anfänger – Staffel 2 Folge 3",
+            s.episodeEntryMatch(listOf(r("Türkisch für Anfänger – Staffel 2 Folge 3")), listOf("Tuerkisch fuer Anfaenger"), 2, 3)?.name)
+        assertEquals("Die grosse Ueberraschung S01E01",
+            s.episodeEntryMatch(listOf(r("Die grosse Ueberraschung S01E01")), listOf("Die große Überraschung!"), 1, 1)?.name)
+        // Decomposed umlauts (a + combining diaeresis) and other accents
+        assertEquals("Ma\u0308dchen Staffel 1", s.seasonMatch(listOf(r("Ma\u0308dchen Staffel 1")), listOf("Maedchen"), 1)?.name)
+        assertEquals("Pokemon Season 2", s.seasonMatch(listOf(r("Pokemon Season 2")), listOf("Pokémon"), 2)?.name)
     }
 }
