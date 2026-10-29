@@ -27,4 +27,28 @@ class SeasonMatchTest {
         assertNull(s.seasonMatch(listOf(r("Show Season 10")), listOf("Show"), 1))
         assertNull(s.seasonMatch(listOf(r("Show Season 3 Part 2")), listOf("Show"), 3))
     }
+
+    @Test
+    fun germanSeasonNames() {
+        val s = StremioServer
+        val megakino = listOf("Tulsa King - 4 Staffel", "Tulsa King Staffel 3", "Tulsa King 2. Staffel").map { r(it) }
+        assertEquals("Tulsa King - 4 Staffel", s.seasonMatch(megakino, listOf("Tulsa King"), 4)?.name)
+        assertEquals("Tulsa King Staffel 3", s.seasonMatch(megakino, listOf("Tulsa King"), 3)?.name)
+        assertEquals("Tulsa King 2. Staffel", s.seasonMatch(megakino, listOf("Tulsa King"), 2)?.name)
+    }
+
+    @Test
+    fun picksTheEpisodeEntry() {
+        val s = StremioServer
+        // What FilmPalast lists for "VisionQuest": one entry per episode, newest first
+        val filmpalast = listOf("VisionQuest S01E04", "VisionQuest S01E03", "VisionQuest S01E02", "VisionQuest S01E01").map { r(it) }
+        assertEquals("VisionQuest S01E02", s.episodeEntryMatch(filmpalast, listOf("VisionQuest"), 1, 2)?.name)
+        assertNull(s.episodeEntryMatch(filmpalast, listOf("VisionQuest"), 1, 5))
+        assertNull(s.episodeEntryMatch(filmpalast, listOf("VisionQuest"), 2, 1))
+        // S1E1 is never taken for S1E10, nor another show's episode
+        assertNull(s.episodeEntryMatch(listOf(r("Show S01E10")), listOf("Show"), 1, 1))
+        assertNull(s.episodeEntryMatch(listOf(r("Other Show S01E01")), listOf("Show"), 1, 1))
+        assertEquals("Haus des Geldes Staffel 2 Folge 3",
+            s.episodeEntryMatch(listOf(r("Haus des Geldes Staffel 2 Folge 3")), listOf("Haus des Geldes"), 2, 3)?.name)
+    }
 }

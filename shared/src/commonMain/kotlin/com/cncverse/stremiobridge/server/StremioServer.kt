@@ -2119,6 +2119,88 @@ object StremioServer {
             ?: partial.firstOrNull { it.year == null }
     }
 
+    /** A search result that is the show itself, one of its seasons, or a single episode. */
+    private enum class MatchKind { SHOW, SEASON, EPISODE }
+    private class Match(val result: SearchResult, val kind: MatchKind)
+
+    /**
+     * The result that is episode [episode] of season [season] of one of [names]: sites like
+     * FilmPalast list every episode as its own entry ("VisionQuest S01E02"), with no episode list
+     * inside. Also "<name> staffel 1 folge 2" / "… episode 2".
+     */
+    internal fun episodeEntryMatch(results: List<SearchResult>, names: List<String>, season: Int, episode: Int): SearchResult? {
+        for (name in names) {
+            val wanted = normalizeTitle(name)
+            if (wanted.isEmpty()) continue
+            val rx = Regex("^" + Regex.escape(wanted) +
+                " (?:s0*$season ?e0*$episode|(?:season|staffel) 0*$season (?:episode|folge|e) 0*$episode)( |$)")
+            results.firstOrNull { rx.containsMatchIn(normalizeTitle(it.name)) }?.let { return it }
+        }
+        return null
+    }
+
+    /** The extension's language when it isn't English ("de" for a German site), else null. */
+    private fun nonEnglishLanguage(api: MainApiWrapper): String? =
+        (api.apiLang ?: api.pluginLanguage)?.trim()?.lowercase()?.substringBefore('-')
+            ?.takeIf { it.length == 2 && it != "en" }
+
+    private val localTitleCache = ConcurrentHashMap<String, kotlinx.coroutines.Deferred<String?>>()
+
+    /**
+     * TMDB's title of an IMDb / TMDB item in [lang]: German sites list "Money Heist" as "Haus des
+     * Geldes", which neither the main title nor the English-speaking regions' titles match. TMDB
+     * answers with the original name when it has no translation, so that is no extra title.
+     */
+    private suspend fun localizedTitle(type: String, id: String, lang: String): String? {
+        val ext = ExternalIds.parse(id) ?: return null
+        if (ext.scheme != "imdb" && ext.scheme != "tmdb") return null
+        val mediaType = if (type == "series") "tv" else "movie"
+        val key = "$mediaType:${ext.key}:$lang"
+        if (localTitleCache.size > 5_000) localTitleCache.clear()
+        val job = localTitleCache.computeIfAbsent(key) {
+            streamSearchScope.async {
+                runCatching {
+                    val tmdbId = tmdbIdOf(mediaType, ext.key) ?: return@runCatching null
+                    val j = fetchTmdbJson("$mediaType/$tmdbId?language=$lang") ?: return@runCatching null
+                    (j["name"] ?: j["title"])?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+                }.getOrNull()
+            }
+        }
+        val title = withTimeoutOrNull(6_000) { job.await() }
+        // A failed lookup (TMDB down) is asked again next time instead of being kept as "none"
+        if (title == null && job.isCompleted) localTitleCache.remove(key, job)
+        return title
+    }
+
+    /** The episode entry, season entry or show among [results] for one of [names]. */
+    private fun matchIn(results: List<SearchResult>, names: List<String>, year: Int?, season: Int?, episode: Int?): Match? {
+        if (season != null && episode != null) episodeEntryMatch(results, names, season, episode)?.let { return Match(it, MatchKind.EPISODE) }
+        if (season != null && season > 1) seasonMatch(results, names, season)?.let { return Match(it, MatchKind.SEASON) }
+        return names.firstNotNullOfOrNull { pickBestMatch(results, it, year) }?.let { Match(it, MatchKind.SHOW) }
+    }
+
+    /**
+     * For an extension in another language than English: the item's title in that language (TMDB),
+     * matched on the results of the main search, then searched itself.
+     */
+    private suspend fun matchByLocalizedTitle(
+        api: MainApiWrapper, type: String, id: String, title: String, results: List<SearchResult>,
+        year: Int?, season: Int?, episode: Int?,
+    ): Match? {
+        val lang = nonEnglishLanguage(api) ?: return null
+        val local = localizedTitle(type, id, lang)?.takeIf { normalizeTitle(it) != normalizeTitle(title) } ?: return null
+        matchIn(results, listOf(local), year, season, episode)?.let { return it }
+        val more = try {
+            SearchLoadCache.getSearch(api.internalName, local)
+                ?: api.search(local).also { SearchLoadCache.putSearch(api.internalName, local, it) }
+        } catch (e: Throwable) {
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            return null
+        }
+        return matchIn(more, listOf(local), year, season, episode)
+            ?.also { ServerState.debug("[${api.name}] Matched by its language's title '$local'") }
+    }
+
     /**
      * The title Cinemeta/TMDB give is the US one ("Harry Potter and the Sorcerer's Stone"); Indian
      * and UK sites (Netflix/Hotstar mirrors) list the same film as "…Philosopher's Stone", which
@@ -2165,7 +2247,8 @@ object StremioServer {
         for (name in names) {
             val wanted = normalizeTitle(name)
             if (wanted.isEmpty()) continue
-            val rx = Regex("^" + Regex.escape(wanted) + " (?:season 0*$season|s0*$season|$ord season|0*$season)$partRx( |$)")
+            // German sites: "… Staffel 3" ("… 3. Staffel" is the bare number)
+            val rx = Regex("^" + Regex.escape(wanted) + " (?:season 0*$season|staffel 0*$season|s0*$season|$ord season|0*$season)$partRx( |$)")
             val hits = results.filter { r ->
                 val n = normalizeTitle(r.name)
                 // "… Season 3 Part 2" numbers its episodes from 1 again: never taken for the season itself
@@ -2228,14 +2311,18 @@ object StremioServer {
         return titles ?: emptyList()
     }
 
+    /** The TMDB id of an IMDb ("tt…") key ([mediaType] "tv" or "movie"); a TMDB key as is. */
+    private suspend fun tmdbIdOf(mediaType: String, key: String): String? {
+        if (!key.startsWith("tt")) return key
+        val found = fetchTmdbJson("find/$key?external_source=imdb_id") ?: return null
+        val r = ((found[if (mediaType == "tv") "tv_results" else "movie_results"] as? kotlinx.serialization.json.JsonArray)
+            ?.firstOrNull())?.jsonObject ?: return null
+        return r["id"]?.jsonPrimitive?.contentOrNull
+    }
+
     /** TMDB name, regional titles and Latin-script original title of an IMDb ("tt…") or TMDB id. */
     private suspend fun fetchAlternativeTitles(mediaType: String, key: String): List<String> {
-        val tmdbId = if (key.startsWith("tt")) {
-            val found = fetchTmdbJson("find/$key?external_source=imdb_id") ?: return emptyList()
-            val r = ((found[if (mediaType == "tv") "tv_results" else "movie_results"] as? kotlinx.serialization.json.JsonArray)
-                ?.firstOrNull())?.jsonObject ?: return emptyList()
-            r["id"]?.jsonPrimitive?.contentOrNull ?: return emptyList()
-        } else key
+        val tmdbId = tmdbIdOf(mediaType, key) ?: return emptyList()
         // One call: the item (its TMDB name — Cinemeta's can differ) with its alternative titles
         val j = fetchTmdbJson("$mediaType/$tmdbId?append_to_response=alternative_titles") ?: return emptyList()
         fun str(k: String) = j[k]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
@@ -2327,22 +2414,29 @@ object StremioServer {
         ServerState.debug("[${api.name}] Found ${searchResults.size} results")
 
         // From the parsed id: "tvdb:431162:3:1" / "kitsu:…" have the season elsewhere than tt ids
-        val requestedSeason = if (type == "series") ExternalIds.parse(id)?.season else null
+        val requested = if (type == "series") ExternalIds.parse(id) else null
+        val requestedSeason = requested?.season
+        val requestedEpisode = requested?.episode
 
         // Sites often list each season separately ("The Boys Season 2", "Kusuriya no Hitorigoto
         // 3rd Season"), which strict title+year matching rejects; such an entry numbers its
         // episodes from 1. Season 1 is usually the plain title, so only later seasons look here.
-        var seasonEntry: SearchResult? = null
-        if (requestedSeason != null && requestedSeason > 1) {
-            seasonEntry = seasonMatch(searchResults, listOf(title), requestedSeason)
-                ?: seasonMatch(searchResults, alternativeTitles(type, id), requestedSeason)
-        }
-        val bestMatch = (seasonEntry ?: pickBestMatch(searchResults, title, year))
-            ?: matchByAlternativeTitle(api, type, id, title, searchResults, year) ?: run {
-            ServerState.debug("[${api.name}] No result matches '$title'" + (year?.let { " ($it)" } ?: ""))
-            StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "No result matches '$title'")
-            return emptyList()
-        }
+        // Some list every episode on its own ("VisionQuest S01E02"): that entry is the episode.
+        val match = matchIn(searchResults, listOf(title), year, requestedSeason, requestedEpisode)
+            ?.takeIf { it.kind != MatchKind.SHOW }
+            ?: requestedSeason?.takeIf { it > 1 }
+                ?.let { seasonMatch(searchResults, alternativeTitles(type, id), it) }?.let { Match(it, MatchKind.SEASON) }
+            ?: pickBestMatch(searchResults, title, year)?.let { Match(it, MatchKind.SHOW) }
+            ?: matchByAlternativeTitle(api, type, id, title, searchResults, year)?.let { Match(it, MatchKind.SHOW) }
+            // A German / French / … site lists the item under its title in that language
+            ?: matchByLocalizedTitle(api, type, id, title, searchResults, year, requestedSeason, requestedEpisode)
+            ?: run {
+                ServerState.debug("[${api.name}] No result matches '$title'" + (year?.let { " ($it)" } ?: ""))
+                StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "No result matches '$title'")
+                return emptyList()
+            }
+        val bestMatch = match.result
+        val seasonEntry = bestMatch.takeIf { match.kind == MatchKind.SEASON }
 
         ServerState.debug("[${api.name}] Best match: '${bestMatch.name}' (url: ${bestMatch.url})")
         val cachedLoad = SearchLoadCache.getLoad(cacheKey, bestMatch.url)
@@ -2367,7 +2461,14 @@ object StremioServer {
         }
 
         var dataUrlToLoad = mediaInfo.dataUrl
-        if (type == "series" && id.contains(":")) {
+        if (match.kind == MatchKind.EPISODE) {
+            ServerState.debug("[${api.name}] '${bestMatch.name}' is the episode itself")
+            // Should the entry still carry an episode list, the requested one (or its only one)
+            mediaInfo.episodes?.takeIf { it.isNotEmpty() }?.let { eps ->
+                (eps.find { (it.season ?: 1) == requestedSeason && it.episode == requestedEpisode } ?: eps.singleOrNull())
+                    ?.let { dataUrlToLoad = it.dataUrl }
+            }
+        } else if (type == "series" && id.contains(":")) {
             val parsed  = ExternalIds.parse(id)
             val season  = parsed?.season
             val episode = parsed?.episode
