@@ -1922,7 +1922,9 @@ object StremioServer {
             .map { it.internalName }.sorted().joinToString(",").hashCode()
         val aggCacheKey = "stream:generic:$type:$id:$activeSig"
 
-        return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetchResult(aggCacheKey, null) {
+        var fetchedHere = false
+        val aggList = com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetchResult(aggCacheKey, null) {
+            fetchedHere = true
             try {
                 val resolved = resolveExternal(type, ext)
                 if (resolved == null) {
@@ -2013,7 +2015,44 @@ object StremioServer {
                 com.cncverse.stremiobridge.cache.StreamCacheManager.FetchResult(emptyList())
             }
         }
+        return if (fetchedHere) aggList else withFreshLocalLinks(aggList, type, id)
     }
+
+    private val LOOPBACK_URL = Regex("^https?://(127\\.0\\.0\\.1|localhost|\\[::1\\])[:/]", RegexOption.IGNORE_CASE)
+
+    /** Extensions whose links point at their own local server (ReAnime, GoTaku…), as last seen. */
+    private val localLinkProviders: MutableSet<String> = ConcurrentHashMap.newKeySet()
+
+    /**
+     * A cached stream list never holds local-server links: ReAnime keeps only its last 20 streams,
+     * GoTaku its last 10, so on a busy server a stored link was dead within minutes (404). When the
+     * list comes from the cache, those extensions hand out fresh links now — their search and
+     * episode lookup are cached, so only the link step runs — and the links are merged in.
+     */
+    private suspend fun withFreshLocalLinks(list: List<StremioStream>, type: String, id: String): List<StremioStream> {
+        if (list.any { LOOPBACK_URL.containsMatchIn(it.url.orEmpty()) }) return list // already fresh
+        val apis = loadedApis.filter { api ->
+            api.internalName in localLinkProviders && !isGloballyDisabled(api) && api.supportedTypes.any { it != "tv" }
+        }
+        if (apis.isEmpty()) return list
+        val (title, year) = ExternalIds.parse(id)?.let { resolveExternal(type, it) } ?: return list
+        val fresh = withTimeoutOrNull(LOCAL_LINK_TIMEOUT_MS) {
+            coroutineScope {
+                apis.map { api ->
+                    async {
+                        try { doBuildGenericStreamsForApi(api, type, id, title, year) }
+                        catch (e: kotlinx.coroutines.CancellationException) { throw e }
+                        catch (e: Throwable) { emptyList() }
+                    }
+                }.awaitAll().flatten()
+            }
+        }.orEmpty()
+        // Only their local links: anything else they gave is already in the cached list
+        val local = fresh.filter { LOOPBACK_URL.containsMatchIn(it.url.orEmpty()) }
+        return if (local.isEmpty()) list else sortStreamsByQuality(list + local)
+    }
+
+    private const val LOCAL_LINK_TIMEOUT_MS = 12_000L
 
     // ── Generic per-provider stream fetch (shared by buildStreams + buildStreamsForApi) ─
 
@@ -2028,7 +2067,9 @@ object StremioServer {
         title: String,
         year: Int?
     ): List<StremioStream> {
-        if (id.startsWith("probe_")) {
+        // Probes, and extensions whose links live on their own local server (a stored link is
+        // soon dead), always fetch; search and episode lookups are still cached inside
+        if (id.startsWith("probe_") || api.internalName in localLinkProviders) {
             return doBuildGenericStreamsForApi(api, type, id, title, year)
         }
         val providerCacheKey = "stream:provider:${api.internalName}:$type:$id"
@@ -2103,20 +2144,82 @@ object StremioServer {
             ?.also { ServerState.debug("[${api.name}] Matched by alternative title '$alt'") }
     }
 
-    /** Regions whose titles the Indian / English sites use; other languages' titles never match them. */
-    private val ALT_TITLE_REGIONS = listOf("IN", "GB", "US", "AU", "CA", "IE", "NZ") // India / UK first
+    /**
+     * Regions whose titles the Indian / English sites use; other languages' titles never match them.
+     * JP last: anime sites often list a show by its romaji name ("Tougen Anki"); only Latin-script
+     * titles are ever kept.
+     */
+    private val LATER_PART = Regex("^ ?(?:part|cour) 0*[2-9]( |$)")
+
+    /**
+     * The result that is season [season] of one of [names]: "<name> season 3", "<name> s3",
+     * "<name> 3rd season", "<name> 3" — at the start, so "Season 1" never matches "Season 10" and
+     * spin-offs ("The Boys Presents …") never do. An entry that is just that season wins over a
+     * "… Season 3 Part 2".
+     */
+    internal fun seasonMatch(results: List<SearchResult>, names: List<String>, season: Int, part: Int? = null): SearchResult? {
+        val ord = season.toString() + when {
+            season % 100 in 11..13 -> "th"; season % 10 == 1 -> "st"; season % 10 == 2 -> "nd"; season % 10 == 3 -> "rd"; else -> "th"
+        }
+        val partRx = if (part == null) "" else " (?:part|cour) 0*$part"
+        for (name in names) {
+            val wanted = normalizeTitle(name)
+            if (wanted.isEmpty()) continue
+            val rx = Regex("^" + Regex.escape(wanted) + " (?:season 0*$season|s0*$season|$ord season|0*$season)$partRx( |$)")
+            val hits = results.filter { r ->
+                val n = normalizeTitle(r.name)
+                // "… Season 3 Part 2" numbers its episodes from 1 again: never taken for the season itself
+                rx.containsMatchIn(n) && (part != null || !LATER_PART.containsMatchIn(n.substring(rx.find(n)!!.range.last + 1)))
+            }
+            (hits.firstOrNull { rx.matchEntire(normalizeTitle(it.name)) != null } ?: hits.firstOrNull())?.let { return it }
+        }
+        return null
+    }
+
+    /**
+     * Episode [episode] of season [season] past the end of that season's entry: sites split a long
+     * season into "… Season 3" and "… Season 3 Part 2", the second numbering from 1 again.
+     */
+    private suspend fun seasonPartTwoEpisode(
+        api: MainApiWrapper, results: List<SearchResult>, title: String, type: String, id: String,
+        season: Int, episode: Int, partOne: MediaInfo,
+    ): MediaInfoEpisode? {
+        val partOneCount = partOne.episodes?.mapNotNull { it.episode }?.maxOrNull() ?: return null
+        if (episode <= partOneCount) return null
+        val names = listOf(title) + alternativeTitles(type, id)
+        val two = seasonMatch(results, names, season, part = 2) ?: return null
+        val info = SearchLoadCache.getLoad(api.internalName, two.url)?.info
+            ?: runCatching { api.load(two.url) }.getOrNull()?.also { SearchLoadCache.putLoad(api.internalName, two.url, it) }
+            ?: return null
+        return info.episodes?.find { (it.season ?: 1) == 1 && it.episode == episode - partOneCount }
+    }
+
+    private val ALT_TITLE_REGIONS = listOf("IN", "GB", "US", "AU", "CA", "IE", "NZ", "JP") // India / UK first
     private val altTitleCache = ConcurrentHashMap<String, kotlinx.coroutines.Deferred<List<String>>>()
 
-    /** TMDB's other titles for an IMDb/TMDB item (one lookup per item, shared by every source). */
+    /** ID-mapping source names (arm.haglund.dev) of the anime id schemes. */
+    private val ANIME_ID_SOURCES = mapOf("kitsu" to "kitsu", "mal" to "myanimelist", "anilist" to "anilist", "anidb" to "anidb")
+
+    private fun isLatin(s: String) = s.all { it.code < 0x250 || !it.isLetter() }
+
+    /**
+     * Other titles of an item (one lookup per item, shared by every source). IMDb/TMDB: TMDB's
+     * name and regional titles. Anime ids (Kitsu, MAL, AniList, AniDB): the anime database's own
+     * titles plus the TMDB titles of the same show — Kitsu calls "Tougen Anki" "Tougen Anki:
+     * Legend of the Cursed Blood" and has only a romaji name for "The Exiled Heavy Knight…", so
+     * its title matched no source.
+     */
     private suspend fun alternativeTitles(type: String, id: String): List<String> {
         val ext = ExternalIds.parse(id) ?: return emptyList()
-        if (ext.scheme != "imdb" && ext.scheme != "tmdb") return emptyList()
-        val key = "$type:${ext.key}"
+        if (ext.scheme != "imdb" && ext.scheme != "tmdb" && ext.scheme !in ANIME_ID_SOURCES) return emptyList()
+        val key = "$type:${ext.scheme}:${ext.key}"
         if (altTitleCache.size > 5_000) altTitleCache.clear()
         val job = altTitleCache.computeIfAbsent(key) {
             streamSearchScope.async {
-                runCatching { fetchAlternativeTitles(if (type == "series") "tv" else "movie", ext.key) }
-                    .getOrDefault(emptyList())
+                runCatching {
+                    if (ext.scheme in ANIME_ID_SOURCES) fetchAnimeTitles(type, ext.scheme, ext.key)
+                    else fetchAlternativeTitles(if (type == "series") "tv" else "movie", ext.key)
+                }.getOrDefault(emptyList())
             }
         }
         val titles = withTimeoutOrNull(6_000) { job.await() }
@@ -2125,24 +2228,81 @@ object StremioServer {
         return titles ?: emptyList()
     }
 
+    /** TMDB name, regional titles and Latin-script original title of an IMDb ("tt…") or TMDB id. */
     private suspend fun fetchAlternativeTitles(mediaType: String, key: String): List<String> {
-        var original: String? = null
         val tmdbId = if (key.startsWith("tt")) {
             val found = fetchTmdbJson("find/$key?external_source=imdb_id") ?: return emptyList()
             val r = ((found[if (mediaType == "tv") "tv_results" else "movie_results"] as? kotlinx.serialization.json.JsonArray)
                 ?.firstOrNull())?.jsonObject ?: return emptyList()
-            original = (r["original_title"] ?: r["original_name"])?.jsonPrimitive?.contentOrNull
             r["id"]?.jsonPrimitive?.contentOrNull ?: return emptyList()
         } else key
-        val j = fetchTmdbJson("$mediaType/$tmdbId/alternative_titles") ?: return listOfNotNull(original)
-        val list = (j["titles"] ?: j["results"]) as? kotlinx.serialization.json.JsonArray ?: return listOfNotNull(original)
-        val regional = list.mapNotNull { it as? JsonObject }
+        // One call: the item (its TMDB name — Cinemeta's can differ) with its alternative titles
+        val j = fetchTmdbJson("$mediaType/$tmdbId?append_to_response=alternative_titles") ?: return emptyList()
+        fun str(k: String) = j[k]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { it.isNotEmpty() }
+        val name = str("name") ?: str("title")
+        val original = str("original_name") ?: str("original_title")
+        val alt = j["alternative_titles"]?.jsonObject
+        val list = (alt?.get("titles") ?: alt?.get("results")) as? kotlinx.serialization.json.JsonArray
+        val regional = list.orEmpty().mapNotNull { it as? JsonObject }
             .filter { it["iso_3166_1"]?.jsonPrimitive?.contentOrNull in ALT_TITLE_REGIONS }
             .sortedBy { ALT_TITLE_REGIONS.indexOf(it["iso_3166_1"]?.jsonPrimitive?.contentOrNull) }
             .mapNotNull { it["title"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { t -> t.isNotEmpty() } }
-        // Latin-script original titles only ("Amélie" yes, a Japanese or Hindi script title no)
-        val orig = original?.takeIf { o -> o.all { it.code < 0x250 } }
-        return (regional + listOfNotNull(orig)).distinctBy { normalizeTitle(it) }.take(5)
+        // Latin script only ("Amélie" yes, a Japanese or Hindi script title no)
+        return (listOfNotNull(name) + regional + listOfNotNull(original)).filter { isLatin(it) }
+            .distinctBy { normalizeTitle(it) }.take(6)
+    }
+
+    /**
+     * Titles of an anime id: TMDB's (English sites use them, so they come first) through the
+     * anime id mapping, then the anime database's own English / romaji / short titles.
+     */
+    private suspend fun fetchAnimeTitles(type: String, scheme: String, key: String): List<String> = coroutineScope {
+        val tmdb = async {
+            runCatching {
+                val m = getJson("https://arm.haglund.dev/api/v2/ids?source=${ANIME_ID_SOURCES[scheme]}&id=$key")
+                val tmdbId = m?.get("themoviedb")?.jsonPrimitive?.contentOrNull
+                val movie = m?.get("media")?.jsonPrimitive?.contentOrNull.equals("MOVIE", ignoreCase = true) || type == "movie"
+                if (tmdbId != null) fetchAlternativeTitles(if (movie) "movie" else "tv", tmdbId)
+                else m?.get("imdb")?.jsonPrimitive?.contentOrNull?.let { fetchAlternativeTitles(if (movie) "movie" else "tv", it) }.orEmpty()
+            }.getOrDefault(emptyList())
+        }
+        val own = async {
+            runCatching {
+                when (scheme) {
+                    "kitsu" -> getJson("https://kitsu.io/api/edge/anime/$key", accept = "application/vnd.api+json")
+                        ?.get("data")?.jsonObject?.get("attributes")?.jsonObject?.let { a ->
+                            val t = a["titles"]?.jsonObject
+                            listOfNotNull(
+                                t?.get("en")?.jsonPrimitive?.contentOrNull, t?.get("en_us")?.jsonPrimitive?.contentOrNull,
+                                t?.get("en_jp")?.jsonPrimitive?.contentOrNull, a["canonicalTitle"]?.jsonPrimitive?.contentOrNull,
+                            ) + (a["abbreviatedTitles"] as? kotlinx.serialization.json.JsonArray).orEmpty()
+                                .mapNotNull { it.jsonPrimitive.contentOrNull }
+                        }.orEmpty()
+                    else -> aniListTitles(if (scheme == "mal") "idMal" else "id",
+                        if (scheme == "anidb") getJson("https://arm.haglund.dev/api/v2/ids?source=anidb&id=$key")
+                            ?.get("anilist")?.jsonPrimitive?.contentOrNull ?: return@runCatching emptyList() else key)
+                }
+            }.getOrDefault(emptyList())
+        }
+        (tmdb.await() + own.await()).map { it.trim() }.filter { it.isNotEmpty() && isLatin(it) }
+            .distinctBy { normalizeTitle(it) }.take(8)
+    }
+
+    /** AniList's English, romaji and synonym titles. */
+    private suspend fun aniListTitles(field: String, key: String): List<String> {
+        val id = key.toIntOrNull() ?: return emptyList()
+        val query = "query{Media(" + field + ":" + id + ",type:ANIME){title{english romaji}synonyms}}"
+        val body = kotlinx.serialization.json.buildJsonObject { put("query", kotlinx.serialization.json.JsonPrimitive(query)) }.toString()
+        val text = idApiCall(
+            okhttp3.Request.Builder().url("https://graphql.anilist.co")
+                .header("Accept", "application/json")
+                .post(okhttp3.RequestBody.create("application/json".toMediaTypeOrNull(), body))
+                .build()
+        ) ?: return emptyList()
+        val media = serverJson.parseToJsonElement(text).jsonObject["data"]?.jsonObject?.get("Media")?.jsonObject ?: return emptyList()
+        val t = media["title"]?.jsonObject
+        return listOfNotNull(t?.get("english")?.jsonPrimitive?.contentOrNull, t?.get("romaji")?.jsonPrimitive?.contentOrNull) +
+            (media["synonyms"] as? kotlinx.serialization.json.JsonArray).orEmpty().mapNotNull { it.jsonPrimitive.contentOrNull }
     }
 
     private suspend fun doBuildGenericStreamsForApi(
@@ -2166,22 +2326,19 @@ object StremioServer {
         }
         ServerState.debug("[${api.name}] Found ${searchResults.size} results")
 
-        val requestedSeason = if (type == "series" && id.contains(":")) {
-            id.split(":").getOrNull(1)?.toIntOrNull()
-        } else null
+        // From the parsed id: "tvdb:431162:3:1" / "kitsu:…" have the season elsewhere than tt ids
+        val requestedSeason = if (type == "series") ExternalIds.parse(id)?.season else null
 
-        val bestMatch = (if (requestedSeason != null) {
-            // Sites often list each season separately ("The Boys Season 2", sometimes with that
-            // season's year), which strict title+year matching rejects. Accept those only when the
-            // result is exactly "<title> season N" / "<title> sN" at the start — so "Season 1"
-            // never matches "Season 10" and spin-offs ("The Boys Presents …") never match.
-            val wanted = normalizeTitle(title)
-            val seasonRx = Regex("^" + Regex.escape(wanted) + " (?:season 0*$requestedSeason|s0*$requestedSeason)(?: |$)")
-            searchResults.find { r -> seasonRx.containsMatchIn(normalizeTitle(r.name)) }
-                ?: pickBestMatch(searchResults, title, year)
-        } else {
-            pickBestMatch(searchResults, title, year)
-        }) ?: matchByAlternativeTitle(api, type, id, title, searchResults, year) ?: run {
+        // Sites often list each season separately ("The Boys Season 2", "Kusuriya no Hitorigoto
+        // 3rd Season"), which strict title+year matching rejects; such an entry numbers its
+        // episodes from 1. Season 1 is usually the plain title, so only later seasons look here.
+        var seasonEntry: SearchResult? = null
+        if (requestedSeason != null && requestedSeason > 1) {
+            seasonEntry = seasonMatch(searchResults, listOf(title), requestedSeason)
+                ?: seasonMatch(searchResults, alternativeTitles(type, id), requestedSeason)
+        }
+        val bestMatch = (seasonEntry ?: pickBestMatch(searchResults, title, year))
+            ?: matchByAlternativeTitle(api, type, id, title, searchResults, year) ?: run {
             ServerState.debug("[${api.name}] No result matches '$title'" + (year?.let { " ($it)" } ?: ""))
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "No result matches '$title'")
             return emptyList()
@@ -2217,6 +2374,10 @@ object StremioServer {
             if (season != null && episode != null) {
                 // Anime extensions often leave the season empty: that is season 1
                 val ep = mediaInfo.episodes?.find { (it.season ?: 1) == season && it.episode == episode }
+                    // A season's own entry ("… Season 3") numbers its episodes S1E1…
+                    ?: seasonEntry?.let { mediaInfo.episodes?.find { e -> (e.season ?: 1) == 1 && e.episode == episode } }
+                    // …and a long season may be split: past this entry's end, "… Season 3 Part 2"
+                    ?: seasonEntry?.let { seasonPartTwoEpisode(api, searchResults, title, type, id, season, episode, mediaInfo) }
                 if (ep != null) {
                     dataUrlToLoad = ep.dataUrl
                     ServerState.debug("[${api.name}] Found episode S${season}E${episode}")
@@ -2230,6 +2391,7 @@ object StremioServer {
         ServerState.debug("[${api.name}] Loading links for $dataUrlToLoad")
         try {
             val links = api.loadLinksAll(dataUrlToLoad)
+            if (links.any { LOOPBACK_URL.containsMatchIn(it.url.orEmpty()) }) localLinkProviders.add(api.internalName)
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, links.size, null)
             if (links.isNotEmpty()) {
                 ServerState.debug("[STREAM_SUCCESS] [${api.name}] Resolved ${links.size} streamable link(s) for '$title'")

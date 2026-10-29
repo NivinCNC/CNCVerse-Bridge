@@ -171,6 +171,20 @@ object StreamLinkClassifier {
             HOST_RX.find(trimmed)?.groupValues?.getOrNull(1)?.lowercase() ?: ""
         }
 
+        // An extension's own local server (ReAnime, GoTaku…): it keeps only its last 10–20
+        // streams, so on a busy server a link is gone within minutes — never stored
+        if (host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1") {
+            return LinkClassificationResult(
+                url = trimmed,
+                host = host,
+                category = "LOCAL_SERVER",
+                isSigned = false,
+                computedTtlMs = 0L,
+                isCacheable = false,
+                reason = "Extension's local server: the link lives only while it keeps that stream",
+            )
+        }
+
         val now = System.currentTimeMillis()
         val queryStr = trimmed.substringAfter('?', "")
 
