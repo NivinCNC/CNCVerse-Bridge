@@ -56,6 +56,22 @@ class MkvProbeTest {
     }
 
     @Test
+    fun readsTheRunningTime() {
+        // Info: TimestampScale 1 ms, Duration 5 400 000 units (8-byte float) = 90 minutes
+        val scale = el(id(0x2A, 0xD7, 0xB1), byteArrayOf(0x0F, 0x42, 0x40))
+        val duration = el(id(0x44, 0x89), java.nio.ByteBuffer.allocate(8).putDouble(5_400_000.0).array())
+        val info = el(id(0x15, 0x49, 0xA9, 0x66), scale + duration)
+        val file = header + el(id(0x18, 0x53, 0x80, 0x67), info + tracks + el(id(0x1F, 0x43, 0xB6, 0x75), ByteArray(50)))
+        val r = MkvProbe.parse(file)
+        assertIs<MkvProbe.Parsed.Tracks>(r)
+        assertEquals(5400.0, r.durationSec)
+        // 4-byte float too, and no Duration at all
+        val f4 = el(id(0x44, 0x89), java.nio.ByteBuffer.allocate(4).putFloat(60_000f).array())
+        assertEquals(60.0, (MkvProbe.parse(header + el(id(0x18, 0x53, 0x80, 0x67), el(id(0x15, 0x49, 0xA9, 0x66), f4) + tracks)) as MkvProbe.Parsed.Tracks).durationSec)
+        assertNull((MkvProbe.parse(header + el(id(0x18, 0x53, 0x80, 0x67), tracks)) as MkvProbe.Parsed.Tracks).durationSec)
+    }
+
+    @Test
     fun notAnMkv() {
         assertNull(MkvProbe.parse("ftypisom....".toByteArray()))
         assertNull(MkvProbe.parse(ByteArray(0)))

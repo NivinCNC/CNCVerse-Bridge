@@ -29,7 +29,8 @@ object HlsProbe {
     private const val BUDGET_MS = 2_500L
     private const val MAX_BYTES = 512 * 1024
 
-    class Master(val heights: List<Int>, val languages: List<String>)
+    /** [bandwidth]: bits per second of the best variant (its AVERAGE-BANDWIDTH, else BANDWIDTH). */
+    class Master(val heights: List<Int>, val languages: List<String>, val bandwidth: Long? = null)
 
     /** url -> (master, or null when unreadable / not a master; checkedAt) */
     private val results = ConcurrentHashMap<String, Pair<Master?, Long>>()
@@ -91,6 +92,7 @@ object HlsProbe {
             s.copy(info = info.copy(
                 variantHeights = m.heights.takeIf { it.isNotEmpty() },
                 audioLanguages = m.languages.takeIf { it.isNotEmpty() } ?: info.audioLanguages,
+                bitrateBps = m.bandwidth ?: info.bitrateBps,
             ))
         }
     }
@@ -130,7 +132,12 @@ object HlsProbe {
             .filter { it.startsWith("#EXT-X-MEDIA", ignoreCase = true) && attr(it, "TYPE").equals("AUDIO", ignoreCase = true) }
             .mapNotNull { languageOf(attr(it, "NAME"), attr(it, "LANGUAGE")) }
             .distinct().toList()
-        return Master(heights, languages)
+        // The speed the best quality needs: the top variant's average (else peak) bandwidth
+        val best = variants.maxByOrNull { v ->
+            RESOLUTION.find(v)?.let { tier(it.groupValues[1].toInt(), it.groupValues[2].toInt()) } ?: 0
+        }
+        val bandwidth = best?.let { (attr(it, "AVERAGE-BANDWIDTH") ?: attr(it, "BANDWIDTH"))?.toLongOrNull() }?.takeIf { it > 0 }
+        return Master(heights, languages, bandwidth)
     }
 
     /** Resolution tier of a WxH variant: wide films (1920x800) are 1080p by their width. */

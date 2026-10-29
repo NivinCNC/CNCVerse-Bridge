@@ -283,7 +283,7 @@ object StreamVariables {
     val NAMES = listOf(
         "addon.name", "metadata.title", "metadata.year",
         "stream.resolution", "stream.qualities", "stream.quality", "stream.specs", "stream.visualTags", "stream.encode",
-        "stream.audioTags", "stream.audioChannels", "stream.streamType", "stream.size",
+        "stream.audioTags", "stream.audioChannels", "stream.streamType", "stream.size", "stream.bitrate",
         "stream.languages", "stream.subtitles", "stream.seasonEpisode", "stream.season",
         "stream.episode", "stream.source", "stream.label", "stream.filename", "stream.name", "stream.title",
     )
@@ -453,6 +453,7 @@ object StreamVariables {
      * multi-quality pack title. Same value the formatter shows as {stream.size}.
      */
     fun sizeBytesOf(stream: StremioStream): Long? {
+        stream.info?.sizeBytes?.let { return it } // the server's own Content-Range
         val linkText = stream.info?.linkName ?: stream.title
         val releaseText = stream.name?.substringBeforeLast('\n', "")?.takeIf { it.isNotBlank() }
         return sizeFrom(resolutionOf(stream), linkText, releaseText)
@@ -469,6 +470,10 @@ object StreamVariables {
         val allText = listOfNotNull(linkText, releaseText, stream.name).joinToString(" ")
         return (stream.info?.audioLanguages.orEmpty() + LANGUAGES.filter { (_, r) -> r.containsMatchIn(allText) }.map { it.first }).distinct()
     }
+
+    /** "~17.6 Mbps" for [bps]; null when unknown. */
+    fun bitrateText(bps: Long?): String? =
+        bps?.takeIf { it > 0 }?.let { String.format(java.util.Locale.ROOT, "~%.1f Mbps", it / 1_000_000.0) }
 
     /** The extension (addon) that produced [stream]. */
     fun addonOf(stream: StremioStream): String? =
@@ -527,7 +532,9 @@ object StreamVariables {
             "stream.audiotags" to audio,
             "stream.audiochannels" to channels,
             "stream.streamtype" to streamTypeFrom(info, stream),
-            "stream.size" to sizeFrom(resolution, linkText, releaseText),
+            "stream.size" to (info?.sizeBytes ?: sizeFrom(resolution, linkText, releaseText)),
+            // "~17.6 Mbps": the speed it needs on average (size / running time, or the HLS bandwidth)
+            "stream.bitrate" to bitrateText(info?.bitrateBps),
             // Multi-audio files can carry 20+ tracks: a few, then "+N more", so the card stays readable
             "stream.languages" to (if (languages.size <= MAX_LANGUAGES) languages
                 else languages.take(MAX_LANGUAGES - 1) + "+${languages.size - (MAX_LANGUAGES - 1)} more"),
@@ -629,7 +636,7 @@ object StreamFormatter {
                 "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
                 "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::default('Auto')} • {stream.streamType::default('HLS')}\"]}\n" +
                 "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}\n" +
-                "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}\n" +
+                "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}{stream.bitrate::exists[\" · {stream.bitrate}\"||\"\"]}\"||\"\"]}\n" +
                 "{stream.languages::exists[\"🎧 Audio: {stream.languages::join(', ')}\"||\"\"]}\n" +
                 "{stream.subtitles::exists[\"💬 Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
         ),
@@ -639,7 +646,7 @@ object StreamFormatter {
             description = "Ultra-compact 2-line layout inspired by Torrentio and Cyberflix.",
             nameTemplate = "[CNC] {stream.resolution::default('HD')} • {addon.name}",
             descriptionTemplate = "{metadata.title}{stream.seasonEpisode::exists[\" - {stream.seasonEpisode::join('')}\"||\"\"]}\n" +
-                "{stream.specs::join(' ')}{stream.size::>0[\" | {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}{stream.source::exists[\" | {stream.source}\"||\"\"]}\n" +
+                "{stream.specs::join(' ')}{stream.size::>0[\" | {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}{stream.bitrate::exists[\" · {stream.bitrate}\"||\"\"]}\"||\"\"]}{stream.source::exists[\" | {stream.source}\"||\"\"]}\n" +
                 "Audio: {stream.languages::default('Multi')}{stream.subtitles::exists[\" | Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
         ),
         FormatterPreset(
@@ -649,7 +656,7 @@ object StreamFormatter {
             nameTemplate = "⚡ CNCVerse | {stream.resolution::=2160p[\"💎 4K UHD\"||\"📺 {stream.resolution::default('FHD')}\"]} | {addon.name}",
             descriptionTemplate = "🎬 {metadata.title}{stream.seasonEpisode::exists[\" [{stream.seasonEpisode::join('')}]\"||\"\"]}\n" +
                 "⚙️ Specs: {stream.specs::join(' • ')}\n" +
-                "📦 Size: {stream.size::>0[\"{stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"Direct Stream\"]} • Host: {addon.name}\n" +
+                "📦 Size: {stream.size::>0[\"{stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}{stream.bitrate::exists[\" · {stream.bitrate}\"||\"\"]}\"||\"Direct Stream\"]} • Host: {addon.name}\n" +
                 "🔊 Audio: {stream.languages::default('Original')}\n" +
                 "{stream.subtitles::exists[\"📝 Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
         ),
@@ -660,7 +667,7 @@ object StreamFormatter {
             nameTemplate = "{stream.resolution::default('Auto')} • {stream.streamType::default('Direct')} • {addon.name}",
             descriptionTemplate = "{metadata.title}{stream.seasonEpisode::exists[\" • {stream.seasonEpisode::join('')}\"||\"\"]}\n" +
                 "{stream.specs::join(' • ')}\n" +
-                "{stream.size::>0[\"Size: {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')} • \"||\"\"]}Audio: {stream.languages::default('Default')}"
+                "{stream.size::>0[\"Size: {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}{stream.bitrate::exists[\" · {stream.bitrate}\"||\"\"]} • \"||\"\"]}Audio: {stream.languages::default('Default')}"
         )
     )
 
@@ -671,7 +678,7 @@ object StreamFormatter {
         "{stream.label::exists[\"🏷️ {stream.label::truncate(90)}\"||\"\"]}\n" +
         "🎞️ {stream.specs::length::>0[\"{stream.specs::join(' • ')}\"||\"{stream.resolution::default('Auto')} • {stream.streamType::default('HLS')}\"]}\n" +
         "🛰️ Source: {addon.name}{stream.source::exists[\" • {stream.source}\"||\"\"]}\n" +
-        "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}\"||\"\"]}\n" +
+        "{stream.size::>0[\"💾 {stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}{stream.bitrate::exists[\" · {stream.bitrate}\"||\"\"]}\"||\"\"]}\n" +
         "{stream.languages::exists[\"🎧 Audio: {stream.languages::join(', ')}\"||\"\"]}\n" +
         "{stream.subtitles::exists[\"💬 Subs: {stream.subtitles::join(', ')}\"||\"\"]}"
 
@@ -689,11 +696,33 @@ object StreamFormatter {
         val loaded = runCatching { if (f.exists()) json.decodeFromString<StreamFormatterConfig>(f.readText()) else null }
             .onFailure { ServerState.warn("Stream formatter config unreadable: ${it.message}") }
             .getOrNull() ?: StreamFormatterConfig(enabled = true, nameTemplate = PRESET_NAME, descriptionTemplate = PRESET_DESCRIPTION)
-        runCatching { install(loaded) }.onFailure {
+        val migrated = withBitrate(loaded)
+        if (migrated != loaded) {
+            ServerState.info("Stream formatter: the size line now also shows the speed a file needs (~X Mbps)")
+            runCatching { f.writeText(json.encodeToString(StreamFormatterConfig.serializer(), migrated)) }
+        }
+        runCatching { install(migrated) }.onFailure {
             ServerState.warn("Stream formatter disabled — template error: ${it.message}")
             config = loaded.copy(enabled = false)
         }
     }
+
+    /** The size snippet every preset (and the server templates copied from them) starts from. */
+    private const val SIZE_SNIPPET = "{stream.size::bytes2::replace('GiB','GB')::replace('MiB','MB')}"
+    private const val BITRATE_SNIPPET = "{stream.bitrate::exists[\" · {stream.bitrate}\"||\"\"]}"
+
+    /**
+     * A template made before {stream.bitrate} existed gets the speed right after the size
+     * ("💾 13.4 GB · ~17.6 Mbps"). Its own wording stays; one that already uses stream.bitrate,
+     * or has no standard size snippet, is left alone.
+     */
+    internal fun withBitrate(template: String): String =
+        if ("stream.bitrate" in template || SIZE_SNIPPET !in template) template
+        else template.replace(SIZE_SNIPPET, SIZE_SNIPPET + BITRATE_SNIPPET)
+
+    /** One-time update of the saved server templates (see the String overload). */
+    internal fun withBitrate(cfg: StreamFormatterConfig): StreamFormatterConfig =
+        cfg.copy(nameTemplate = withBitrate(cfg.nameTemplate), descriptionTemplate = withBitrate(cfg.descriptionTemplate))
 
     /** Validates both templates; throws [TemplateException] naming the broken one. */
     fun validate(cfg: StreamFormatterConfig): Pair<Template?, Template?> {
@@ -794,7 +823,8 @@ object StreamFormatter {
             "preset" -> PRESETS.find { it.id == pf.presetId }
                 ?.let { runCatching { parsedPair(it.nameTemplate, it.descriptionTemplate) }.getOrNull() }
                 ?: return apply(streams, ctx)
-            "custom" -> runCatching { parsedPair(pf.nameTemplate, pf.descriptionTemplate) }.getOrNull()
+            // Users' own templates get the speed after their size too (their saved text is untouched)
+            "custom" -> runCatching { parsedPair(withBitrate(pf.nameTemplate), withBitrate(pf.descriptionTemplate)) }.getOrNull()
                 ?: return apply(streams, ctx)
             else -> return apply(streams, ctx)
         }

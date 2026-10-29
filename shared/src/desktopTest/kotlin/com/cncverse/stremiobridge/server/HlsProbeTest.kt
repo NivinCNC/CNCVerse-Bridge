@@ -29,6 +29,11 @@ class HlsProbeTest {
         assertEquals(listOf(1080, 720, 480), m.heights)
         // Subtitle tracks and "und" are not audio languages
         assertEquals(listOf("Hindi", "Tamil"), m.languages)
+        // The best variant's bandwidth, not the first or the largest number
+        assertEquals(5_000_000L, m.bandwidth)
+        // AVERAGE-BANDWIDTH wins over the peak when the master gives both
+        val avg = HlsProbe.parse("#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=9000000,AVERAGE-BANDWIDTH=6200000,RESOLUTION=1920x1080\nv.m3u8\n")!!
+        assertEquals(6_200_000L, avg.bandwidth)
     }
 
     @Test

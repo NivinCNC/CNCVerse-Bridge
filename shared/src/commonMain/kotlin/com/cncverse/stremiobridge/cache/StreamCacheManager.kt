@@ -607,9 +607,14 @@ object StreamCacheManager {
     /** A fetch outcome; [cacheable] = false serves the streams without caching them (e.g. partial results). */
     class FetchResult(val streams: List<StremioStream>, val cacheable: Boolean = true)
 
+    /**
+     * @param scope where the shared fetch runs: the plugin pool by default; opened catalog items
+     *   pass their own, so live channels never queue behind the movie / series scraping.
+     */
     suspend fun getOrFetchResult(
         key: String,
         providerKey: String? = null,
+        scope: CoroutineScope? = null,
         fetcher: suspend () -> FetchResult
     ): List<StremioStream> {
         if (!config.enabled) return fetcher().streams
@@ -638,7 +643,7 @@ object StreamCacheManager {
             } else {
                 isLeader = true
                 lateinit var self: Flight
-                val deferred = fetchScope.async(start = CoroutineStart.LAZY) {
+                val deferred = (scope ?: fetchScope).async(start = CoroutineStart.LAZY) {
                     try {
                         val result = withTimeout(MAX_FETCH_MS) { fetcher() }
                         if (result.cacheable) put(key, result.streams, providerKey)

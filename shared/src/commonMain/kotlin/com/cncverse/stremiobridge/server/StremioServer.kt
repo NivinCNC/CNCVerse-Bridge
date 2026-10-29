@@ -145,6 +145,22 @@ object StremioServer {
         Dispatchers.IO.limitedParallelism(64)
 
     /**
+     * Streams of an item opened from a bridge catalog (live channels, PlayFy's live events): one
+     * extension each, someone waiting on it. On the plugin pool they queued behind the movie and
+     * series scraping, whose extensions hold a thread up to 38 s: a PlayFy match answered in
+     * 45-65 s although PlayFy itself gave its links in 2 s (24 Oct) — start, resume after the
+     * links and the answer each waited for a free slot. Movie requests hid it with their 8 s
+     * cut-off; catalog items have none.
+     */
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private val itemDispatcher: kotlinx.coroutines.CoroutineDispatcher =
+        Dispatchers.IO.limitedParallelism(16)
+    private val itemStreamScope = CoroutineScope(itemDispatcher + SupervisorJob())
+
+    /** The pool a stream / subtitle request for [id] is built on. */
+    private fun streamPool(id: String) = if (StremioIds.decode(id) != null) itemDispatcher else pluginDispatcher
+
+    /**
      * Shared provider catalog cache: provider internalName -> list of StremioCatalogDef.
      * Kept between refreshes so manifests never block on re-fetching sections.
      */
@@ -815,7 +831,9 @@ object StremioServer {
         val type = parameters["type"] ?: return respond(HttpStatusCode.BadRequest)
         val id   = parameters["id"]   ?: return respond(HttpStatusCode.BadRequest)
 
-        val streams = withContext(pluginDispatcher) { buildStreams(type, id) }
+        // The title's running time (for each file's "~X Mbps"), looked up while the streams load
+        val runtime = if (type == "movie" || type == "series") streamSearchScope.async { titleRuntimeSec(type, id) } else null
+        val streams = withContext(streamPool(id)) { buildStreams(type, id) }
             // Archive downloads (".zip" season packs) can never play in any player
             .filter { !SeekProbe.isArchiveUrl(it.url) }
             // Unlabelled HLS ("Auto"): read the master for its qualities and audio languages;
@@ -831,8 +849,10 @@ object StremioServer {
 
         // Preferred languages (and the ones the filter keeps) lead the audio line
         val preferred = (p.preferredLanguages + p.allowedLanguages).distinct()
+        val runtimeSec = runtime?.let { withTimeoutOrNull(1_500) { it.await() } }
+        val sized = filtered.map { withSizeHints(it, runtimeSec) }
         val formatted = com.cncverse.stremiobridge.format.StreamFormatter.applyFor(
-            filtered,
+            sized,
             com.cncverse.stremiobridge.format.StreamFormatter.contextFromId(type, id).copy(preferredLanguages = preferred),
             null,
         )
@@ -846,6 +866,56 @@ object StremioServer {
             }
             .map { s -> s.subtitles?.let { subs -> s.copy(subtitles = subs.map { it.copy(lang = com.cncverse.stremiobridge.format.SubtitleLangs.normalize(it.lang)) }) } ?: s }
         respond(StremioStreamResponse(out))
+    }
+
+    private val VIDEO_FILE_NAME = Regex("[^/\\\\]+[.](mkv|mp4|m4v|avi|mov|webm|ts|wmv)", RegexOption.IGNORE_CASE)
+
+    /** Above this, the size is a season pack's or the running time is wrong — not a real file's speed. */
+    private const val MAX_PLAUSIBLE_BPS = 150_000_000L
+
+    /**
+     * behaviorHints.videoSize (and the file name, when the link is one) for players and subtitle
+     * addons, and the average speed the file needs: its size over its own running time (MKV
+     * header) or the title's (TMDB). HLS links keep the bandwidth their master states.
+     */
+    private fun withSizeHints(s: StremioStream, runtimeSec: Double?): StremioStream {
+        if (s.externalUrl != null) return s
+        val info = s.info
+        val size = com.cncverse.stremiobridge.format.StreamVariables.sizeBytesOf(s)?.takeIf { it > 0 }
+        val seconds = info?.durationSec ?: runtimeSec
+        val bps = (info?.bitrateBps ?: if (size != null && seconds != null && seconds >= 60) (size * 8 / seconds).toLong() else null)
+            ?.takeIf { it in 100_000..MAX_PLAUSIBLE_BPS }
+        val filename = info?.linkName?.trim()?.takeIf { VIDEO_FILE_NAME.matches(it) }
+        if (size == null && bps == null && filename == null) return s
+        val hints = if (size == null && filename == null) s.behaviorHints
+            else (s.behaviorHints ?: StreamBehaviorHints()).let { h -> h.copy(videoSize = size ?: h.videoSize, filename = filename ?: h.filename) }
+        return s.copy(behaviorHints = hints, info = (info ?: StreamInfo()).copy(bitrateBps = bps))
+    }
+
+    private val runtimeCache = ConcurrentHashMap<String, kotlinx.coroutines.Deferred<Double?>>()
+
+    /** Running time of the movie / episode asked for, in seconds (TMDB); null when unknown. */
+    private suspend fun titleRuntimeSec(type: String, id: String): Double? {
+        val ext = ExternalIds.parse(id) ?: return null
+        if (ext.scheme != "imdb" && ext.scheme != "tmdb") return null
+        val series = type == "series"
+        if (series && (ext.season == null || ext.episode == null)) return null
+        val key = "$type:${ext.key}:${ext.season}:${ext.episode}"
+        if (runtimeCache.size > 20_000) runtimeCache.clear()
+        val job = runtimeCache.computeIfAbsent(key) {
+            streamSearchScope.async {
+                runCatching {
+                    val tmdbId = tmdbIdOf(if (series) "tv" else "movie", ext.key) ?: return@runCatching null
+                    val minutes = if (series) {
+                        fetchTmdbJson("tv/$tmdbId/season/${ext.season}/episode/${ext.episode}")?.get("runtime")?.jsonPrimitive?.intOrNull
+                            ?: (fetchTmdbJson("tv/$tmdbId")?.get("episode_run_time") as? kotlinx.serialization.json.JsonArray)
+                                ?.firstOrNull()?.jsonPrimitive?.intOrNull
+                    } else fetchTmdbJson("movie/$tmdbId")?.get("runtime")?.jsonPrimitive?.intOrNull
+                    minutes?.takeIf { it > 0 }?.let { it * 60.0 }
+                }.getOrNull()
+            }
+        }
+        return withTimeoutOrNull(6_000) { job.await() }
     }
 
     /** HLS masters and MKV headers read at once (they never touch the same stream). */
@@ -890,7 +960,7 @@ object StremioServer {
             respond(StremioSubtitleResponse(emptyList()))
             return
         }
-        val streams = withContext(pluginDispatcher) { buildStreams(type, id) }
+        val streams = withContext(streamPool(id)) { buildStreams(type, id) }
         val subtitles = streams.flatMap { it.subtitles ?: emptyList() }.distinctBy { it.id }
             .map { it.copy(lang = com.cncverse.stremiobridge.format.SubtitleLangs.normalize(it.lang)) }
 
@@ -1856,12 +1926,12 @@ object StremioServer {
             val directCacheKey = "stream:direct:$pluginKey:$dataUrl"
             // Live TV / live events: links are short-lived session URLs — never cache them.
             val isLive = type == "tv" || matchingApis.all { api -> api.supportedTypes.all { it == "tv" } }
-            return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetchResult(directCacheKey, pluginKey) {
+            return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetchResult(directCacheKey, pluginKey, itemStreamScope) {
                 ServerState.info("Parallel stream load: ${matchingApis.size} API(s) for key '$pluginKey'")
 
                 val accumulated = java.util.concurrent.CopyOnWriteArrayList<StremioStream>()
                 val jobs = matchingApis.map { api ->
-                    streamSearchScope.launch {
+                    itemStreamScope.launch {
                         withTimeoutOrNull(PROVIDER_TIMEOUT_MS) {
                             try {
                                 ServerState.debug("[${api.name}] Loading links for $dataUrl")

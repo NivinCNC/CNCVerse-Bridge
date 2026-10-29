@@ -167,6 +167,12 @@ data class StreamInfo(
     val variantHeights: List<Int>? = null,
     /** Audio track languages the HLS master lists ("Hindi", "Tamil", …); null when not read. */
     val audioLanguages: List<String>? = null,
+    /** The file's real size from its server (Content-Range), when its start was read. */
+    val sizeBytes: Long? = null,
+    /** Running time the file itself states (MKV header), in seconds. */
+    val durationSec: Double? = null,
+    /** Average bits per second it needs: the HLS master's bandwidth, or size ÷ running time. */
+    val bitrateBps: Long? = null,
 )
 
 @Serializable
@@ -186,6 +192,10 @@ data class StreamBehaviorHints(
     @SerialName("bingeGroup")     val bingeGroup: String? = null,
     @SerialName("notWebReady")    val notWebReady: Boolean? = null,
     @SerialName("proxyHeaders")   val proxyHeaders: ProxyHeaders? = null,
+    /** File size in bytes (players show it; subtitle addons match on it). */
+    @SerialName("videoSize")      val videoSize: Long? = null,
+    /** The file's own name, when the link carries one. */
+    @SerialName("filename")       val filename: String? = null,
 )
 
 @Serializable

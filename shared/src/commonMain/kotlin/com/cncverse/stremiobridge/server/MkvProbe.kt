@@ -21,8 +21,11 @@ import java.util.concurrent.TimeUnit
  * Until now only the link/release name was searched for language words, so a "Multi Audio"
  * file showed nothing, or only the languages its name happened to spell out.
  *
- * Other formats (MP4 keeps its track list wherever it likes) are left alone. Results are kept
- * per link; reads that miss the request's short budget finish for the next request.
+ * The same read gives the file's real size (the server's Content-Range) for every direct file,
+ * and an MKV's running time from its header: size / time is the speed it needs to play.
+ *
+ * Other formats (MP4 keeps its track list wherever it likes) only get their size. Results are
+ * kept per link; reads that miss the request's short budget finish for the next request.
  */
 object MkvProbe {
     private const val TTL_MS = 6 * 60 * 60_000L
@@ -31,8 +34,13 @@ object MkvProbe {
     private const val HEAD_BYTES = 256 * 1024
     private const val TRACKS_BYTES = 128 * 1024
 
-    /** url -> (audio languages, or null when unreadable / not an MKV; checkedAt) */
-    private val results = ConcurrentHashMap<String, Pair<List<String>?, Long>>()
+    /** What one read of a file's start told. */
+    class Facts(val languages: List<String>?, val sizeBytes: Long?, val durationSec: Double?) {
+        val empty get() = languages == null && sizeBytes == null && durationSec == null
+    }
+
+    /** url -> (facts, or null when unreadable; checkedAt) */
+    private val results = ConcurrentHashMap<String, Pair<Facts?, Long>>()
     private val inFlight = ConcurrentHashMap<String, kotlinx.coroutines.Deferred<Unit>>()
     private val limit = Semaphore(16)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -46,16 +54,17 @@ object MkvProbe {
             .build()
     }
 
-    private fun candidate(s: StremioStream) = s.info?.audioLanguages == null && SeekProbe.isDirectFile(s)
+    private fun candidate(s: StremioStream) =
+        (s.info?.audioLanguages == null || s.info?.sizeBytes == null) && SeekProbe.isDirectFile(s)
 
-    private fun cached(url: String): Pair<List<String>?, Long>? {
+    private fun cached(url: String): Pair<Facts?, Long>? {
         val e = results[url] ?: return null
         val ttl = if (e.first == null) FAIL_TTL_MS else TTL_MS
         if (System.currentTimeMillis() - e.second > ttl) { results.remove(url); return null }
         return e
     }
 
-    /** [streams] with the audio languages filled in for every MKV whose track list could be read. */
+    /** [streams] with audio languages, real size and running time filled in where the file's start was read. */
     suspend fun enrich(streams: List<StremioStream>): List<StremioStream> {
         if (results.size > 50_000) { val now = System.currentTimeMillis(); results.entries.removeIf { now - it.value.second > TTL_MS } }
         val todo = streams.filter { candidate(it) && cached(it.url!!) == null }.distinctBy { it.url }
@@ -71,14 +80,22 @@ object MkvProbe {
         }
         return streams.map { s ->
             if (!candidate(s)) return@map s
-            val langs = cached(s.url!!)?.first?.takeIf { it.isNotEmpty() } ?: return@map s
+            val f = cached(s.url!!)?.first ?: return@map s
             val info = s.info ?: com.cncverse.stremiobridge.model.StreamInfo()
-            s.copy(info = info.copy(audioLanguages = langs))
+            s.copy(info = info.copy(
+                audioLanguages = f.languages?.takeIf { it.isNotEmpty() } ?: info.audioLanguages,
+                sizeBytes = f.sizeBytes ?: info.sizeBytes,
+                durationSec = f.durationSec ?: info.durationSec,
+            ))
         }
     }
 
-    /** First [max] bytes from [start]; null on error. Second value: the server honoured the range. */
-    private fun fetch(s: StremioStream, start: Long, max: Int): Pair<ByteArray, Boolean>? {
+    private class Read(val bytes: ByteArray, val ranged: Boolean, val total: Long?)
+
+    private val CONTENT_RANGE_TOTAL = Regex("/(\\d+)\\s*$")
+
+    /** First [max] bytes from [start]; null on error. Also: the server honoured the range, the file's size. */
+    private fun fetch(s: StremioStream, start: Long, max: Int): Read? {
         val req = okhttp3.Request.Builder().url(s.url!!)
             .header("Range", "bytes=$start-${start + max - 1}")
             .header("User-Agent", "ExoPlayerLib/2.19.1")
@@ -90,20 +107,26 @@ object MkvProbe {
             val src = r.body?.source() ?: return@use null
             src.request(max.toLong())
             val n = minOf(max.toLong(), src.buffer.size).toInt()
-            src.buffer.readByteArray(n.toLong()) to (r.code == 206)
+            // 206: "bytes 0-262143/14420352696"; 200: the whole file, so its length
+            val total = if (r.code == 206) r.header("Content-Range")?.let { CONTENT_RANGE_TOTAL.find(it)?.groupValues?.get(1)?.toLongOrNull() }
+                else r.header("Content-Length")?.toLongOrNull()?.takeIf { r.header("Content-Encoding") == null }
+            Read(src.buffer.readByteArray(n.toLong()), r.code == 206, total?.takeIf { it > 0 })
         }
     }
 
-    private suspend fun read(s: StremioStream): List<String>? = limit.withPermit {
+    private suspend fun read(s: StremioStream): Facts? = limit.withPermit {
         withContext(Dispatchers.IO) {
             runCatching {
-                val (head, ranged) = fetch(s, 0, HEAD_BYTES) ?: return@runCatching null
-                when (val r = parse(head)) {
-                    is Parsed.Tracks -> r.languages
-                    is Parsed.SeekTo -> if (!ranged) null else
-                        fetch(s, r.offset, TRACKS_BYTES)?.first?.let { tracksAt(it) }
-                    null -> null
+                val head = fetch(s, 0, HEAD_BYTES) ?: return@runCatching null
+                val facts = when (val r = parse(head.bytes)) {
+                    is Parsed.Tracks -> Facts(r.languages, head.total, r.durationSec)
+                    is Parsed.SeekTo -> Facts(
+                        if (!head.ranged) null else fetch(s, r.offset, TRACKS_BYTES)?.bytes?.let { tracksAt(it) },
+                        head.total, r.durationSec,
+                    )
+                    null -> Facts(null, head.total, null) // not an MKV: its size is still worth having
                 }
+                facts.takeIf { !it.empty }
             }.onFailure { ServerState.debug("[MkvProbe] ${s.url?.take(80)}: ${it.message}") }.getOrNull()
         }
     }
@@ -123,11 +146,16 @@ object MkvProbe {
     private const val LANGUAGE_BCP47 = 0x22B59DL
     private const val NAME = 0x536EL
     private const val CLUSTER = 0x1F43B675L
+    private const val INFO = 0x1549A966L
+    private const val TIMESTAMP_SCALE = 0x2AD7B1L
+    private const val DURATION = 0x4489L
 
     internal sealed class Parsed {
-        class Tracks(val languages: List<String>) : Parsed()
+        /** Running time from the segment's Info, when it came before the track list. */
+        abstract val durationSec: Double?
+        class Tracks(val languages: List<String>, override val durationSec: Double? = null) : Parsed()
         /** The track list is not in the bytes read; it starts at this file offset. */
-        class SeekTo(val offset: Long) : Parsed()
+        class SeekTo(val offset: Long, override val durationSec: Double? = null) : Parsed()
     }
 
     /** Variable-length integer at [pos]: (value, length). IDs keep their length marker, sizes don't. */
@@ -182,9 +210,11 @@ object MkvProbe {
         val segment = element(b, header.end.toInt())?.takeIf { it.id == SEGMENT } ?: return null
         val segEnd = if (segment.unknownSize) Long.MAX_VALUE else segment.end
         var tracksOffset: Long? = null
+        var duration: Double? = null
         for (e in children(b, segment.data, segEnd)) {
             when (e.id) {
-                TRACKS -> return Parsed.Tracks(audioLanguages(b, e))
+                INFO -> duration = durationOf(b, e)
+                TRACKS -> return Parsed.Tracks(audioLanguages(b, e), duration)
                 SEEK_HEAD -> for (seek in children(b, e.data, e.end).filter { it.id == SEEK }) {
                     val parts = children(b, seek.data, seek.end).toList()
                     val target = parts.firstOrNull { it.id == SEEK_ID }?.let { id -> (0 until id.size.toInt()).fold(0L) { v, i -> (v shl 8) or (b[id.data + i].toLong() and 0xFF) } }
@@ -193,7 +223,21 @@ object MkvProbe {
                 CLUSTER -> break // the video itself: no track list before it
             }
         }
-        return tracksOffset?.let { Parsed.SeekTo(it) }
+        return tracksOffset?.let { Parsed.SeekTo(it, duration) }
+    }
+
+    /** Info's Duration (a float in TimestampScale units, 1 ms by default) in seconds. */
+    private fun durationOf(b: ByteArray, info: Element): Double? {
+        if (info.end > b.size) return null
+        val fields = children(b, info.data, info.end).toList()
+        val scaleNs = fields.firstOrNull { it.id == TIMESTAMP_SCALE }?.let { uint(b, it) }?.takeIf { it > 0 } ?: 1_000_000L
+        val d = fields.firstOrNull { it.id == DURATION }?.takeIf { it.end <= b.size } ?: return null
+        val units = when (d.size) {
+            4L -> java.nio.ByteBuffer.wrap(b, d.data, 4).float.toDouble()
+            8L -> java.nio.ByteBuffer.wrap(b, d.data, 8).double
+            else -> return null
+        }
+        return (units * scaleNs / 1e9).takeIf { it.isFinite() && it > 0 }
     }
 
     /** The audio languages of a Tracks element that starts at byte 0 of [b]. */
