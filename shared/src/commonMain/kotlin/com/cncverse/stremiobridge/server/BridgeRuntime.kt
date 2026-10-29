@@ -262,6 +262,12 @@ object BridgeRuntime {
         ServerState.updateStatus(ServerStatus.Starting("Loading plugin registry…"))
         initState()
         RepoManager.loadSavedRepos()
+        // Same-named extensions from two repos that shared one file get their own (re-downloaded below)
+        val separated = withContext(Dispatchers.IO) {
+            runCatching { PluginInstaller.separateSharedFiles(cacheDir) }
+                .onFailure { ServerState.warn("Shared-file check failed: ${it.message}") }
+                .getOrDefault(0)
+        }
         // Drop extensions whose repo was deleted + stray .cs3/.jar files left by older builds
         val pruned = withContext(Dispatchers.IO) {
             runCatching { PluginInstaller.pruneOrphans(cacheDir, RepoState.repos.value.map { it.url }) }
@@ -269,7 +275,7 @@ object BridgeRuntime {
                 .getOrDefault(emptyList())
         }
         // Plugins may have been preloaded at app start — drop the pruned ones from memory too
-        if (pruned.isNotEmpty() && GlobalPluginManager.isPluginsLoaded.value) forceReloadPlugins()
+        if ((pruned.isNotEmpty() || separated > 0) && GlobalPluginManager.isPluginsLoaded.value) forceReloadPlugins()
 
         val installed = withContext(Dispatchers.IO) { PluginInstaller.loadInstalledPlugins(cacheDir) }
         RepoState.setInstalledPlugins(installed)

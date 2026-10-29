@@ -179,11 +179,12 @@ object PluginRepository {
      * Downloads a single plugin's .cs3 file to the cache directory.
      * Returns the local [File] on success, null on failure.
      * Skips download if file already exists and hash matches.
+     * [fileBase] is the file name without ".cs3" (repo-specific when two repos' names collide).
      */
-    suspend fun downloadPlugin(plugin: SitePlugin, cacheDir: String): File? =
+    suspend fun downloadPlugin(plugin: SitePlugin, cacheDir: String, fileBase: String = plugin.internalName.sanitize()): File? =
         withContext(Dispatchers.IO) {
             val dir = File(cacheDir, "plugins").also { it.mkdirs() }
-            val fileName = "${plugin.internalName.sanitize()}.cs3"
+            val fileName = "$fileBase.cs3"
             val destFile = File(dir, fileName)
 
             // Skip download if cached with matching hash

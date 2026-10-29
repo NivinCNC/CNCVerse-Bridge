@@ -44,7 +44,7 @@ object PluginInstaller {
         RepoState.setInstallState(plugin.internalName, PluginInstallState.Installing("Downloading…"))
         ServerState.info("Installing '${plugin.name}'…")
 
-        val file = PluginRepository.downloadPlugin(plugin, cacheDir)
+        val file = PluginRepository.downloadPlugin(plugin, cacheDir, fileBaseFor(plugin.internalName, ap.repoEntry.url))
         return if (file != null) {
             val installed = InstalledPlugin(
                 internalName = plugin.internalName,
@@ -73,7 +73,8 @@ object PluginInstaller {
     suspend fun uninstallPlugin(internalName: String, cacheDir: String) = withContext(Dispatchers.IO) {
         val inst = RepoState.installedPlugins.value.find { it.internalName == internalName }
             ?: loadInstalledPlugins(cacheDir).find { it.internalName == internalName }
-        deletePluginFiles(cacheDir, internalName, inst?.localPath)
+        deletePluginFiles(cacheDir, internalName, inst?.localPath,
+            keep = RepoState.installedPlugins.value.filter { it.internalName != internalName })
         RepoState.markUninstalled(internalName)
         saveInstalledPlugins(cacheDir)
         ServerState.info("Uninstalled '$internalName'")
@@ -93,10 +94,15 @@ object PluginInstaller {
         else -> fileName
     }
 
-    /** Deletes the .cs3 and every derived artifact (.dex, -jvmN.jar) for one plugin. */
-    private fun deletePluginFiles(cacheDir: String, internalName: String, localPath: String?) {
+    /**
+     * Deletes the .cs3 and every derived artifact (.dex, -jvmN.jar) for one plugin. Files that
+     * a plugin in [keep] still uses stay ("Reanime" and "ReAnime" from two repos both map to
+     * reanime.cs3 in older installs).
+     */
+    private fun deletePluginFiles(cacheDir: String, internalName: String, localPath: String?, keep: List<InstalledPlugin> = emptyList()) {
         val dir = File(cacheDir, "plugins")
         if (!dir.exists()) return
+        val kept = keep.map { File(it.localPath).nameWithoutExtension }.toSet()
         val bases = buildSet {
             val s = sanitizeName(internalName).trim()
             if (s.isNotBlank()) add(s)
@@ -104,11 +110,11 @@ object PluginInstaller {
                 val n = File(it).nameWithoutExtension.trim()
                 if (n.isNotBlank()) add(n)
             }
-        }
+        } - kept
         if (bases.isEmpty()) return
         localPath?.let {
             val f = File(it)
-            if (f.exists() && f.isFile) f.delete()
+            if (f.exists() && f.isFile && f.nameWithoutExtension in bases) f.delete()
         }
         dir.listFiles()?.forEach { f ->
             if (f.isFile && pluginFileBase(f.name) in bases) f.delete()
@@ -125,12 +131,12 @@ object PluginInstaller {
         val candidates = (RepoState.installedPlugins.value + loadInstalledPlugins(cacheDir))
             .filter { it.repoUrl == repoUrl }
             .distinctBy { it.internalName }
-        candidates.forEach { inst ->
-            deletePluginFiles(cacheDir, inst.internalName, inst.localPath)
-            RepoState.markUninstalled(inst.internalName)
-        }
         // Persist from the on-disk list minus the removed repo so nothing else is lost
         val remaining = loadInstalledPlugins(cacheDir).filter { it.repoUrl != repoUrl }
+        candidates.forEach { inst ->
+            deletePluginFiles(cacheDir, inst.internalName, inst.localPath, keep = remaining)
+            RepoState.markUninstalled(inst.internalName)
+        }
         RepoState.setInstalledPlugins(RepoState.installedPlugins.value.filter { it.repoUrl != repoUrl })
         writeInstalled(cacheDir, remaining)
         if (candidates.isNotEmpty()) {
@@ -155,7 +161,7 @@ object PluginInstaller {
         val normalizedKnown = repoUrls.map { normalizeRepoUrl(it) }.toSet()
         val installed = loadInstalledPlugins(cacheDir)
         val (keep, orphaned) = installed.partition { normalizeRepoUrl(it.repoUrl) in normalizedKnown }
-        orphaned.forEach { deletePluginFiles(cacheDir, it.internalName, it.localPath) }
+        orphaned.forEach { deletePluginFiles(cacheDir, it.internalName, it.localPath, keep) }
         if (orphaned.isNotEmpty()) {
             writeInstalled(cacheDir, keep)
             RepoState.setInstalledPlugins(RepoState.installedPlugins.value.filter { normalizeRepoUrl(it.repoUrl) in normalizedKnown })
@@ -171,6 +177,53 @@ object PluginInstaller {
         }
         if (strayFiles > 0) ServerState.info("Deleted $strayFiles orphaned plugin file(s)")
         return orphaned.map { it.internalName }
+    }
+
+    /** Short, stable tag for a repo, used to tell apart files of plugins whose names collide. */
+    private fun repoTag(repoUrl: String): String =
+        PluginRepository.sha256Bytes(normalizeRepoUrl(repoUrl).toByteArray()).removePrefix("sha256-").take(8)
+
+    /**
+     * File name (without ".cs3") for a plugin from [repoUrl]: the one it already has, else its
+     * lower-cased name, else that name plus a repo tag when another installed plugin uses it.
+     */
+    private fun fileBaseFor(internalName: String, repoUrl: String): String {
+        val installed = RepoState.installedPlugins.value
+        val isSelf = { p: InstalledPlugin ->
+            p.internalName == internalName && normalizeRepoUrl(p.repoUrl) == normalizeRepoUrl(repoUrl)
+        }
+        val taken = installed.filterNot(isSelf).map { File(it.localPath).nameWithoutExtension }.toSet()
+        val own = installed.find(isSelf)?.let { File(it.localPath).nameWithoutExtension }
+        val plain = sanitizeName(internalName)
+        return listOfNotNull(own, plain).firstOrNull { it !in taken } ?: "$plain-${repoTag(repoUrl)}"
+    }
+
+    /**
+     * Startup fix for older installs: plugins whose names differ only in case or symbols
+     * ("Reanime" from one repo, "ReAnime" from another) shared one .cs3, so both ran whichever
+     * was downloaded last. The plugin whose hash the file matches keeps it; the others get a
+     * file of their own, re-downloaded by [repairMissingFiles]. Returns how many were moved.
+     */
+    fun separateSharedFiles(cacheDir: String): Int {
+        val installed = loadInstalledPlugins(cacheDir)
+        val groups = installed.groupBy { File(it.localPath).absolutePath.lowercase() }.values.filter { it.size > 1 }
+        if (groups.isEmpty()) return 0
+        val moved = mutableMapOf<InstalledPlugin, InstalledPlugin>()
+        for (group in groups) {
+            val file = File(group.first().localPath)
+            val actual = if (file.exists()) runCatching { PluginRepository.sha256(file) }.getOrNull() else null
+            val owner = group.find { it.fileHash != null && it.fileHash == actual } ?: group.first()
+            group.filter { it !== owner }.forEach { p ->
+                val base = "${sanitizeName(p.internalName)}-${repoTag(p.repoUrl)}"
+                moved[p] = p.copy(localPath = File(file.parentFile, "$base.cs3").absolutePath)
+            }
+        }
+        val updated = installed.map { moved[it] ?: it }
+        writeInstalled(cacheDir, updated)
+        RepoState.setInstalledPlugins(updated)
+        ServerState.warn("Gave ${moved.size} extension(s) their own file (shared with a same-named one from another repo): " +
+            moved.keys.joinToString { "${it.displayName} [${it.repoUrl.substringAfter("githubusercontent.com/").substringBefore('/')}]" })
+        return moved.size
     }
 
     private fun writeInstalled(cacheDir: String, plugins: List<InstalledPlugin>) {
