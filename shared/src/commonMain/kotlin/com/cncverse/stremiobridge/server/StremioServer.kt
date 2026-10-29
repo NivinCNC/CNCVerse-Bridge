@@ -662,11 +662,11 @@ object StremioServer {
             // Links to an extension's own server on this machine (Re:ANIME: http://127.0.0.1:41949/…)
             get("/proxy/local/{port}/{path...}") {
                 val port = call.parameters["port"]?.toIntOrNull() ?: return@get call.respond(HttpStatusCode.NotFound)
-                LocalRelay.handle(call, port, call.parameters.getAll("path").orEmpty().joinToString("/"), call.request.queryString())
+                LocalRelay.handle(call, port, LocalRelay.rawPath(call.request.uri, port), call.request.queryString())
             }
             head("/proxy/local/{port}/{path...}") {
                 val port = call.parameters["port"]?.toIntOrNull() ?: return@head call.respond(HttpStatusCode.NotFound)
-                LocalRelay.handle(call, port, call.parameters.getAll("path").orEmpty().joinToString("/"), call.request.queryString())
+                LocalRelay.handle(call, port, LocalRelay.rawPath(call.request.uri, port), call.request.queryString())
             }
 
             // ── Addon ────────────────────────────────────────────────────────

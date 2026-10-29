@@ -67,6 +67,14 @@ object LocalRelay {
         return true
     }
 
+    /**
+     * The path after /proxy/local/{port}/ exactly as the player sent it. Ktor's path parameters
+     * come decoded, and GoTaku puts a whole URL in one segment (/p/https%3A%2F%2Fhost%2Fp%2F1…):
+     * decoded, its %2F became real slashes and the extension's server answered 404.
+     */
+    fun rawPath(uri: String, port: Int): String =
+        uri.substringBefore('?').removePrefix("/proxy/local/$port").removePrefix("/")
+
     suspend fun handle(call: ApplicationCall, port: Int, path: String, rawQuery: String) {
         if (!isAllowed(port)) return call.respondText("Not found", status = HttpStatusCode.NotFound)
         allowed[port] = System.currentTimeMillis()
