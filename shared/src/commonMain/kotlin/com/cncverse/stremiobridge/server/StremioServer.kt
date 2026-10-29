@@ -2078,6 +2078,73 @@ object StremioServer {
             ?: partial.firstOrNull { it.year == null }
     }
 
+    /**
+     * The title Cinemeta/TMDB give is the US one ("Harry Potter and the Sorcerer's Stone"); Indian
+     * and UK sites (Netflix/Hotstar mirrors) list the same film as "…Philosopher's Stone", which
+     * the strict title match rejects. When nothing matches the main title, the film's other
+     * official titles are tried on the same results (same year rules), then the first one is
+     * searched as well (Hotstar finds nothing for the US title).
+     */
+    private suspend fun matchByAlternativeTitle(
+        api: MainApiWrapper, type: String, id: String, title: String, results: List<SearchResult>, year: Int?,
+    ): SearchResult? {
+        val main = normalizeTitle(title)
+        val alts = alternativeTitles(type, id).filter { normalizeTitle(it) != main }.ifEmpty { return null }
+        alts.firstNotNullOfOrNull { pickBestMatch(results, it, year) }?.let { return it }
+        val alt = alts.first()
+        val more = try {
+            SearchLoadCache.getSearch(api.internalName, alt)
+                ?: api.search(alt).also { SearchLoadCache.putSearch(api.internalName, alt, it) }
+        } catch (e: Throwable) {
+            kotlinx.coroutines.currentCoroutineContext().ensureActive()
+            return null
+        }
+        return alts.firstNotNullOfOrNull { pickBestMatch(more, it, year) }
+            ?.also { ServerState.debug("[${api.name}] Matched by alternative title '$alt'") }
+    }
+
+    /** Regions whose titles the Indian / English sites use; other languages' titles never match them. */
+    private val ALT_TITLE_REGIONS = listOf("IN", "GB", "US", "AU", "CA", "IE", "NZ") // India / UK first
+    private val altTitleCache = ConcurrentHashMap<String, kotlinx.coroutines.Deferred<List<String>>>()
+
+    /** TMDB's other titles for an IMDb/TMDB item (one lookup per item, shared by every source). */
+    private suspend fun alternativeTitles(type: String, id: String): List<String> {
+        val ext = ExternalIds.parse(id) ?: return emptyList()
+        if (ext.scheme != "imdb" && ext.scheme != "tmdb") return emptyList()
+        val key = "$type:${ext.key}"
+        if (altTitleCache.size > 5_000) altTitleCache.clear()
+        val job = altTitleCache.computeIfAbsent(key) {
+            streamSearchScope.async {
+                runCatching { fetchAlternativeTitles(if (type == "series") "tv" else "movie", ext.key) }
+                    .getOrDefault(emptyList())
+            }
+        }
+        val titles = withTimeoutOrNull(6_000) { job.await() }
+        // A failed lookup (TMDB down) is asked again next time instead of being kept as "none"
+        if (titles.isNullOrEmpty() && job.isCompleted) altTitleCache.remove(key, job)
+        return titles ?: emptyList()
+    }
+
+    private suspend fun fetchAlternativeTitles(mediaType: String, key: String): List<String> {
+        var original: String? = null
+        val tmdbId = if (key.startsWith("tt")) {
+            val found = fetchTmdbJson("find/$key?external_source=imdb_id") ?: return emptyList()
+            val r = ((found[if (mediaType == "tv") "tv_results" else "movie_results"] as? kotlinx.serialization.json.JsonArray)
+                ?.firstOrNull())?.jsonObject ?: return emptyList()
+            original = (r["original_title"] ?: r["original_name"])?.jsonPrimitive?.contentOrNull
+            r["id"]?.jsonPrimitive?.contentOrNull ?: return emptyList()
+        } else key
+        val j = fetchTmdbJson("$mediaType/$tmdbId/alternative_titles") ?: return listOfNotNull(original)
+        val list = (j["titles"] ?: j["results"]) as? kotlinx.serialization.json.JsonArray ?: return listOfNotNull(original)
+        val regional = list.mapNotNull { it as? JsonObject }
+            .filter { it["iso_3166_1"]?.jsonPrimitive?.contentOrNull in ALT_TITLE_REGIONS }
+            .sortedBy { ALT_TITLE_REGIONS.indexOf(it["iso_3166_1"]?.jsonPrimitive?.contentOrNull) }
+            .mapNotNull { it["title"]?.jsonPrimitive?.contentOrNull?.trim()?.takeIf { t -> t.isNotEmpty() } }
+        // Latin-script original titles only ("Amélie" yes, a Japanese or Hindi script title no)
+        val orig = original?.takeIf { o -> o.all { it.code < 0x250 } }
+        return (regional + listOfNotNull(orig)).distinctBy { normalizeTitle(it) }.take(5)
+    }
+
     private suspend fun doBuildGenericStreamsForApi(
         api: MainApiWrapper,
         type: String,
@@ -2103,7 +2170,7 @@ object StremioServer {
             id.split(":").getOrNull(1)?.toIntOrNull()
         } else null
 
-        val bestMatch = if (requestedSeason != null) {
+        val bestMatch = (if (requestedSeason != null) {
             // Sites often list each season separately ("The Boys Season 2", sometimes with that
             // season's year), which strict title+year matching rejects. Accept those only when the
             // result is exactly "<title> season N" / "<title> sN" at the start — so "Season 1"
@@ -2114,7 +2181,7 @@ object StremioServer {
                 ?: pickBestMatch(searchResults, title, year)
         } else {
             pickBestMatch(searchResults, title, year)
-        } ?: run {
+        }) ?: matchByAlternativeTitle(api, type, id, title, searchResults, year) ?: run {
             ServerState.debug("[${api.name}] No result matches '$title'" + (year?.let { " ($it)" } ?: ""))
             StreamTracker.record(api.pluginInternalName, api.internalName, api.name, 0, "No result matches '$title'")
             return emptyList()
