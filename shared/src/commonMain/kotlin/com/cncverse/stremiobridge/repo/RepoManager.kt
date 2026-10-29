@@ -188,8 +188,12 @@ object RepoManager {
         wrapped.forEach { ap ->
             val inst = installed.find { it.internalName == ap.plugin.internalName }
             if (inst != null && inst.repoUrl == ap.repoEntry.url) {
+                // A changed hash only counts at the same version: right after a rebuild some
+                // raw.githubusercontent edges still serve the old index, and treating that
+                // older entry as an update made plugins bounce vN -> vN+1 -> vN every refresh
                 val hasNewVersion = ap.plugin.version > inst.version ||
-                        (ap.plugin.fileHash != null && ap.plugin.fileHash != inst.fileHash)
+                        (ap.plugin.version == inst.version &&
+                            ap.plugin.fileHash != null && ap.plugin.fileHash != inst.fileHash)
                 if (hasNewVersion) {
                     RepoState.setInstallState(
                         ap.plugin.internalName,
