@@ -163,6 +163,10 @@ data class StreamInfo(
     val metadataYear: Int? = null,
     /** Display name of the extension (MainAPI.name, e.g. "4K HDHUB") - what the configure page lists. */
     val providerName: String? = null,
+    /** HLS master playlist's variant heights as tiers (1080, 720, …), best first; null when not read. */
+    val variantHeights: List<Int>? = null,
+    /** Audio track languages the HLS master lists ("Hindi", "Tamil", …); null when not read. */
+    val audioLanguages: List<String>? = null,
 )
 
 @Serializable

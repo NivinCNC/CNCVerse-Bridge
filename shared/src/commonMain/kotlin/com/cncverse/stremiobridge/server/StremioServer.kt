@@ -198,6 +198,12 @@ object StremioServer {
         val allowedResolutions: Set<String> = emptySet(),
         /** Exclude CAM / TeleSync / Screener recordings. */
         val excludeCam: Boolean = false,
+        /** Audio languages to keep ("Hindi", "Tamil"…). Empty = every language. */
+        val allowedLanguages: Set<String> = emptySet(),
+        /** With a language filter: also hide streams whose language is not known. */
+        val hideUnknownLanguage: Boolean = false,
+        /** Audio languages listed first on stream cards, in this order (display only, never filters). */
+        val preferredLanguages: List<String> = emptyList(),
         /** Maximum streams per quality tier (0 = unlimited). */
         val maxStreamsPerResolution: Int = 0,
         /** Streams go out without subtitle tracks and /subtitles answers empty. */
@@ -240,6 +246,8 @@ object StremioServer {
             maxSizeGb = max,
             maxStreamsPerResolution = p.maxStreamsPerResolution.coerceIn(0, 100),
             providerOrder = p.providerOrder.map { it.trim() }.filter { it.isNotEmpty() }.distinct(),
+            allowedLanguages = p.allowedLanguages.map { it.trim() }.filter { it.isNotEmpty() && it.length <= 40 }.take(60).toSet(),
+            preferredLanguages = p.preferredLanguages.map { it.trim() }.filter { it.isNotEmpty() && it.length <= 40 }.distinct().take(20),
         )
         streamPrefs = cleaned
         val file = streamPrefsFile ?: return
@@ -810,16 +818,22 @@ object StremioServer {
         val streams = withContext(pluginDispatcher) { buildStreams(type, id) }
             // Archive downloads (".zip" season packs) can never play in any player
             .filter { !SeekProbe.isArchiveUrl(it.url) }
+            // Unlabelled HLS ("Auto"): read the master for its qualities and audio languages;
+            // MKV files: their track list for the audio languages. Not live TV: short-lived
+            // session links, and no quality filters there.
+            .let { if (type == "tv") it else probeMedia(it) }
         val sorted = sortStreamsByQuality(streams)
 
         // Filters and ordering from the app's stream settings
         val p = streamPrefs
-        val kept = filterStreamsByProfile(sorted, p)
+        val kept = filterStreamsByProfile(sorted, p, type)
         val filtered = arrangeStreams(if (p.filterNonSeekable) SeekProbe.dropNonSeekable(kept) else kept, p)
 
+        // Preferred languages (and the ones the filter keeps) lead the audio line
+        val preferred = (p.preferredLanguages + p.allowedLanguages).distinct()
         val formatted = com.cncverse.stremiobridge.format.StreamFormatter.applyFor(
             filtered,
-            com.cncverse.stremiobridge.format.StreamFormatter.contextFromId(type, id),
+            com.cncverse.stremiobridge.format.StreamFormatter.contextFromId(type, id).copy(preferredLanguages = preferred),
             null,
         )
         // "Hide subtitles": no subtitle tracks go out (after formatting, so the description stays truthful)
@@ -832,6 +846,15 @@ object StremioServer {
             }
             .map { s -> s.subtitles?.let { subs -> s.copy(subtitles = subs.map { it.copy(lang = com.cncverse.stremiobridge.format.SubtitleLangs.normalize(it.lang)) }) } ?: s }
         respond(StremioStreamResponse(out))
+    }
+
+    /** HLS masters and MKV headers read at once (they never touch the same stream). */
+    private suspend fun probeMedia(streams: List<StremioStream>): List<StremioStream> = coroutineScope {
+        val hls = async { HlsProbe.enrich(streams) }
+        val mkv = async { MkvProbe.enrich(streams) }
+        val h = hls.await()
+        val m = mkv.await()
+        streams.indices.map { i -> if (m[i] !== streams[i]) m[i] else h[i] }
     }
 
     private val SUPPORT_STREAM = StremioStream(
@@ -1604,14 +1627,16 @@ object StremioServer {
     fun detectStreamResolution(stream: StremioStream): String =
         // Same rule as the formatter: reported quality, else the link's own name —
         // never the matched release title (multi-quality pack pages say "4K 1080p 720p").
-        when (com.cncverse.stremiobridge.format.StreamVariables.resolutionOf(stream)) {
-            "4320p", "2160p" -> "2160p"
-            "1440p", "1080p" -> "1080p"
-            "720p" -> "720p"
-            "576p", "480p" -> "480p"
-            "360p" -> "360p"
-            else -> "other"
-        }
+        tierOf(com.cncverse.stremiobridge.format.StreamVariables.resolutionOf(stream))
+
+    private fun tierOf(resolution: String?): String = when (resolution) {
+        "4320p", "2160p" -> "2160p"
+        "1440p", "1080p" -> "1080p"
+        "720p" -> "720p"
+        "576p", "480p" -> "480p"
+        "360p" -> "360p"
+        else -> "other"
+    }
 
     /** Returns true if the stream name/title indicates a CAM / TeleSync / Screener recording. */
     fun isCamStream(stream: StremioStream): Boolean {
@@ -1634,28 +1659,41 @@ object StremioServer {
     fun arrangeStreams(streams: List<StremioStream>, profile: StreamPrefs): List<StremioStream> {
         val bySize = profile.sortBy == "size"
         val byProvider = profile.groupBy == "provider"
-        if (profile.providerOrder.isEmpty() && !bySize && !byProvider) return streams
+        // Preferred languages (then the ones the language filter keeps) come first inside a quality
+        val langOrder = (profile.preferredLanguages + profile.allowedLanguages).map { languageGroup(it) }.distinct()
+        if (profile.providerOrder.isEmpty() && !bySize && !byProvider && langOrder.isEmpty()) return streams
         val rank = profile.providerOrder.withIndex().associate { (i, n) -> n.lowercase() to i }
+        val langRankOf = langOrder.withIndex().associate { (i, l) -> l to i }
         // Sort keys are computed ONCE per stream: the size lookup is a text search and a sort
         // compares each stream about log2(n) times (6 ms -> well under 1 ms for 250 streams)
-        class Keyed(val stream: StremioStream, val providerRank: Int, val provider: String, val quality: Int, val sizeKey: Long)
+        class Keyed(val stream: StremioStream, val providerRank: Int, val provider: String, val quality: Int, val sizeKey: Long, val langRank: Int)
         val keyed = streams.map { st ->
             // The configure page lists extensions by display name ("4K HDHUB"); a stream's addon
             // label is often the plugin file name ("FourKHDHub"), so match on the display name
             val provider = (st.info?.providerName ?: com.cncverse.stremiobridge.format.StreamVariables.addonOf(st))?.lowercase().orEmpty()
             // Largest first via a negated key; unknown size gets +1 so it sorts after every known one
             val sizeKey = if (!bySize) 0L else -(com.cncverse.stremiobridge.format.StreamVariables.sizeBytesOf(st) ?: -1L)
-            Keyed(st, rank[provider] ?: Int.MAX_VALUE, provider, streamQualityRank(st), sizeKey)
+            // Best (lowest) rank of any preferred language the stream carries; none = after them
+            val langRank = if (langOrder.isEmpty()) 0
+                else com.cncverse.stremiobridge.format.StreamVariables.languagesOf(st).minOfOrNull { langRankOf[languageGroup(it)] ?: Int.MAX_VALUE } ?: Int.MAX_VALUE
+            Keyed(st, rank[provider] ?: Int.MAX_VALUE, provider, streamQualityRank(st), sizeKey, langRank)
         }
         val order = if (byProvider)
-            compareBy<Keyed>({ it.providerRank }, { it.provider }, { -it.quality }, { it.sizeKey })
+            compareBy<Keyed>({ it.providerRank }, { it.provider }, { -it.quality }, { it.langRank }, { it.sizeKey })
         else
-            compareBy<Keyed>({ -it.quality }, { it.sizeKey }, { it.providerRank })
+            compareBy<Keyed>({ -it.quality }, { it.langRank }, { it.sizeKey }, { it.providerRank })
         return keyed.sortedWith(order).map { it.stream } // stable: ties keep their arrival order
     }
 
+    /** "Mandarin" and "Cantonese" count as Chinese, "Tagalog" as Filipino, for the language filter. */
+    private fun languageGroup(lang: String): String = when (val l = lang.trim().lowercase()) {
+        "mandarin", "cantonese" -> "chinese"
+        "tagalog" -> "filipino"
+        else -> l
+    }
+
     /** Filters a list of streams against a user's profile quality preferences. */
-    fun filterStreamsByProfile(streams: List<StremioStream>, profile: StreamPrefs): List<StremioStream> {
+    fun filterStreamsByProfile(streams: List<StremioStream>, profile: StreamPrefs, type: String? = null): List<StremioStream> {
         var result = streams
 
         // 1. Exclude CAM / Screener rips
@@ -1670,7 +1708,19 @@ object StremioServer {
         if (allowed.isNotEmpty() && !allowed.containsAll(SELECTABLE_RESOLUTIONS)) {
             result = result.filter { stream ->
                 val res = detectStreamResolution(stream).lowercase()
-                res !in SELECTABLE_RESOLUTIONS || res in allowed
+                // A multi-quality HLS master stays when any of its qualities is wanted
+                val variants = com.cncverse.stremiobridge.format.StreamVariables.qualitiesOf(stream).map { tierOf(it) }
+                res !in SELECTABLE_RESOLUTIONS || res in allowed || variants.any { it in allowed }
+            }
+        }
+
+        // 2a. Audio languages (not live TV: channels rarely say their language anywhere)
+        if (profile.allowedLanguages.isNotEmpty() && type != "tv") {
+            val allowedLangs = profile.allowedLanguages.map { languageGroup(it) }.toSet()
+            result = result.filter { st ->
+                val langs = com.cncverse.stremiobridge.format.StreamVariables.languagesOf(st)
+                if (langs.isEmpty()) !profile.hideUnknownLanguage
+                else langs.any { languageGroup(it) in allowedLangs }
             }
         }
 

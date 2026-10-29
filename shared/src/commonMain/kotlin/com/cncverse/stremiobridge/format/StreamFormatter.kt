@@ -270,14 +270,19 @@ private fun formatBytes(bytes: Double, binary: Boolean): String {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Request-level context: what the user asked for. */
-data class StreamRequestContext(val season: Int? = null, val episode: Int? = null)
+data class StreamRequestContext(
+    val season: Int? = null,
+    val episode: Int? = null,
+    /** The preferred audio languages (Settings → Streams): listed first, so "+N more" never hides them. */
+    val preferredLanguages: List<String> = emptyList(),
+)
 
 object StreamVariables {
 
     /** Documented variable names (shown in the admin panel). */
     val NAMES = listOf(
         "addon.name", "metadata.title", "metadata.year",
-        "stream.resolution", "stream.quality", "stream.specs", "stream.visualTags", "stream.encode",
+        "stream.resolution", "stream.qualities", "stream.quality", "stream.specs", "stream.visualTags", "stream.encode",
         "stream.audioTags", "stream.audioChannels", "stream.streamType", "stream.size",
         "stream.languages", "stream.subtitles", "stream.seasonEpisode", "stream.season",
         "stream.episode", "stream.source", "stream.label", "stream.filename", "stream.name", "stream.title",
@@ -328,6 +333,7 @@ object StreamVariables {
         "AAC" to rxAudio("aac"),
         "OPUS" to rxAudio("opus"),
     )
+    private const val MAX_LANGUAGES = 5
     private val CHANNEL_RX = Regex("(?<![0-9.])(7\\.1|5\\.1|2\\.0)(?![0-9])")
     private val LANGUAGES = listOf(
         "Hindi", "English", "Tamil", "Telugu", "Malayalam", "Kannada", "Bengali", "Marathi", "Punjabi",
@@ -436,7 +442,11 @@ object StreamVariables {
      * formatter, the profile quality filter and stream sorting.
      */
     fun resolutionOf(stream: StremioStream): String? =
-        resolutionFrom(stream.info?.quality, stream.info?.linkName ?: stream.title)
+        resolutionFrom(stream.info?.quality ?: stream.info?.variantHeights?.maxOrNull(), stream.info?.linkName ?: stream.title)
+
+    /** Every quality an HLS master offers ("1080p", "720p", …), best first; empty when not known. */
+    fun qualitiesOf(stream: StremioStream): List<String> =
+        stream.info?.variantHeights.orEmpty().mapNotNull { resolutionFrom(it) }.distinct()
 
     /**
      * File size in bytes when the link's own name says so, else null - never guessed from a
@@ -446,6 +456,18 @@ object StreamVariables {
         val linkText = stream.info?.linkName ?: stream.title
         val releaseText = stream.name?.substringBeforeLast('\n', "")?.takeIf { it.isNotBlank() }
         return sizeFrom(resolutionOf(stream), linkText, releaseText)
+    }
+
+    /**
+     * Audio languages of [stream]: the tracks its HLS master / MKV file lists first (what it
+     * really carries), then languages named in the link or release name. Same list the formatter
+     * shows as {stream.languages} and the language filter matches on.
+     */
+    fun languagesOf(stream: StremioStream): List<String> {
+        val linkText = stream.info?.linkName ?: stream.title
+        val releaseText = stream.name?.substringBeforeLast('\n', "")?.takeIf { it.isNotBlank() }
+        val allText = listOfNotNull(linkText, releaseText, stream.name).joinToString(" ")
+        return (stream.info?.audioLanguages.orEmpty() + LANGUAGES.filter { (_, r) -> r.containsMatchIn(allText) }.map { it.first }).distinct()
     }
 
     /** The extension (addon) that produced [stream]. */
@@ -470,7 +492,16 @@ object StreamVariables {
         val encode = tags(linkOnly, ENCODE_TAGS, firstOnly = true)
         val audio = tags(linkOnly, AUDIO_TAGS)
         val channels = CHANNEL_RX.find(linkOnly)?.value
-        val languages = LANGUAGES.filter { (_, r) -> r.containsMatchIn(allText) }.map { it.first }
+        val languages = languagesOf(stream).let { found ->
+            if (ctx.preferredLanguages.isEmpty()) found
+            else {
+                val rank = ctx.preferredLanguages.withIndex().associate { (i, l) -> l.lowercase() to i }
+                found.sortedBy { rank[it.lowercase()] ?: Int.MAX_VALUE } // stable: the rest keep their order
+            }
+        }
+        // A multi-quality HLS master: "1080p · 720p · 480p" (the player switches between them)
+        val qualities = qualitiesOf(stream)
+        val qualitySpec = if (qualities.size > 1) listOf(qualities.joinToString(" · ")) else emptyList()
 
         val sxe = SXE_RX.find(allText)
         val season = ctx.season ?: sxe?.groupValues?.get(1)?.toIntOrNull()
@@ -489,14 +520,17 @@ object StreamVariables {
             "metadata.year" to info?.metadataYear?.toLong(),
             "stream.resolution" to resolution,
             "stream.quality" to quality.firstOrNull(),
-            "stream.specs" to (quality + visual + encode + audio).distinct(),
+            "stream.specs" to (qualitySpec + quality + visual + encode + audio).distinct(),
+            "stream.qualities" to qualities,
             "stream.visualtags" to visual,
             "stream.encode" to encode.firstOrNull(),
             "stream.audiotags" to audio,
             "stream.audiochannels" to channels,
             "stream.streamtype" to streamTypeFrom(info, stream),
             "stream.size" to sizeFrom(resolution, linkText, releaseText),
-            "stream.languages" to languages,
+            // Multi-audio files can carry 20+ tracks: a few, then "+N more", so the card stays readable
+            "stream.languages" to (if (languages.size <= MAX_LANGUAGES) languages
+                else languages.take(MAX_LANGUAGES - 1) + "+${languages.size - (MAX_LANGUAGES - 1)} more"),
             "stream.subtitles" to cleanSubtitles(stream.subtitles),
             "stream.seasonepisode" to seasonEpisode,
             "stream.season" to season?.toLong(),

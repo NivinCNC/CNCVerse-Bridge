@@ -282,6 +282,13 @@ fun StreamCacheCard() {
 
 private val RESOLUTIONS = listOf("2160p", "1080p", "720p", "480p", "360p")
 
+/** Audio languages offered for the language filter and the preferred order. */
+private val LANGUAGE_CHOICES = listOf(
+    "Hindi", "English", "Tamil", "Telugu", "Malayalam", "Kannada", "Bengali", "Marathi",
+    "Punjabi", "Gujarati", "Urdu", "Odia", "Japanese", "Korean", "Chinese", "Spanish", "French", "German",
+    "Italian", "Portuguese", "Russian", "Arabic", "Turkish", "Thai", "Indonesian", "Filipino",
+)
+
 /** How stream lists are filtered and ordered (applied to every request). */
 @Composable
 fun StreamsCard() {
@@ -290,6 +297,7 @@ fun StreamsCard() {
     var maxGb by remember { mutableStateOf(p.maxSizeGb.takeIf { it > 0 }?.toString().orEmpty()) }
     var maxPer by remember { mutableStateOf(p.maxStreamsPerResolution.takeIf { it > 0 }?.toString().orEmpty()) }
     var showOrder by remember { mutableStateOf(false) }
+    var showLanguages by remember { mutableStateOf(false) }
     var saved by remember { mutableStateOf<String?>(null) }
     fun update(n: StremioServer.StreamPrefs) { p = n; saved = null }
 
@@ -312,6 +320,63 @@ fun StreamsCard() {
                 )
             }
         }
+
+        // Audio languages: a filter, and an order that puts preferred languages first
+        TextButton(onClick = { showLanguages = !showLanguages }) {
+            Text(
+                if (showLanguages) "Hide audio languages"
+                else "Audio languages (" + (if (p.allowedLanguages.isEmpty()) "all" else "${p.allowedLanguages.size} kept") +
+                    (if (p.preferredLanguages.isEmpty()) "" else ", ${p.preferredLanguages.size} preferred") + ")",
+                color = Violet400, fontSize = 12.sp,
+            )
+        }
+        if (showLanguages) {
+            Text("Only show streams with one of these audio languages", color = TextSecondary, fontSize = 11.sp)
+            Text("None selected = every language. Live TV is never filtered.", color = TextMuted, fontSize = 10.sp)
+            // Languages saved earlier that the list doesn't have still show (and stay ticked)
+            val allowedChoices = LANGUAGE_CHOICES + p.allowedLanguages.filter { it !in LANGUAGE_CHOICES }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                allowedChoices.forEach { l ->
+                    val on = l in p.allowedLanguages
+                    FilterChip(
+                        selected = on,
+                        onClick = { update(p.copy(allowedLanguages = if (on) p.allowedLanguages - l else p.allowedLanguages + l)) },
+                        label = { Text(l, fontSize = 11.sp) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = Violet600, selectedLabelColor = TextPrimary,
+                            containerColor = AmoledCard2, labelColor = TextSecondary,
+                        ),
+                    )
+                }
+            }
+            if (p.allowedLanguages.isNotEmpty()) {
+                SwitchRow("Also hide unknown language", "Many streams don't say their language anywhere", p.hideUnknownLanguage) {
+                    update(p.copy(hideUnknownLanguage = it))
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+            Text("Preferred languages", color = TextSecondary, fontSize = 11.sp)
+            Text(
+                "In the order you tick them: these come first inside each quality and lead a stream's audio line. Nothing is hidden by this.",
+                color = TextMuted, fontSize = 10.sp,
+            )
+            val preferredChoices = LANGUAGE_CHOICES + p.preferredLanguages.filter { it !in LANGUAGE_CHOICES }
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                preferredChoices.forEach { l ->
+                    val n = p.preferredLanguages.indexOf(l)
+                    FilterChip(
+                        selected = n >= 0,
+                        onClick = { update(p.copy(preferredLanguages = if (n >= 0) p.preferredLanguages - l else p.preferredLanguages + l)) },
+                        label = { Text(if (n >= 0) "${n + 1}. $l" else l, fontSize = 11.sp) },
+                        colors = FilterChipDefaults.filterChipColors(
+                            selectedContainerColor = Violet600, selectedLabelColor = TextPrimary,
+                            containerColor = AmoledCard2, labelColor = TextSecondary,
+                        ),
+                    )
+                }
+            }
+        }
+
         SwitchRow("Hide CAM / TeleSync", "Drops cinema recordings and screeners", p.excludeCam) { update(p.copy(excludeCam = it)) }
         SwitchRow("Hide non-seekable / non-playable files", "Direct files whose server can't seek, and archives", p.filterNonSeekable) {
             update(p.copy(filterNonSeekable = it))
