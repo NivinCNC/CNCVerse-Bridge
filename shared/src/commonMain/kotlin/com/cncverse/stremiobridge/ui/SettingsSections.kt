@@ -357,7 +357,7 @@ fun StreamsCard() {
             Spacer(Modifier.height(6.dp))
             Text("Preferred languages", color = TextSecondary, fontSize = 11.sp)
             Text(
-                "In the order you tick them: these come first inside each quality and lead a stream's audio line. Nothing is hidden by this.",
+                "In the order you tick them: streams in these languages come first, before any quality, and the languages lead a stream's audio line. Nothing is hidden by this.",
                 color = TextMuted, fontSize = 10.sp,
             )
             val preferredChoices = LANGUAGE_CHOICES + p.preferredLanguages.filter { it !in LANGUAGE_CHOICES }

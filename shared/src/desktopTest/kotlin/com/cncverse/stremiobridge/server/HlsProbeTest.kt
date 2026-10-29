@@ -77,14 +77,29 @@ class HlsProbeTest {
     }
 
     @Test
-    fun preferredLanguagesSortFirstInsideAQuality() {
+    fun preferredLanguagesSortFirst() {
         val english = file("Movie.English.1080p.mkv")
         val unknown = file("Movie.1080p.mkv")
         val tamil = file("Movie.1080p.mkv", audio = listOf("Tamil"))
+        val tamil720 = file("Movie.Tamil.720p.mkv")
         val hindi4k = file("Movie.Hindi.2160p.mkv")
         val p = StremioServer.StreamPrefs(preferredLanguages = listOf("Tamil", "English"))
-        // Quality still leads (4K first); inside 1080p: Tamil, English, then the rest
-        assertEquals(listOf(hindi4k, tamil, english, unknown), StremioServer.arrangeStreams(listOf(english, unknown, tamil, hindi4k), p))
+        // Every Tamil link (best quality first), then English, then the rest by quality
+        assertEquals(listOf(tamil, tamil720, english, hindi4k, unknown),
+            StremioServer.arrangeStreams(listOf(english, unknown, tamil720, tamil, hindi4k), p))
+        // Grouped by provider: still every Tamil link first, providers grouped inside
+        val tamilB = file("Movie.Tamil.720p.mkv").let { it.copy(info = it.info!!.copy(addonName = "B")) }
+        assertEquals(listOf(tamilB, tamil, hindi4k),
+            StremioServer.arrangeStreams(listOf(hindi4k, tamil, tamilB), p.copy(groupBy = "provider", providerOrder = listOf("B", "X"))))
+    }
+
+    @Test
+    fun keptLanguagesOnlySortInsideAQuality() {
+        val unknown = file("Movie.1080p.mkv")
+        val tamil = file("Movie.Tamil.1080p.mkv")
+        val hindi4k = file("Movie.Hindi.2160p.mkv")
+        val p = StremioServer.StreamPrefs(allowedLanguages = setOf("Tamil", "Hindi"))
+        assertEquals(listOf(hindi4k, tamil, unknown), StremioServer.arrangeStreams(listOf(unknown, tamil, hindi4k), p))
     }
 
     @Test

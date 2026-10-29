@@ -1652,21 +1652,26 @@ object StremioServer {
 
     /**
      * Orders already-filtered streams by the profile's grouping, sorting and provider order.
-     * Default/quality: best resolution first, inside a resolution the provider order (or, with
-     * "sort by size", the biggest file first, unknown last). Provider grouping: all of one
-     * provider together, providers in the chosen order, best resolution first inside each.
+     * Preferred audio languages lead everything: all streams in the first one, then the next,
+     * then the rest. Inside that, default/quality: best resolution first, inside a resolution
+     * the provider order (or, with "sort by size", the biggest file first, unknown last).
+     * Provider grouping: all of one provider together, providers in the chosen order, best
+     * resolution first inside each.
      */
     fun arrangeStreams(streams: List<StremioStream>, profile: StreamPrefs): List<StremioStream> {
         val bySize = profile.sortBy == "size"
         val byProvider = profile.groupBy == "provider"
-        // Preferred languages (then the ones the language filter keeps) come first inside a quality
-        val langOrder = (profile.preferredLanguages + profile.allowedLanguages).map { languageGroup(it) }.distinct()
+        // Preferred languages come before any quality: a 1080p Telugu link from one provider
+        // used to sit under every other 4K link. The languages the filter keeps (but that
+        // aren't preferred) only order streams inside a quality.
+        val prefOrder = profile.preferredLanguages.map { languageGroup(it) }.distinct()
+        val langOrder = (prefOrder + profile.allowedLanguages.map { languageGroup(it) }).distinct()
         if (profile.providerOrder.isEmpty() && !bySize && !byProvider && langOrder.isEmpty()) return streams
         val rank = profile.providerOrder.withIndex().associate { (i, n) -> n.lowercase() to i }
         val langRankOf = langOrder.withIndex().associate { (i, l) -> l to i }
         // Sort keys are computed ONCE per stream: the size lookup is a text search and a sort
         // compares each stream about log2(n) times (6 ms -> well under 1 ms for 250 streams)
-        class Keyed(val stream: StremioStream, val providerRank: Int, val provider: String, val quality: Int, val sizeKey: Long, val langRank: Int)
+        class Keyed(val stream: StremioStream, val providerRank: Int, val provider: String, val quality: Int, val sizeKey: Long, val langRank: Int, val prefRank: Int)
         val keyed = streams.map { st ->
             // The configure page lists extensions by display name ("4K HDHUB"); a stream's addon
             // label is often the plugin file name ("FourKHDHub"), so match on the display name
@@ -1676,12 +1681,14 @@ object StremioServer {
             // Best (lowest) rank of any preferred language the stream carries; none = after them
             val langRank = if (langOrder.isEmpty()) 0
                 else com.cncverse.stremiobridge.format.StreamVariables.languagesOf(st).minOfOrNull { langRankOf[languageGroup(it)] ?: Int.MAX_VALUE } ?: Int.MAX_VALUE
-            Keyed(st, rank[provider] ?: Int.MAX_VALUE, provider, streamQualityRank(st), sizeKey, langRank)
+            // Preferred languages are first in langOrder, so the same rank says which one (if any)
+            val prefRank = if (langRank < prefOrder.size) langRank else Int.MAX_VALUE
+            Keyed(st, rank[provider] ?: Int.MAX_VALUE, provider, streamQualityRank(st), sizeKey, langRank, prefRank)
         }
         val order = if (byProvider)
-            compareBy<Keyed>({ it.providerRank }, { it.provider }, { -it.quality }, { it.langRank }, { it.sizeKey })
+            compareBy<Keyed>({ it.prefRank }, { it.providerRank }, { it.provider }, { -it.quality }, { it.langRank }, { it.sizeKey })
         else
-            compareBy<Keyed>({ -it.quality }, { it.langRank }, { it.sizeKey }, { it.providerRank })
+            compareBy<Keyed>({ it.prefRank }, { -it.quality }, { it.langRank }, { it.sizeKey }, { it.providerRank })
         return keyed.sortedWith(order).map { it.stream } // stable: ties keep their arrival order
     }
 
