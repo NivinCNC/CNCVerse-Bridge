@@ -8,6 +8,7 @@ import com.cncverse.stremiobridge.plugin.GlobalPluginManager
 import com.cncverse.stremiobridge.plugin.PluginLoader
 import com.cncverse.stremiobridge.repo.RepoManager
 import com.cncverse.stremiobridge.server.BridgeRuntime
+import com.cncverse.stremiobridge.server.LockFreeConsole
 import com.cncverse.stremiobridge.server.PlatformPaths
 import com.cncverse.stremiobridge.state.*
 import com.cncverse.stremiobridge.update.GithubRelease
@@ -41,7 +42,15 @@ import com.cncverse.stremiobridge.tunnel.CloudflaredManager
 private const val DEFAULT_PORT = 8080
 private val CACHE_DIR: String = PlatformPaths.cacheDir.absolutePath
 
-fun main() = application {
+fun main() {
+    // Extensions' prints can no longer block or deadlock the bridge. After a first log line,
+    // so the log writer has already kept the real stdout for a console run.
+    ServerState.info("CNCVerse Bridge starting…")
+    LockFreeConsole.install()
+    bridgeApp()
+}
+
+private fun bridgeApp() = application {
     // Surface fatal errors (e.g. Compose render-thread exceptions) into the
     // app log so crashes in the packaged exe are diagnosable.
     Thread.setDefaultUncaughtExceptionHandler { thread, e ->
