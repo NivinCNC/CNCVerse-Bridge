@@ -160,6 +160,8 @@ actual class PluginLoader {
 
             val newOk = existingOk.newBuilder()
                 .addInterceptor(cfKiller)
+                // TMDB, Cinemeta, TVmaze, IMDb, Kitsu answers shared between extensions for 30 min
+                .addInterceptor(com.cncverse.stremiobridge.network.ResponseCache)
                 .dns(AdaptiveHostDns)
                 .fastFallback(true)
                 .connectTimeout(20, java.util.concurrent.TimeUnit.SECONDS)
@@ -202,6 +204,7 @@ actual class PluginLoader {
                     if (!alreadyHas) {
                         val patched = existing.newBuilder()
                             .addInterceptor(cfKiller)
+                            .addInterceptor(com.cncverse.stremiobridge.network.ResponseCache)
                             .dns(AdaptiveHostDns)
                             .connectionPool(okhttp3.ConnectionPool(50, 90, java.util.concurrent.TimeUnit.SECONDS))
                             .addInterceptor(TMDB_HOST_REWRITE)
@@ -250,6 +253,7 @@ actual class PluginLoader {
                 if (existing.interceptors.none { it is com.lagradost.cloudstream3.network.CloudflareKiller }) {
                     val patched = existing.newBuilder()
                         .addInterceptor(cfKiller)
+                        .addInterceptor(com.cncverse.stremiobridge.network.ResponseCache)
                         .addInterceptor(TMDB_HOST_REWRITE)
                         .dispatcher(PLUGIN_DISPATCHER)
                         .pingInterval(PLUGIN_PING_SECONDS, java.util.concurrent.TimeUnit.SECONDS)
