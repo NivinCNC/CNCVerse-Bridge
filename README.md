@@ -2,7 +2,7 @@
 
 [![Support Project (UPI Supported)](https://img.shields.io/badge/Support%20Project%20%28UPI%20Supported%29-FF0000?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://cncverse.pages.dev)
 
-[![Discord](https://invidget.switchblade.xyz/jG8aKTtDze)](https://discord.gg/jG8aKTtDze)
+[![Discord](https://api.weblutions.com/discord/invite/jG8aKTtDze)](https://discord.gg/jG8aKTtDze)
 
 An application addon to run Cloudstream extensions on Nuvio, Stremio, and every other Stremio-supported platform.
 
