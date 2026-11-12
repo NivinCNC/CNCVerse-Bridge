@@ -229,6 +229,9 @@ object StremioIds {
 
 /** Maps CS3 TvType names → Stremio type strings */
 fun cs3TvTypeToStremio(tvType: String): String = when (tvType.lowercase()) {
-    "live", "tv"                               -> "tv"
-    else                                       -> "other"
+    "movie" -> "movie"
+    "tvseries", "series" -> "series"
+    "live" -> "channel"
+    "tv" -> "tv" // Preserve legacy Stremio TV type compatibility.
+    else -> "other"
 }

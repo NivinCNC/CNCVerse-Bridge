@@ -78,7 +78,7 @@ class HlsProbeTest {
         assertEquals(listOf(tamilInFile, unknown, mandarin), StremioServer.filterStreamsByProfile(all, p, "movie"))
         assertEquals(listOf(tamilInFile, mandarin), StremioServer.filterStreamsByProfile(all, p.copy(hideUnknownLanguage = true), "movie"))
         // Live TV is never language-filtered
-        assertEquals(all, StremioServer.filterStreamsByProfile(all, p.copy(hideUnknownLanguage = true), "tv"))
+        assertEquals(all, StremioServer.filterStreamsByProfile(all, p.copy(hideUnknownLanguage = true), "channel"))
     }
 
     @Test
