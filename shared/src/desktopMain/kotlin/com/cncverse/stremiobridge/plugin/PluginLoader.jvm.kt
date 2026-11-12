@@ -870,8 +870,8 @@ private class DirectMainApiWrapper(
         val hasLive = api.supportedTypes.any { it.name.equals("Live", ignoreCase = true) }
         val isOnlyLive = api.supportedTypes.size == 1 && hasLive
         return when {
-            isOnlyLive -> listOf("tv")
-            hasLive -> listOf("movie", "tv")
+            isOnlyLive -> listOf("channel")
+            hasLive -> listOf("movie", "channel")
             else -> listOf("movie")
         }
     }

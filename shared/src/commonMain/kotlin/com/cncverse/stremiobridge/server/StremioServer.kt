@@ -839,7 +839,7 @@ object StremioServer {
             // Unlabelled HLS ("Auto"): read the master for its qualities and audio languages;
             // MKV files: their track list for the audio languages. Not live TV: short-lived
             // session links, and no quality filters there.
-            .let { if (type == "tv") it else probeMedia(it) }
+            .let { if (type == "channel") it else probeMedia(it) }
         val sorted = sortStreamsByQuality(streams)
 
         // Filters and ordering from the app's stream settings
@@ -1246,7 +1246,7 @@ object StremioServer {
      * catalogs with its home-page sections as genres, minus catalogs hidden in the app.
      */
     suspend fun buildManifest(): StremioManifest {
-        val types = listOf("movie", "series", "other", "tv")
+        val types = listOf("movie", "series", "other", "tv", "channel")
         val prefs = streamPrefs
 
         val catalogs = if (ServerState.disableCatalogsGlobally) {
@@ -1572,7 +1572,7 @@ object StremioServer {
         // re-parsing every playlist — thousands of channels, per source, per search — and Stremio
         // sends a search to every catalog. Their home pages are already parsed and cached, so a
         // search is just a filter over those channels.
-        if (!search.isNullOrBlank() && api.supportedTypes.all { it == "tv" }) {
+        if (!search.isNullOrBlank() && api.isLiveOnly()) {
             val pages = homePageCatalogCache.filterKeys { it.startsWith("$type:$id:") }.values
             if (pages.isNotEmpty()) {
                 // Plain lower-case contains: normalizeTitle's regexes over ~15k channels per
@@ -1594,7 +1594,7 @@ object StremioServer {
                 // page is refreshed only when someone opens it and it is older than its TTL: the
                 // cached page is served at once and that one page reloads in the background.
                 // (A timer used to reload every home page every 30 min, opened or not.)
-                val liveOnly = api.supportedTypes.all { it == "tv" }
+                val liveOnly = api.isLiveOnly()
                 val age = System.currentTimeMillis() - (homePageCachedAt[cacheKey] ?: 0L)
                 // Live events change by the minute; channel playlists re-parse thousands of
                 // lines, so 15 min; everything else 30 min.
@@ -1792,7 +1792,7 @@ object StremioServer {
         }
 
         // 2a. Audio languages (not live TV: channels rarely say their language anywhere)
-        if (profile.allowedLanguages.isNotEmpty() && type != "tv") {
+        if (profile.allowedLanguages.isNotEmpty() && type != "channel") {
             val allowedLangs = profile.allowedLanguages.map { languageGroup(it) }.toSet()
             result = result.filter { st ->
                 val langs = com.cncverse.stremiobridge.format.StreamVariables.languagesOf(st)
@@ -1925,7 +1925,7 @@ object StremioServer {
 
             val directCacheKey = "stream:direct:$pluginKey:$dataUrl"
             // Live TV / live events: links are short-lived session URLs — never cache them.
-            val isLive = type == "tv" || matchingApis.all { api -> api.supportedTypes.all { it == "tv" } }
+            val isLive = type == "channel" || matchingApis.all { api -> api.isLiveOnly() }
             return com.cncverse.stremiobridge.cache.StreamCacheManager.getOrFetchResult(directCacheKey, pluginKey, itemStreamScope) {
                 ServerState.info("Parallel stream load: ${matchingApis.size} API(s) for key '$pluginKey'")
 
@@ -1947,7 +1947,7 @@ object StremioServer {
                                 // Catalog items opened straight from a row (defaultVideoId) carry the
                                 // item URL, not the load() data — e.g. Netflix mirrors need the title
                                 // that only load() adds. Resolve it once and retry.
-                                if (links.isEmpty() && cachedData == null && !api.supportedTypes.all { it == "tv" }) {
+                                if (links.isEmpty() && cachedData == null && !api.isLiveOnly()) {
                                     val resolved = loadData(runCatching { api.load(dataUrl) }.getOrNull())
                                     if (resolved != null) {
                                         ServerState.info("[${api.name}] Retrying with load() data")
@@ -1995,7 +1995,7 @@ object StremioServer {
         // Key on the exact set of extensions this request may use, so profiles with
         // different opt-ins / disables and admin enable/disable changes never share results.
         val activeSig = loadedApis.asSequence()
-            .filter { api -> !isGloballyDisabled(api) && api.supportedTypes.any { it != "tv" } }
+            .filter { api -> !isGloballyDisabled(api) && !api.isLiveOnly() }
             .map { it.internalName }.sorted().joinToString(",").hashCode()
         val aggCacheKey = "stream:generic:$type:$id:$activeSig"
 
@@ -2015,7 +2015,7 @@ object StremioServer {
                 // they don't carry on-demand movie/series content.
                 val activePlugins = loadedApis.filter { api ->
                     !isGloballyDisabled(api) &&
-                    api.supportedTypes.any { it != "tv" }
+                    !api.isLiveOnly()
                 }
                 ServerState.debug("Searching across ${activePlugins.size} plugin(s) (live-TV-only excluded)...")
 
@@ -2109,7 +2109,7 @@ object StremioServer {
     private suspend fun withFreshLocalLinks(list: List<StremioStream>, type: String, id: String): List<StremioStream> {
         if (list.any { LOOPBACK_URL.containsMatchIn(it.url.orEmpty()) }) return list // already fresh
         val apis = loadedApis.filter { api ->
-            api.internalName in localLinkProviders && !isGloballyDisabled(api) && api.supportedTypes.any { it != "tv" }
+            api.internalName in localLinkProviders && !isGloballyDisabled(api) && !api.isLiveOnly()
         }
         if (apis.isEmpty()) return list
         val (title, year) = ExternalIds.parse(id)?.let { resolveExternal(type, it) } ?: return list
@@ -2617,7 +2617,7 @@ object StremioServer {
 
     /** Probes all active APIs in parallel (up to 5 concurrent) and updates StreamTracker. */
     suspend fun probeAllApis(query: String = "Avatar"): Map<String, Int> {
-        val active = loadedApis.filter { api -> api.supportedTypes.any { it != "tv" } }
+        val active = loadedApis.filter { api -> !api.isLiveOnly() }
         val results = java.util.concurrent.ConcurrentHashMap<String, Int>()
         val sem = Semaphore(5)
         coroutineScope {
@@ -2646,6 +2646,13 @@ object StremioServer {
  * Platform-agnostic wrapper around a loaded CS3 MainAPI instance.
  * Implemented by each platform's PluginLoader actual.
  */
+/**
+ * True only for providers dedicated to live channels.
+ * Mixed movie + channel providers remain eligible for VOD searches.
+ */
+private fun MainApiWrapper.isLiveOnly(): Boolean =
+    supportedTypes.isNotEmpty() && supportedTypes.all { it == "channel" }
+
 interface MainApiWrapper {
     val name: String
     val internalName: String
@@ -2792,7 +2799,7 @@ fun SearchResult.toStremiMeta(pluginInternalName: String, stremioType: String): 
         genres      = null,
         year        = year,
         // For TV/live items, set defaultVideoId so Stremio can auto-play without extra navigation
-        behaviorHints = if (resolvedType == "tv" || isHorizontal) {
+        behaviorHints = if (resolvedType == "channel" || resolvedType == "tv" || isHorizontal) {
             MetaBehaviorHints(defaultVideoId = encodedId)
         } else null,
     )
