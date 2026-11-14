@@ -12,15 +12,11 @@ import kotlinx.coroutines.sync.withLock
 object RepoManager {
 
     /**
-     * Load saved repos from persistence and seed the default repo if none exist.
+     * Load saved repos from persistence. No repo comes preinstalled: users add the ones they want.
      * Should be called once at app start (before refreshing).
      */
     fun loadSavedRepos() {
-        var urls = loadRepoUrls().toMutableList()
-        if (urls.isEmpty()) {
-            urls = mutableListOf(DEFAULT_REPO_URL)
-            saveRepoUrls(urls)
-        }
+        val urls = loadRepoUrls()
         val cached = runCatching { loadCachedRepoEntries() }.getOrDefault(emptyList()).associateBy { it.url }
         val entries = urls.map { url ->
             val prev = cached[url]

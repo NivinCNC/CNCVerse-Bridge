@@ -623,7 +623,7 @@ private fun AddRepoDialog(
                             }
                             if (repo.isLoading) {
                                 CircularProgressIndicator(color = Violet400, modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
-                            } else if (repo.url != com.cncverse.stremiobridge.repo.DEFAULT_REPO_URL) {
+                            } else {
                                 IconButton(
                                     onClick = { onRemove(repo.url) },
                                     modifier = Modifier.size(28.dp),
